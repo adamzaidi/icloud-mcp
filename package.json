@@ -1,0 +1,17 @@
+{
+  "name": "icloud-mcp",
+  "version": "1.0.0",
+  "description": "iCloud Mail MCP Server for Claude Desktop",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "Adam Zaidi",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "imapflow": "^1.2.10"
+  }
+}
