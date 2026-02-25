@@ -1,7 +1,8 @@
-import { execSync, spawnSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import { writeFileSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { fileURLToPath } from 'url';
 
 const IMAP_USER = process.env.IMAP_USER;
 const IMAP_PASSWORD = process.env.IMAP_PASSWORD;
@@ -10,6 +11,8 @@ if (!IMAP_USER || !IMAP_PASSWORD) {
   console.error('Error: IMAP_USER and IMAP_PASSWORD environment variables are required');
   process.exit(1);
 }
+
+const projectDir = fileURLToPath(new URL('.', import.meta.url));
 
 function callTool(name, args = {}) {
   const messages = [
@@ -27,7 +30,7 @@ function callTool(name, args = {}) {
       '/bin/sh',
       ['-c', `cat "${tmpFile}" | /opt/homebrew/bin/node index.js`],
       {
-        cwd: '/Users/adamzaidi/Desktop/icloud-mcp',
+        cwd: projectDir,
         encoding: 'utf8',
         timeout: 180000,
         env: { ...process.env, IMAP_USER, IMAP_PASSWORD }
