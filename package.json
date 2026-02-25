@@ -1,15 +1,19 @@
 {
   "name": "icloud-mcp",
   "version": "1.0.0",
-  "description": "iCloud Mail MCP Server for Claude Desktop",
+  "description": "A Model Context Protocol (MCP) server for iCloud Mail",
   "main": "index.js",
+  "bin": {
+    "icloud-mcp": "./index.js"
+  },
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node test.js"
   },
-  "keywords": [],
+  "keywords": ["mcp", "icloud", "email", "imap", "claude"],
   "author": "Adam Zaidi",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
     "imapflow": "^1.2.10"
