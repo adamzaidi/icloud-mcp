@@ -1,4 +1,7 @@
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
+import { writeFileSync, unlinkSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 const IMAP_USER = process.env.IMAP_USER;
 const IMAP_PASSWORD = process.env.IMAP_PASSWORD;
@@ -8,29 +11,43 @@ if (!IMAP_USER || !IMAP_PASSWORD) {
   process.exit(1);
 }
 
-function sendMessages(messages) {
-  const input = messages.map(m => JSON.stringify(m)).join('\n') + '\n';
-  const result = execSync(
-    `echo '${input.replace(/'/g, "'\\''")}' | IMAP_USER="${IMAP_USER}" IMAP_PASSWORD="${IMAP_PASSWORD}" /opt/homebrew/bin/node index.js`,
-    { cwd: '/Users/adamzaidi/Desktop/icloud-mcp', encoding: 'utf8', timeout: 30000 }
-  );
-  return result.trim().split('\n').filter(l => l.startsWith('{')).map(l => JSON.parse(l));
-}
-
 function callTool(name, args = {}) {
   const messages = [
     { jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '1.0.0' } } },
     { jsonrpc: '2.0', method: 'notifications/initialized' },
     { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }
   ];
-  const responses = sendMessages(messages);
-  const toolResponse = responses.find(r => r.id === 1);
-  if (!toolResponse) throw new Error(`No response for tool: ${name}`);
-  const content = toolResponse.result?.content?.[0]?.text;
-  if (!content) throw new Error(`No content in response for: ${name}`);
-  const parsed = JSON.parse(content);
-  if (toolResponse.result?.isError) throw new Error(`Tool error: ${content}`);
-  return parsed;
+
+  const input = messages.map(m => JSON.stringify(m)).join('\n') + '\n';
+  const tmpFile = join(tmpdir(), `mcp-test-${Date.now()}.txt`);
+  writeFileSync(tmpFile, input);
+
+  try {
+    const result = spawnSync(
+      '/bin/sh',
+      ['-c', `cat "${tmpFile}" | /opt/homebrew/bin/node index.js`],
+      {
+        cwd: '/Users/adamzaidi/Desktop/icloud-mcp',
+        encoding: 'utf8',
+        timeout: 180000,
+        env: { ...process.env, IMAP_USER, IMAP_PASSWORD }
+      }
+    );
+
+    if (result.error) throw new Error(`Spawn error: ${result.error.message}`);
+    if (result.status !== 0) throw new Error(`Process exited with code ${result.status}: ${result.stderr}`);
+
+    const lines = (result.stdout || '').trim().split('\n').filter(l => l.trim().startsWith('{'));
+    const responses = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const toolResponse = responses.find(r => r.id === 1);
+    if (!toolResponse) throw new Error(`No response for tool: ${name}`);
+    const content = toolResponse.result?.content?.[0]?.text;
+    if (!content) throw new Error(`No content in response for: ${name}`);
+    if (toolResponse.result?.isError) throw new Error(`Tool error: ${content}`);
+    return JSON.parse(content);
+  } finally {
+    try { unlinkSync(tmpFile); } catch {}
+  }
 }
 
 let passed = 0;
@@ -54,7 +71,6 @@ function assert(condition, message) {
 
 console.log('\n🧪 iCloud MCP Server Tests\n');
 
-// ── Read-only tests ──────────────────────────────────────────────────────────
 console.log('📬 Mailbox & Summary');
 
 test('get_inbox_summary', () => {
@@ -122,7 +138,6 @@ test('search_emails', () => {
 });
 
 test('get_emails_by_sender', () => {
-  // First get a real sender from inbox
   const senders = callTool('get_top_senders', { sampleSize: 20 });
   const topSender = senders.topAddresses[0]?.address;
   assert(topSender, 'should have at least one sender');
@@ -153,7 +168,6 @@ test('get_email (fetch first email content)', () => {
   console.log(`\n     → fetched email: "${result.subject?.slice(0, 40)}..."`);
 });
 
-// ── Write tests (use a safe test email) ─────────────────────────────────────
 console.log('\n✏️  Write Operations (flag/mark only — no deletions)');
 
 test('flag_email and unflag_email', () => {
@@ -178,7 +192,6 @@ test('mark_as_read and mark_as_unread', () => {
   console.log(`\n     → marked read/unread uid ${uid}`);
 });
 
-// ── Destructive tests (skipped by default) ───────────────────────────────────
 console.log('\n⚠️  Destructive Tests (skipped by default)');
 console.log('  Skipping: bulk_delete_by_sender');
 console.log('  Skipping: bulk_delete_by_subject');
@@ -187,11 +200,9 @@ console.log('  Skipping: delete_email');
 console.log('  Skipping: empty_trash');
 console.log('  Run with --destructive flag to enable these\n');
 
-// ── Summary ──────────────────────────────────────────────────────────────────
 console.log('─'.repeat(40));
 console.log(`\n✅ Passed: ${passed}`);
 console.log(`❌ Failed: ${failed}`);
 console.log(`📊 Total:  ${passed + failed}\n`);
 
 if (failed > 0) process.exit(1);
-

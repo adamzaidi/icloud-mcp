@@ -24,17 +24,42 @@ function createClient() {
 async function fetchEmails(mailbox = 'INBOX', limit = 10, onlyUnread = false, page = 1) {
   const client = createClient();
   await client.connect();
-  await client.mailboxOpen(mailbox);
-  const status = await client.status(mailbox, { messages: true });
-  const total = status.messages;
+  const mb = await client.mailboxOpen(mailbox);
+  const total = mb.exists;
   const emails = [];
-  const query = onlyUnread ? { seen: false } : { all: true };
-  let count = 0;
-  let skipped = 0;
-  const skip = (page - 1) * limit;
-  for await (const msg of client.fetch(query, { envelope: true, flags: true }, { reverse: true })) {
-    if (skipped < skip) { skipped++; continue; }
-    if (count >= limit) break;
+
+  if (total === 0) {
+    await client.logout();
+    return { emails, page, limit, total, totalPages: 0, hasMore: false };
+  }
+
+  if (onlyUnread) {
+    const uids = (await client.search({ seen: false }, { uid: true })) ?? [];
+    const totalUnread = uids.length;
+    const skip = (page - 1) * limit;
+    const pageUids = uids.reverse().slice(skip, skip + limit);
+    for (const uid of pageUids) {
+      const msg = await client.fetchOne(uid, { envelope: true, flags: true }, { uid: true });
+      if (msg) {
+        emails.push({
+          uid,
+          subject: msg.envelope.subject,
+          from: msg.envelope.from?.[0]?.address,
+          date: msg.envelope.date,
+          flagged: msg.flags.has('\\Flagged'),
+          seen: msg.flags.has('\\Seen')
+        });
+      }
+    }
+    await client.logout();
+    return { emails, page, limit, total: totalUnread, totalPages: Math.ceil(totalUnread / limit), hasMore: (page * limit) < totalUnread };
+  }
+
+  const end = Math.max(1, total - ((page - 1) * limit));
+  const start = Math.max(1, end - limit + 1);
+  const range = `${start}:${end}`;
+
+  for await (const msg of client.fetch(range, { envelope: true, flags: true })) {
     emails.push({
       uid: msg.uid,
       subject: msg.envelope.subject,
@@ -43,10 +68,11 @@ async function fetchEmails(mailbox = 'INBOX', limit = 10, onlyUnread = false, pa
       flagged: msg.flags.has('\\Flagged'),
       seen: msg.flags.has('\\Seen')
     });
-    count++;
   }
+
   await client.logout();
-  return { emails, page, limit, total, totalPages: Math.ceil(total / limit), hasMore: page * limit < total };
+  emails.reverse();
+  return { emails, page, limit, total, totalPages: Math.ceil(total / limit), hasMore: (page * limit) < total };
 }
 
 async function getInboxSummary(mailbox = 'INBOX') {
@@ -60,12 +86,17 @@ async function getInboxSummary(mailbox = 'INBOX') {
 async function getTopSenders(mailbox = 'INBOX', sampleSize = 500) {
   const client = createClient();
   await client.connect();
-  await client.mailboxOpen(mailbox);
+  const mb = await client.mailboxOpen(mailbox);
+  const total = mb.exists;
   const senderCounts = {};
   const senderDomains = {};
+
+  const end = total;
+  const start = Math.max(1, total - sampleSize + 1);
+  const range = `${start}:${end}`;
   let count = 0;
-  for await (const msg of client.fetch({ all: true }, { envelope: true }, { reverse: true })) {
-    if (count >= sampleSize) break;
+
+  for await (const msg of client.fetch(range, { envelope: true })) {
     const address = msg.envelope.from?.[0]?.address;
     if (address) {
       senderCounts[address] = (senderCounts[address] || 0) + 1;
@@ -74,6 +105,7 @@ async function getTopSenders(mailbox = 'INBOX', sampleSize = 500) {
     }
     count++;
   }
+
   await client.logout();
   const topAddresses = Object.entries(senderCounts).sort((a, b) => b[1] - a[1]).slice(0, 20).map(([address, count]) => ({ address, count }));
   const topDomains = Object.entries(senderDomains).sort((a, b) => b[1] - a[1]).slice(0, 20).map(([domain, count]) => ({ domain, count }));
@@ -84,14 +116,18 @@ async function getUnreadSenders(mailbox = 'INBOX', sampleSize = 500) {
   const client = createClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
+  const uids = (await client.search({ seen: false }, { uid: true })) ?? [];
+  const recentUids = uids.reverse().slice(0, sampleSize);
   const senderCounts = {};
-  let count = 0;
-  for await (const msg of client.fetch({ seen: false }, { envelope: true }, { reverse: true })) {
-    if (count >= sampleSize) break;
-    const address = msg.envelope.from?.[0]?.address;
-    if (address) senderCounts[address] = (senderCounts[address] || 0) + 1;
-    count++;
+
+  for (const uid of recentUids) {
+    const msg = await client.fetchOne(uid, { envelope: true }, { uid: true });
+    if (msg) {
+      const address = msg.envelope.from?.[0]?.address;
+      if (address) senderCounts[address] = (senderCounts[address] || 0) + 1;
+    }
   }
+
   await client.logout();
   return Object.entries(senderCounts).sort((a, b) => b[1] - a[1]).slice(0, 20).map(([address, count]) => ({ address, count }));
 }
@@ -227,17 +263,28 @@ async function getEmailContent(uid, mailbox = 'INBOX') {
   const client = createClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
-  const msg = await client.fetchOne(uid, { source: true, envelope: true, flags: true });
-  const raw = msg.source.toString();
-  const bodyStart = raw.indexOf('\r\n\r\n');
-  const body = bodyStart > -1 ? raw.slice(bodyStart + 4, bodyStart + 2000) : raw.slice(0, 2000);
+  const meta = await client.fetchOne(uid, { envelope: true, flags: true }, { uid: true });
+  let body = '(body unavailable)';
+  try {
+    const sourceMsg = await Promise.race([
+      client.fetchOne(uid, { source: true }, { uid: true }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000))
+    ]);
+    if (sourceMsg?.source) {
+      const raw = sourceMsg.source.toString();
+      const bodyStart = raw.indexOf('\r\n\r\n');
+      body = bodyStart > -1 ? raw.slice(bodyStart + 4, bodyStart + 2000) : raw.slice(0, 2000);
+    }
+  } catch {
+    body = '(body unavailable - email may be too large)';
+  }
   await client.logout();
   return {
-    uid: msg.uid,
-    subject: msg.envelope.subject,
-    from: msg.envelope.from?.[0]?.address,
-    date: msg.envelope.date,
-    flags: [...msg.flags],
+    uid: meta.uid,
+    subject: meta.envelope.subject,
+    from: meta.envelope.from?.[0]?.address,
+    date: meta.envelope.date,
+    flags: [...meta.flags],
     body
   };
 }
@@ -331,7 +378,7 @@ async function moveEmail(uid, targetMailbox, sourceMailbox = 'INBOX') {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.0.5' },
+    { name: 'icloud-mail', version: '1.0.8' },
     { capabilities: { tools: {} } }
   );
 
