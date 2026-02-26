@@ -27,13 +27,19 @@ A Model Context Protocol (MCP) server that connects Claude Desktop to your iClou
 3. Click **+** to generate a new password
 4. Label it something like `Claude MCP` and save the generated password
 
-### 2. Install the server
+### 2. Install the package
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/icloud-mcp.git
-cd icloud-mcp
-npm install
+npm install -g icloud-mcp
 ```
+
+Then find the install location:
+
+```bash
+npm root -g
+```
+
+This will return a path like `/opt/homebrew/lib/node_modules` or `/usr/local/lib/node_modules`.
 
 ### 3. Configure Claude Desktop
 
@@ -43,14 +49,14 @@ Open your Claude Desktop config file:
 open ~/Library/Application\ Support/Claude/claude_desktop_config.json
 ```
 
-Add the following under `mcpServers`:
+Add the following under `mcpServers`, replacing the path with your npm root path from the previous step:
 
 ```json
 {
   "mcpServers": {
     "icloud-mail": {
-      "command": "/opt/homebrew/bin/node",
-      "args": ["/path/to/icloud-mcp/index.js"],
+      "command": "node",
+      "args": ["/opt/homebrew/lib/node_modules/icloud-mcp/index.js"],
       "env": {
         "IMAP_USER": "you@icloud.com",
         "IMAP_PASSWORD": "your-app-specific-password"
@@ -60,7 +66,7 @@ Add the following under `mcpServers`:
 }
 ```
 
-> **Note:** Replace `/path/to/icloud-mcp` with the actual path where you cloned the repo, and `/opt/homebrew/bin/node` with the output of `which node`.
+> **Note:** If your `npm root -g` returned a different path, replace `/opt/homebrew/lib/node_modules` with that path.
 
 ### 4. Restart Claude Desktop
 
@@ -100,12 +106,6 @@ Once configured, you can ask Claude things like:
 - *"How many unread emails do I have?"*
 - *"Move all emails from newsletters@substack.com to my newsletters folder"*
 - *"Show me emails from the last week"*
-
-## Running Tests
-
-```bash
-IMAP_USER="you@icloud.com" IMAP_PASSWORD="your-app-specific-password" /opt/homebrew/bin/node test.js
-```
 
 ## Security
 
