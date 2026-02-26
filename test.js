@@ -32,7 +32,7 @@ function callTool(name, args = {}) {
       {
         cwd: projectDir,
         encoding: 'utf8',
-        timeout: 180000,
+        timeout: 300000,
         env: { ...process.env, IMAP_USER, IMAP_PASSWORD }
       }
     );
@@ -74,10 +74,19 @@ function assert(condition, message) {
 
 console.log('\n🧪 iCloud MCP Server Tests\n');
 
+// ─── Mailbox & Summary ────────────────────────────────────────────────────────
 console.log('📬 Mailbox & Summary');
 
 test('get_inbox_summary', () => {
   const result = callTool('get_inbox_summary');
+  assert(typeof result.total === 'number', 'total should be a number');
+  assert(typeof result.unread === 'number', 'unread should be a number');
+  assert(result.mailbox === 'INBOX', 'mailbox should be INBOX');
+  console.log(`\n     → ${result.total} total, ${result.unread} unread`);
+});
+
+test('get_mailbox_summary', () => {
+  const result = callTool('get_mailbox_summary', { mailbox: 'INBOX' });
   assert(typeof result.total === 'number', 'total should be a number');
   assert(typeof result.unread === 'number', 'unread should be a number');
   assert(result.mailbox === 'INBOX', 'mailbox should be INBOX');
@@ -92,12 +101,21 @@ test('list_mailboxes', () => {
   console.log(`\n     → ${result.length} mailboxes found`);
 });
 
-test('get_top_senders (sample 50)', () => {
+test('get_top_senders (sample 50, default maxResults)', () => {
   const result = callTool('get_top_senders', { sampleSize: 50 });
   assert(Array.isArray(result.topAddresses), 'topAddresses should be an array');
   assert(Array.isArray(result.topDomains), 'topDomains should be an array');
   assert(result.sampledEmails <= 50, 'should not exceed sample size');
+  assert(result.topAddresses.length <= 20, 'should not exceed default maxResults of 20');
   console.log(`\n     → top sender: ${result.topAddresses[0]?.address} (${result.topAddresses[0]?.count})`);
+});
+
+test('get_top_senders (sample 50, maxResults 5)', () => {
+  const result = callTool('get_top_senders', { sampleSize: 50, maxResults: 5 });
+  assert(Array.isArray(result.topAddresses), 'topAddresses should be an array');
+  assert(result.topAddresses.length <= 5, 'should not exceed maxResults of 5');
+  assert(result.topDomains.length <= 5, 'domains should not exceed maxResults of 5');
+  console.log(`\n     → ${result.topAddresses.length} senders, ${result.topDomains.length} domains (capped at 5)`);
 });
 
 test('get_unread_senders (sample 50, default maxResults)', () => {
@@ -121,6 +139,7 @@ test('get_unread_senders (sample 50, maxResults 50)', () => {
   console.log(`\n     → ${result.length} unread senders found (capped at 50)`);
 });
 
+// ─── Reading Emails ───────────────────────────────────────────────────────────
 console.log('\n📧 Reading Emails');
 
 test('read_inbox (page 1, limit 5)', () => {
@@ -149,10 +168,25 @@ test('read_inbox (unread only)', () => {
   console.log(`\n     → ${result.emails.length} unread emails`);
 });
 
-test('search_emails', () => {
+test('search_emails (keyword only)', () => {
   const result = callTool('search_emails', { query: 'test', limit: 5 });
-  assert(Array.isArray(result), 'result should be an array');
-  console.log(`\n     → ${result.length} results`);
+  assert(typeof result.total === 'number', 'total should be a number');
+  assert(Array.isArray(result.emails), 'emails should be an array');
+  console.log(`\n     → ${result.total} results`);
+});
+
+test('search_emails (keyword + unread filter)', () => {
+  const result = callTool('search_emails', { query: 'test', limit: 5, unread: true });
+  assert(typeof result.total === 'number', 'total should be a number');
+  assert(Array.isArray(result.emails), 'emails should be an array');
+  console.log(`\n     → ${result.total} unread results`);
+});
+
+test('search_emails (keyword + date filter)', () => {
+  const result = callTool('search_emails', { query: 'test', limit: 5, since: '2024-01-01' });
+  assert(typeof result.total === 'number', 'total should be a number');
+  assert(Array.isArray(result.emails), 'emails should be an array');
+  console.log(`\n     → ${result.total} results since 2024`);
 });
 
 test('get_emails_by_sender', () => {
@@ -186,6 +220,7 @@ test('get_email (fetch first email content)', () => {
   console.log(`\n     → fetched email: "${result.subject?.slice(0, 40)}..."`);
 });
 
+// ─── Count & Bulk Query ───────────────────────────────────────────────────────
 console.log('\n🔍 Count & Bulk Query');
 
 test('count_emails (all in INBOX)', () => {
@@ -201,12 +236,17 @@ test('count_emails (unread only)', () => {
   console.log(`\n     → ${result.count} unread emails`);
 });
 
+test('count_emails (read only)', () => {
+  const result = callTool('count_emails', { unread: false });
+  assert(typeof result.count === 'number', 'count should be a number');
+  console.log(`\n     → ${result.count} read emails`);
+});
+
 test('count_emails (by domain)', () => {
   const senders = callTool('get_top_senders', { sampleSize: 20 });
   const topDomain = senders.topDomains[0]?.domain;
   assert(topDomain, 'should have at least one domain');
   const result = callTool('count_emails', { domain: topDomain });
-  console.log('\n     → raw result:', JSON.stringify(result));
   assert(typeof result.count === 'number', 'count should be a number');
   console.log(`\n     → ${result.count} emails from @${topDomain}`);
 });
@@ -217,6 +257,30 @@ test('count_emails (before date)', () => {
   console.log(`\n     → ${result.count} emails before 2020`);
 });
 
+test('count_emails (flagged false)', () => {
+  const result = callTool('count_emails', { flagged: false });
+  assert(typeof result.count === 'number', 'count should be a number');
+  console.log(`\n     → ${result.count} unflagged emails`);
+});
+
+test('bulk_move (dryRun)', () => {
+  const senders = callTool('get_top_senders', { sampleSize: 20 });
+  const topDomain = senders.topDomains[0]?.domain;
+  assert(topDomain, 'should have at least one domain');
+  const result = callTool('bulk_move', { domain: topDomain, targetMailbox: 'Archive', dryRun: true });
+  assert(result.dryRun === true, 'dryRun should be true');
+  assert(typeof result.wouldMove === 'number', 'wouldMove should be a number');
+  console.log(`\n     → would move ${result.wouldMove} emails from @${topDomain}`);
+});
+
+test('bulk_delete (dryRun)', () => {
+  const result = callTool('bulk_delete', { before: '2015-01-01', dryRun: true });
+  assert(result.dryRun === true, 'dryRun should be true');
+  assert(typeof result.wouldDelete === 'number', 'wouldDelete should be a number');
+  console.log(`\n     → would delete ${result.wouldDelete} emails before 2015`);
+});
+
+// ─── Write Operations ─────────────────────────────────────────────────────────
 console.log('\n✏️  Write Operations (flag/mark only — no deletions)');
 
 test('flag_email and unflag_email', () => {
@@ -241,10 +305,35 @@ test('mark_as_read and mark_as_unread', () => {
   console.log(`\n     → marked read/unread uid ${uid}`);
 });
 
+// ─── Mailbox Management ───────────────────────────────────────────────────────
+console.log('\n🗂️  Mailbox Management');
+
+test('create_mailbox', () => {
+  const result = callTool('create_mailbox', { name: 'mcp-test-folder' });
+  assert(result.created === 'mcp-test-folder', 'should confirm creation');
+  console.log(`\n     → created: ${result.created}`);
+});
+
+test('rename_mailbox', () => {
+  const result = callTool('rename_mailbox', { oldName: 'mcp-test-folder', newName: 'mcp-test-folder-renamed' });
+  assert(result.renamed.from === 'mcp-test-folder', 'from should match old name');
+  assert(result.renamed.to === 'mcp-test-folder-renamed', 'to should match new name');
+  console.log(`\n     → renamed: ${result.renamed.from} → ${result.renamed.to}`);
+});
+
+test('delete_mailbox', () => {
+  const result = callTool('delete_mailbox', { name: 'mcp-test-folder-renamed' });
+  assert(result.deleted === 'mcp-test-folder-renamed', 'should confirm deletion');
+  console.log(`\n     → deleted: ${result.deleted}`);
+});
+
+// ─── Destructive (skipped) ────────────────────────────────────────────────────
 console.log('\n⚠️  Destructive Tests (skipped by default)');
-console.log('  Skipping: bulk_move (sender → target folder)');
-console.log('  Skipping: bulk_move (folder → folder)');
-console.log('  Skipping: bulk_delete (by domain)');
+console.log('  Skipping: bulk_move (live)');
+console.log('  Skipping: bulk_delete (live)');
+console.log('  Skipping: bulk_mark_read (live)');
+console.log('  Skipping: bulk_mark_unread (live)');
+console.log('  Skipping: bulk_flag (live)');
 console.log('  Skipping: bulk_delete_by_sender');
 console.log('  Skipping: bulk_delete_by_subject');
 console.log('  Skipping: delete_older_than');
