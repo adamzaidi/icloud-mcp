@@ -1,6 +1,6 @@
 {
   "name": "icloud-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A Model Context Protocol (MCP) server for iCloud Mail",
   "main": "index.js",
   "bin": {
@@ -11,7 +11,13 @@
     "start": "node index.js",
     "test": "node test.js"
   },
-  "keywords": ["mcp", "icloud", "email", "imap", "claude"],
+  "keywords": [
+    "mcp",
+    "icloud",
+    "email",
+    "imap",
+    "claude"
+  ],
   "author": "Adam Zaidi",
   "license": "MIT",
   "dependencies": {
