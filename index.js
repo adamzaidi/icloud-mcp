@@ -166,9 +166,15 @@ async function bulkDeleteBySender(sender, mailbox = 'INBOX') {
   await client.mailboxOpen(mailbox);
   const uids = (await client.search({ from: sender }, { uid: true })) ?? [];
   if (uids.length === 0) { await client.logout(); return { deleted: 0 }; }
-  await client.messageDelete(uids, { uid: true });
+  const chunkSize = 250;
+  let deleted = 0;
+  for (let i = 0; i < uids.length; i += chunkSize) {
+    const chunk = uids.slice(i, i + chunkSize);
+    await client.messageDelete(chunk, { uid: true });
+    deleted += chunk.length;
+  }
   await client.logout();
-  return { deleted: uids.length, sender };
+  return { deleted, sender };
 }
 
 async function bulkMoveBySender(sender, targetMailbox, sourceMailbox = 'INBOX') {
@@ -177,9 +183,15 @@ async function bulkMoveBySender(sender, targetMailbox, sourceMailbox = 'INBOX') 
   await client.mailboxOpen(sourceMailbox);
   const uids = (await client.search({ from: sender }, { uid: true })) ?? [];
   if (uids.length === 0) { await client.logout(); return { moved: 0 }; }
-  await client.messageMove(uids, targetMailbox, { uid: true });
+  const chunkSize = 250;
+  let moved = 0;
+  for (let i = 0; i < uids.length; i += chunkSize) {
+    const chunk = uids.slice(i, i + chunkSize);
+    await client.messageMove(chunk, targetMailbox, { uid: true });
+    moved += chunk.length;
+  }
   await client.logout();
-  return { moved: uids.length, sender, targetMailbox };
+  return { moved, sender, targetMailbox };
 }
 
 async function bulkDeleteBySubject(subject, mailbox = 'INBOX') {
@@ -188,9 +200,15 @@ async function bulkDeleteBySubject(subject, mailbox = 'INBOX') {
   await client.mailboxOpen(mailbox);
   const uids = (await client.search({ subject }, { uid: true })) ?? [];
   if (uids.length === 0) { await client.logout(); return { deleted: 0 }; }
-  await client.messageDelete(uids, { uid: true });
+  const chunkSize = 250;
+  let deleted = 0;
+  for (let i = 0; i < uids.length; i += chunkSize) {
+    const chunk = uids.slice(i, i + chunkSize);
+    await client.messageDelete(chunk, { uid: true });
+    deleted += chunk.length;
+  }
   await client.logout();
-  return { deleted: uids.length, subject };
+  return { deleted, subject };
 }
 
 async function deleteOlderThan(days, mailbox = 'INBOX') {
@@ -201,9 +219,15 @@ async function deleteOlderThan(days, mailbox = 'INBOX') {
   date.setDate(date.getDate() - days);
   const uids = (await client.search({ before: date }, { uid: true })) ?? [];
   if (uids.length === 0) { await client.logout(); return { deleted: 0 }; }
-  await client.messageDelete(uids, { uid: true });
+  const chunkSize = 250;
+  let deleted = 0;
+  for (let i = 0; i < uids.length; i += chunkSize) {
+    const chunk = uids.slice(i, i + chunkSize);
+    await client.messageDelete(chunk, { uid: true });
+    deleted += chunk.length;
+  }
   await client.logout();
-  return { deleted: uids.length, olderThan: date.toISOString() };
+  return { deleted, olderThan: date.toISOString() };
 }
 
 async function getEmailsByDateRange(startDate, endDate, mailbox = 'INBOX', limit = 10) {
@@ -277,9 +301,15 @@ async function emptyTrash() {
   await client.mailboxOpen('Deleted Messages');
   const uids = (await client.search({ all: true }, { uid: true })) ?? [];
   if (uids.length === 0) { await client.logout(); return { deleted: 0 }; }
-  await client.messageDelete(uids, { uid: true });
+  const chunkSize = 250;
+  let deleted = 0;
+  for (let i = 0; i < uids.length; i += chunkSize) {
+    const chunk = uids.slice(i, i + chunkSize);
+    await client.messageDelete(chunk, { uid: true });
+    deleted += chunk.length;
+  }
   await client.logout();
-  return { deleted: uids.length };
+  return { deleted };
 }
 
 async function createMailbox(name) {
@@ -400,10 +430,7 @@ async function searchEmails(query, mailbox = 'INBOX', limit = 10, filters = {}) 
   await client.connect();
   await client.mailboxOpen(mailbox);
 
-  // Build base text search
   const textQuery = { or: [{ subject: query }, { from: query }, { body: query }] };
-
-  // Merge with additional filters if provided
   const extraQuery = buildQuery(filters);
   const finalQuery = Object.keys(extraQuery).length > 0 && !extraQuery.all
     ? { ...textQuery, ...extraQuery }
@@ -438,7 +465,6 @@ async function moveEmail(uid, targetMailbox, sourceMailbox = 'INBOX') {
   return true;
 }
 
-// Build an IMAP search query from a filters object
 function buildQuery(filters) {
   const query = {};
   if (filters.sender) query.from = filters.sender;
@@ -468,9 +494,15 @@ async function bulkMove(filters, targetMailbox, sourceMailbox = 'INBOX', dryRun 
     return { dryRun: true, wouldMove: uids.length, sourceMailbox, targetMailbox, filters };
   }
   if (uids.length === 0) { await client.logout(); return { moved: 0, sourceMailbox, targetMailbox }; }
-  await client.messageMove(uids, targetMailbox, { uid: true });
+  const chunkSize = 250;
+  let moved = 0;
+  for (let i = 0; i < uids.length; i += chunkSize) {
+    const chunk = uids.slice(i, i + chunkSize);
+    await client.messageMove(chunk, targetMailbox, { uid: true });
+    moved += chunk.length;
+  }
   await client.logout();
-  return { moved: uids.length, sourceMailbox, targetMailbox, filters };
+  return { moved, sourceMailbox, targetMailbox, filters };
 }
 
 async function bulkDelete(filters, sourceMailbox = 'INBOX', dryRun = false) {
@@ -484,9 +516,15 @@ async function bulkDelete(filters, sourceMailbox = 'INBOX', dryRun = false) {
     return { dryRun: true, wouldDelete: uids.length, sourceMailbox, filters };
   }
   if (uids.length === 0) { await client.logout(); return { deleted: 0, sourceMailbox }; }
-  await client.messageDelete(uids, { uid: true });
+  const chunkSize = 250;
+  let deleted = 0;
+  for (let i = 0; i < uids.length; i += chunkSize) {
+    const chunk = uids.slice(i, i + chunkSize);
+    await client.messageDelete(chunk, { uid: true });
+    deleted += chunk.length;
+  }
   await client.logout();
-  return { deleted: uids.length, sourceMailbox, filters };
+  return { deleted, sourceMailbox, filters };
 }
 
 async function countEmails(filters, mailbox = 'INBOX') {
@@ -501,7 +539,7 @@ async function countEmails(filters, mailbox = 'INBOX') {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.2.0' },
+    { name: 'icloud-mail', version: '1.3.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -625,7 +663,7 @@ async function main() {
       },
       {
         name: 'bulk_move',
-        description: 'Move emails matching any combination of filters from one mailbox to another. Operates on ALL matching emails in a single IMAP operation. Use dryRun: true to preview without making changes.',
+        description: 'Move emails matching any combination of filters from one mailbox to another. Processes in chunks of 250 for reliability. Use dryRun: true to preview without making changes.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -639,7 +677,7 @@ async function main() {
       },
       {
         name: 'bulk_delete',
-        description: 'Delete emails matching any combination of filters. Operates on ALL matching emails in a single IMAP operation. Use dryRun: true to preview without making changes.',
+        description: 'Delete emails matching any combination of filters. Processes in chunks of 250 for reliability. Use dryRun: true to preview without making changes.',
         inputSchema: {
           type: 'object',
           properties: {

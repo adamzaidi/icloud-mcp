@@ -327,9 +327,39 @@ test('delete_mailbox', () => {
   console.log(`\n     → deleted: ${result.deleted}`);
 });
 
+// ─── Chunk Move Test (live) ───────────────────────────────────────────────────
+console.log('\n📦 Chunk Move Test (live — newsletters ↔ test)');
+
+test('bulk_move newsletters → test (chunked)', () => {
+  const beforeSource = callTool('count_emails', { mailbox: 'newsletters' });
+  assert(beforeSource.count > 0, 'newsletters should have emails');
+  console.log(`\n     → newsletters before: ${beforeSource.count}`);
+
+  const moveResult = callTool('bulk_move', { sourceMailbox: 'newsletters', targetMailbox: 'test' });
+  console.log(`\n     → moved: ${moveResult.moved}`);
+  assert(moveResult.moved === beforeSource.count, `moved count should match source (expected ${beforeSource.count}, got ${moveResult.moved})`);
+
+  const afterTarget = callTool('count_emails', { mailbox: 'test' });
+  console.log(`\n     → test folder after: ${afterTarget.count}`);
+  assert(afterTarget.count === beforeSource.count, `test folder should have all ${beforeSource.count} emails`);
+});
+
+test('bulk_move test → newsletters (restore)', () => {
+  const beforeSource = callTool('count_emails', { mailbox: 'test' });
+  assert(beforeSource.count > 0, 'test folder should have emails to restore');
+  console.log(`\n     → test folder before restore: ${beforeSource.count}`);
+
+  const moveBack = callTool('bulk_move', { sourceMailbox: 'test', targetMailbox: 'newsletters' });
+  console.log(`\n     → moved back: ${moveBack.moved}`);
+  assert(moveBack.moved === beforeSource.count, `should move all ${beforeSource.count} emails back`);
+
+  const afterRestore = callTool('count_emails', { mailbox: 'newsletters' });
+  console.log(`\n     → newsletters restored: ${afterRestore.count}`);
+  assert(afterRestore.count === beforeSource.count, 'newsletters should be fully restored');
+});
+
 // ─── Destructive (skipped) ────────────────────────────────────────────────────
 console.log('\n⚠️  Destructive Tests (skipped by default)');
-console.log('  Skipping: bulk_move (live)');
 console.log('  Skipping: bulk_delete (live)');
 console.log('  Skipping: bulk_mark_read (live)');
 console.log('  Skipping: bulk_mark_unread (live)');
