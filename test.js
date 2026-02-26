@@ -100,10 +100,25 @@ test('get_top_senders (sample 50)', () => {
   console.log(`\n     → top sender: ${result.topAddresses[0]?.address} (${result.topAddresses[0]?.count})`);
 });
 
-test('get_unread_senders (sample 50)', () => {
+test('get_unread_senders (sample 50, default maxResults)', () => {
   const result = callTool('get_unread_senders', { sampleSize: 50 });
   assert(Array.isArray(result), 'result should be an array');
+  assert(result.length <= 20, 'should not exceed default maxResults of 20');
   console.log(`\n     → ${result.length} unread senders found`);
+});
+
+test('get_unread_senders (sample 50, maxResults 5)', () => {
+  const result = callTool('get_unread_senders', { sampleSize: 50, maxResults: 5 });
+  assert(Array.isArray(result), 'result should be an array');
+  assert(result.length <= 5, 'should not exceed maxResults of 5');
+  console.log(`\n     → ${result.length} unread senders found (capped at 5)`);
+});
+
+test('get_unread_senders (sample 50, maxResults 50)', () => {
+  const result = callTool('get_unread_senders', { sampleSize: 50, maxResults: 50 });
+  assert(Array.isArray(result), 'result should be an array');
+  assert(result.length <= 50, 'should not exceed maxResults of 50');
+  console.log(`\n     → ${result.length} unread senders found (capped at 50)`);
 });
 
 console.log('\n📧 Reading Emails');
@@ -171,6 +186,37 @@ test('get_email (fetch first email content)', () => {
   console.log(`\n     → fetched email: "${result.subject?.slice(0, 40)}..."`);
 });
 
+console.log('\n🔍 Count & Bulk Query');
+
+test('count_emails (all in INBOX)', () => {
+  const result = callTool('count_emails', { mailbox: 'INBOX' });
+  assert(typeof result.count === 'number', 'count should be a number');
+  assert(result.count > 0, 'should have emails in INBOX');
+  console.log(`\n     → ${result.count} emails match`);
+});
+
+test('count_emails (unread only)', () => {
+  const result = callTool('count_emails', { unread: true });
+  assert(typeof result.count === 'number', 'count should be a number');
+  console.log(`\n     → ${result.count} unread emails`);
+});
+
+test('count_emails (by domain)', () => {
+  const senders = callTool('get_top_senders', { sampleSize: 20 });
+  const topDomain = senders.topDomains[0]?.domain;
+  assert(topDomain, 'should have at least one domain');
+  const result = callTool('count_emails', { domain: topDomain });
+  console.log('\n     → raw result:', JSON.stringify(result));
+  assert(typeof result.count === 'number', 'count should be a number');
+  console.log(`\n     → ${result.count} emails from @${topDomain}`);
+});
+
+test('count_emails (before date)', () => {
+  const result = callTool('count_emails', { before: '2020-01-01' });
+  assert(typeof result.count === 'number', 'count should be a number');
+  console.log(`\n     → ${result.count} emails before 2020`);
+});
+
 console.log('\n✏️  Write Operations (flag/mark only — no deletions)');
 
 test('flag_email and unflag_email', () => {
@@ -196,6 +242,9 @@ test('mark_as_read and mark_as_unread', () => {
 });
 
 console.log('\n⚠️  Destructive Tests (skipped by default)');
+console.log('  Skipping: bulk_move (sender → target folder)');
+console.log('  Skipping: bulk_move (folder → folder)');
+console.log('  Skipping: bulk_delete (by domain)');
 console.log('  Skipping: bulk_delete_by_sender');
 console.log('  Skipping: bulk_delete_by_subject');
 console.log('  Skipping: delete_older_than');

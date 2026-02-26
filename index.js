@@ -113,7 +113,7 @@ async function getTopSenders(mailbox = 'INBOX', sampleSize = 500) {
   return { sampledEmails: count, topAddresses, topDomains };
 }
 
-async function getUnreadSenders(mailbox = 'INBOX', sampleSize = 500) {
+async function getUnreadSenders(mailbox = 'INBOX', sampleSize = 500, maxResults = 20) {
   const client = createClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
@@ -121,16 +121,19 @@ async function getUnreadSenders(mailbox = 'INBOX', sampleSize = 500) {
   const recentUids = uids.reverse().slice(0, sampleSize);
   const senderCounts = {};
 
-  for (const uid of recentUids) {
-    const msg = await client.fetchOne(uid, { envelope: true }, { uid: true });
-    if (msg) {
-      const address = msg.envelope.from?.[0]?.address;
-      if (address) senderCounts[address] = (senderCounts[address] || 0) + 1;
-    }
+  if (recentUids.length === 0) {
+    await client.logout();
+    return [];
+  }
+
+  // Fetch all envelopes in a single batch instead of one by one
+  for await (const msg of client.fetch(recentUids, { envelope: true }, { uid: true })) {
+    const address = msg.envelope.from?.[0]?.address;
+    if (address) senderCounts[address] = (senderCounts[address] || 0) + 1;
   }
 
   await client.logout();
-  return Object.entries(senderCounts).sort((a, b) => b[1] - a[1]).slice(0, 20).map(([address, count]) => ({ address, count }));
+  return Object.entries(senderCounts).sort((a, b) => b[1] - a[1]).slice(0, maxResults).map(([address, count]) => ({ address, count }));
 }
 
 async function getEmailsBySender(sender, mailbox = 'INBOX', limit = 10) {
@@ -377,11 +380,78 @@ async function moveEmail(uid, targetMailbox, sourceMailbox = 'INBOX') {
   return true;
 }
 
+// Build an IMAP search query from a filters object
+function buildQuery(filters) {
+  const query = {};
+  if (filters.sender) query.from = filters.sender;
+  if (filters.domain) query.from = filters.domain.replace(/^@/, '');
+  if (filters.subject) query.subject = filters.subject;
+  if (filters.before) query.before = new Date(filters.before);
+  if (filters.since) query.since = new Date(filters.since);
+  if (filters.unread === true) query.seen = false;
+  if (filters.unread === false) query.seen = true;
+  if (filters.flagged === true) query.flagged = true;
+  if (filters.flagged === false) query.unflagged = true;
+  if (filters.larger) query.larger = filters.larger * 1024;
+  if (filters.smaller) query.smaller = filters.smaller * 1024;
+  if (filters.hasAttachment) query.header = ['Content-Type', 'multipart/mixed'];
+  // If no filters set, match all
+  if (Object.keys(query).length === 0) query.all = true;
+  return query;
+}
+
+async function bulkMove(filters, targetMailbox, sourceMailbox = 'INBOX') {
+  const client = createClient();
+  await client.connect();
+  await client.mailboxOpen(sourceMailbox);
+  const query = buildQuery(filters);
+  const uids = (await client.search(query, { uid: true })) ?? [];
+  if (uids.length === 0) { await client.logout(); return { moved: 0, sourceMailbox, targetMailbox }; }
+  await client.messageMove(uids, targetMailbox, { uid: true });
+  await client.logout();
+  return { moved: uids.length, sourceMailbox, targetMailbox, filters };
+}
+
+async function bulkDelete(filters, sourceMailbox = 'INBOX') {
+  const client = createClient();
+  await client.connect();
+  await client.mailboxOpen(sourceMailbox);
+  const query = buildQuery(filters);
+  const uids = (await client.search(query, { uid: true })) ?? [];
+  if (uids.length === 0) { await client.logout(); return { deleted: 0, sourceMailbox }; }
+  await client.messageDelete(uids, { uid: true });
+  await client.logout();
+  return { deleted: uids.length, sourceMailbox, filters };
+}
+
+async function countEmails(filters, mailbox = 'INBOX') {
+  const client = createClient();
+  await client.connect();
+  await client.mailboxOpen(mailbox);
+  const query = buildQuery(filters);
+  const uids = (await client.search(query, { uid: true })) ?? [];
+  await client.logout();
+  return { count: uids.length, mailbox, filters };
+}
+
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.0.8' },
+    { name: 'icloud-mail', version: '1.1.0' },
     { capabilities: { tools: {} } }
   );
+
+  const filtersSchema = {
+    sender: { type: 'string', description: 'Match exact sender email address' },
+    domain: { type: 'string', description: 'Match any sender from this domain (e.g. substack.com)' },
+    subject: { type: 'string', description: 'Keyword to match in subject' },
+    before: { type: 'string', description: 'Only emails before this date (YYYY-MM-DD)' },
+    since: { type: 'string', description: 'Only emails since this date (YYYY-MM-DD)' },
+    unread: { type: 'boolean', description: 'True for unread only, false for read only' },
+    flagged: { type: 'boolean', description: 'True for flagged only, false for unflagged only' },
+    larger: { type: 'number', description: 'Only emails larger than this size in KB' },
+    smaller: { type: 'number', description: 'Only emails smaller than this size in KB' },
+    hasAttachment: { type: 'boolean', description: 'Only emails with attachments' }
+  };
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
@@ -408,7 +478,8 @@ async function main() {
           type: 'object',
           properties: {
             mailbox: { type: 'string', description: 'Mailbox to analyze (default INBOX)' },
-            sampleSize: { type: 'number', description: 'Number of emails to sample (default 500)' }
+            sampleSize: { type: 'number', description: 'Number of emails to sample (default 500)' },
+            maxResults: { type: 'number', description: 'Max number of senders to return (default 20)' }
           }
         }
       },
@@ -608,6 +679,41 @@ async function main() {
         name: 'list_mailboxes',
         description: 'List all mailboxes/folders in iCloud Mail',
         inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'bulk_move',
+        description: 'Move emails matching any combination of filters from one mailbox to another. Use this for large-scale moves — it operates on ALL matching emails in a single IMAP operation regardless of count. Prefer this over read_inbox + move_email for any bulk operation.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            targetMailbox: { type: 'string', description: 'Destination mailbox path' },
+            sourceMailbox: { type: 'string', description: 'Source mailbox (default INBOX)' },
+            ...filtersSchema
+          },
+          required: ['targetMailbox']
+        }
+      },
+      {
+        name: 'bulk_delete',
+        description: 'Delete emails matching any combination of filters. Use this for large-scale deletes — it operates on ALL matching emails in a single IMAP operation regardless of count. Prefer this over read_inbox + delete_email for any bulk operation.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sourceMailbox: { type: 'string', description: 'Mailbox to delete from (default INBOX)' },
+            ...filtersSchema
+          }
+        }
+      },
+      {
+        name: 'count_emails',
+        description: 'Count how many emails match a set of filters without moving or deleting them. Use this before bulk_move or bulk_delete to preview how many emails will be affected.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            mailbox: { type: 'string', description: 'Mailbox to count in (default INBOX)' },
+            ...filtersSchema
+          }
+        }
       }
     ]
   }));
@@ -621,7 +727,7 @@ async function main() {
       } else if (name === 'get_top_senders') {
         result = await getTopSenders(args.mailbox || 'INBOX', args.sampleSize || 500);
       } else if (name === 'get_unread_senders') {
-        result = await getUnreadSenders(args.mailbox || 'INBOX', args.sampleSize || 500);
+        result = await getUnreadSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20);
       } else if (name === 'get_emails_by_sender') {
         result = await getEmailsBySender(args.sender, args.mailbox || 'INBOX', args.limit || 10);
       } else if (name === 'read_inbox') {
@@ -656,6 +762,15 @@ async function main() {
         result = await moveEmail(args.uid, args.targetMailbox, args.sourceMailbox || 'INBOX');
       } else if (name === 'list_mailboxes') {
         result = await listMailboxes();
+      } else if (name === 'bulk_move') {
+        const { targetMailbox, sourceMailbox, ...filters } = args;
+        result = await bulkMove(filters, targetMailbox, sourceMailbox || 'INBOX');
+      } else if (name === 'bulk_delete') {
+        const { sourceMailbox, ...filters } = args;
+        result = await bulkDelete(filters, sourceMailbox || 'INBOX');
+      } else if (name === 'count_emails') {
+        const { mailbox, ...filters } = args;
+        result = await countEmails(filters, mailbox || 'INBOX');
       } else {
         throw new Error(`Unknown tool: ${name}`);
       }
