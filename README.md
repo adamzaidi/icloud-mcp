@@ -6,9 +6,10 @@ A Model Context Protocol (MCP) server that connects Claude Desktop to your iClou
 
 - 📬 Read and paginate through your inbox
 - 🔍 Search emails by keyword, sender, or date range
-- 🗑️ Bulk delete emails by sender or subject
-- 📁 Move emails between folders
+- 🗑️ Bulk delete emails by any combination of filters
+- 📁 Bulk move emails between folders with flexible filtering
 - 📊 Analyze top senders to identify inbox clutter
+- 🔢 Count emails matching any filter before taking action
 - ✅ Mark emails as read/unread, flag/unflag
 - 🗂️ List and create mailboxes
 
@@ -78,12 +79,15 @@ Fully quit Claude Desktop (Cmd+Q) and reopen it. You should now be able to manag
 |------|-------------|
 | `get_inbox_summary` | Total, unread, and recent email counts |
 | `get_top_senders` | Top senders by volume from a sample of recent emails |
-| `get_unread_senders` | Top senders of unread emails |
+| `get_unread_senders` | Top senders of unread emails (supports `sampleSize` and `maxResults`) |
 | `read_inbox` | Paginated inbox with sender, subject, date |
 | `get_email` | Full content of a specific email by UID |
 | `get_emails_by_sender` | All emails from a specific address |
 | `get_emails_by_date_range` | Emails between two dates |
 | `search_emails` | Search by keyword across subject, sender, and body |
+| `count_emails` | Count emails matching any combination of filters without modifying them |
+| `bulk_move` | Move emails matching any combination of filters between folders |
+| `bulk_delete` | Delete emails matching any combination of filters |
 | `flag_email` | Flag or unflag an email |
 | `mark_as_read` | Mark an email as read or unread |
 | `delete_email` | Move an email to Deleted Messages |
@@ -97,14 +101,34 @@ Fully quit Claude Desktop (Cmd+Q) and reopen it. You should now be able to manag
 | `create_mailbox` | Create a new folder |
 | `empty_trash` | Permanently delete all emails in Deleted Messages |
 
+## Bulk Move & Delete Filters
+
+`bulk_move` and `bulk_delete` accept any combination of these filters:
+
+| Filter | Type | Description |
+|--------|------|-------------|
+| `sender` | string | Match exact sender email address |
+| `domain` | string | Match any sender from this domain (e.g. `substack.com`) |
+| `subject` | string | Keyword to match in subject |
+| `before` | string | Only emails before this date (YYYY-MM-DD) |
+| `since` | string | Only emails since this date (YYYY-MM-DD) |
+| `unread` | boolean | `true` for unread only, `false` for read only |
+| `flagged` | boolean | `true` for flagged only, `false` for unflagged only |
+| `larger` | number | Only emails larger than this size in KB |
+| `smaller` | number | Only emails smaller than this size in KB |
+| `hasAttachment` | boolean | Only emails with attachments |
+
 ## Example Usage
 
 Once configured, you can ask Claude things like:
 
 - *"Show me the top senders in my iCloud inbox"*
+- *"How many unread emails do I have from substack.com?"*
+- *"Move all emails from substack.com older than 2023 to my Newsletters folder"*
+- *"Delete all unread emails from linkedin.com before 2022"*
+- *"Move everything in my old_folders/college folder to Archive"*
+- *"How many emails do I have with attachments larger than 5MB?"*
 - *"Delete all emails from no-reply@instagram.com"*
-- *"How many unread emails do I have?"*
-- *"Move all emails from newsletters@substack.com to my newsletters folder"*
 - *"Show me emails from the last week"*
 
 ## Security
