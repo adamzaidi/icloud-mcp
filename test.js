@@ -14,7 +14,15 @@ if (!IMAP_USER || !IMAP_PASSWORD) {
 
 const projectDir = fileURLToPath(new URL('.', import.meta.url));
 
-function callTool(name, args = {}) {
+// Timeout in ms per tool category
+const TIMEOUTS = {
+  mailbox_mgmt: 60000,   // create/rename/delete mailbox — can be slow on iCloud
+  default: 300000        // everything else — allow up to 5 min for large operations
+};
+
+const MAILBOX_MGMT_TOOLS = new Set(['create_mailbox', 'rename_mailbox', 'delete_mailbox']);
+
+function callToolRaw(name, args = {}, timeout = TIMEOUTS.default) {
   const messages = [
     { jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '1.0.0' } } },
     { jsonrpc: '2.0', method: 'notifications/initialized' },
@@ -32,7 +40,7 @@ function callTool(name, args = {}) {
       {
         cwd: projectDir,
         encoding: 'utf8',
-        timeout: 300000,
+        timeout,
         env: { ...process.env, IMAP_USER, IMAP_PASSWORD }
       }
     );
@@ -50,6 +58,26 @@ function callTool(name, args = {}) {
     return JSON.parse(content);
   } finally {
     try { unlinkSync(tmpFile); } catch {}
+  }
+}
+
+function callTool(name, args = {}) {
+  const timeout = MAILBOX_MGMT_TOOLS.has(name) ? TIMEOUTS.mailbox_mgmt : TIMEOUTS.default;
+  try {
+    return callToolRaw(name, args, timeout);
+  } catch (err) {
+    // Only retry on spawn-level transient errors (ECONNRESET, ETIMEDOUT on the
+    // child process itself) — NOT on Tool errors, which are application-level
+    // failures that should propagate immediately.
+    const isSpawnTransient = (
+      err.message.includes('ECONNRESET') ||
+      err.message.includes('ETIMEDOUT')
+    ) && !err.message.startsWith('Tool error:');
+    if (isSpawnTransient) {
+      console.log(`\n     ⚠️  transient spawn error (${err.message.split(':')[0]}), retrying...`);
+      return callToolRaw(name, args, timeout);
+    }
+    throw err;
   }
 }
 
@@ -72,7 +100,40 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-console.log('\n🧪 iCloud MCP Server Tests\n');
+console.log('\n🧪 iCloud MCP Server Tests v1.6.0\n');
+
+// ─── Pre-flight cleanup ───────────────────────────────────────────────────────
+// Abandon any leftover in-progress manifest from a previous crashed run,
+// then restore any emails stranded in the test folder.
+console.log('🧹 Pre-flight cleanup');
+
+try {
+  const status = callTool('get_move_status');
+  if (status.current && status.current.status === 'in_progress') {
+    console.log(`  ⚠️  found in-progress manifest (${status.current.operationId}) — abandoning before cleanup`);
+    callTool('abandon_move');
+  }
+} catch (err) {
+  console.log(`  ⚠️  could not check manifest: ${err.message}`);
+}
+
+try { callTool('delete_mailbox', { name: 'mcp-test-folder-renamed' }); } catch {}
+try { callTool('delete_mailbox', { name: 'mcp-test-folder' }); } catch {}
+
+try {
+  const strandedInTest = callTool('count_emails', { mailbox: 'test' });
+  if (strandedInTest.count > 0) {
+    console.log(`  ⚠️  found ${strandedInTest.count} stranded emails in test folder — restoring to newsletters first`);
+    const restoreResult = callTool('bulk_move', { sourceMailbox: 'test', targetMailbox: 'newsletters' });
+    console.log(`  ⚠️  restore status: ${restoreResult.status}, moved: ${restoreResult.moved}`);
+  } else {
+    console.log('  ✓  test folder is clean');
+  }
+} catch (err) {
+  console.log(`  ⚠️  stranded email cleanup failed: ${err.message} — proceeding anyway`);
+}
+
+console.log('');
 
 // ─── Mailbox & Summary ────────────────────────────────────────────────────────
 console.log('📬 Mailbox & Summary');
@@ -270,6 +331,7 @@ test('bulk_move (dryRun)', () => {
   const result = callTool('bulk_move', { domain: topDomain, targetMailbox: 'Archive', dryRun: true });
   assert(result.dryRun === true, 'dryRun should be true');
   assert(typeof result.wouldMove === 'number', 'wouldMove should be a number');
+  assert(result.targetMailbox === 'Archive', 'targetMailbox should be Archive');
   console.log(`\n     → would move ${result.wouldMove} emails from @${topDomain}`);
 });
 
@@ -277,6 +339,7 @@ test('bulk_delete (dryRun)', () => {
   const result = callTool('bulk_delete', { before: '2015-01-01', dryRun: true });
   assert(result.dryRun === true, 'dryRun should be true');
   assert(typeof result.wouldDelete === 'number', 'wouldDelete should be a number');
+  assert(typeof result.sourceMailbox === 'string', 'sourceMailbox should be a string');
   console.log(`\n     → would delete ${result.wouldDelete} emails before 2015`);
 });
 
@@ -314,48 +377,147 @@ test('create_mailbox', () => {
   console.log(`\n     → created: ${result.created}`);
 });
 
-test('rename_mailbox', () => {
-  const result = callTool('rename_mailbox', { oldName: 'mcp-test-folder', newName: 'mcp-test-folder-renamed' });
-  assert(result.renamed.from === 'mcp-test-folder', 'from should match old name');
-  assert(result.renamed.to === 'mcp-test-folder-renamed', 'to should match new name');
-  console.log(`\n     → renamed: ${result.renamed.from} → ${result.renamed.to}`);
+test('rename_mailbox + delete_mailbox', () => {
+  const renamed = callTool('rename_mailbox', { oldName: 'mcp-test-folder', newName: 'mcp-test-folder-renamed' });
+  assert(renamed.renamed.from === 'mcp-test-folder', 'from should match old name');
+  assert(renamed.renamed.to === 'mcp-test-folder-renamed', 'to should match new name');
+  console.log(`\n     → renamed: ${renamed.renamed.from} → ${renamed.renamed.to}`);
+
+  const deleted = callTool('delete_mailbox', { name: 'mcp-test-folder-renamed' });
+  assert(deleted.deleted === 'mcp-test-folder-renamed', 'should confirm deletion');
+  console.log(`\n     → deleted: ${deleted.deleted}`);
 });
 
-test('delete_mailbox', () => {
-  const result = callTool('delete_mailbox', { name: 'mcp-test-folder-renamed' });
-  assert(result.deleted === 'mcp-test-folder-renamed', 'should confirm deletion');
-  console.log(`\n     → deleted: ${result.deleted}`);
+// ─── Move Manifest ────────────────────────────────────────────────────────────
+console.log('\n🗺️  Move Manifest');
+
+test('get_move_status (no operation)', () => {
+  // Abandon any leftover operation so we start clean
+  try { callTool('abandon_move'); } catch {}
+  const result = callTool('get_move_status');
+  assert(result.status === 'no_operation', `expected no_operation, got ${result.status}`);
+  assert(Array.isArray(result.history), 'history should be an array');
+  console.log(`\n     → status: ${result.status}, history: ${result.history.length} entries`);
 });
 
-// ─── Chunk Move Test (live) ───────────────────────────────────────────────────
-console.log('\n📦 Chunk Move Test (live — newsletters ↔ test)');
+test('abandon_move (nothing to abandon)', () => {
+  const result = callTool('abandon_move');
+  assert(result.abandoned === false, 'should return abandoned: false when nothing in progress');
+  assert(typeof result.message === 'string', 'should include a message');
+  console.log(`\n     → ${result.message}`);
+});
 
-test('bulk_move newsletters → test (chunked)', () => {
+// ─── Safe Move (live) ─────────────────────────────────────────────────────────
+console.log('\n🔐 Safe Move Test (live — newsletters ↔ test)');
+
+test('bulk_move newsletters → test (fingerprint verified)', () => {
   const beforeSource = callTool('count_emails', { mailbox: 'newsletters' });
   assert(beforeSource.count > 0, 'newsletters should have emails');
   console.log(`\n     → newsletters before: ${beforeSource.count}`);
 
   const moveResult = callTool('bulk_move', { sourceMailbox: 'newsletters', targetMailbox: 'test' });
-  console.log(`\n     → moved: ${moveResult.moved}`);
-  assert(moveResult.moved === beforeSource.count, `moved count should match source (expected ${beforeSource.count}, got ${moveResult.moved})`);
+  console.log(`\n     → status: ${moveResult.status}, moved: ${moveResult.moved} of ${moveResult.total}`);
+  assert(moveResult.status === 'complete', `expected complete, got ${moveResult.status}: ${moveResult.message || ''}`);
+  assert(moveResult.moved === beforeSource.count, `moved ${moveResult.moved} but expected ${beforeSource.count}`);
+  assert(moveResult.total === beforeSource.count, `total ${moveResult.total} should match source count ${beforeSource.count}`);
+
+  const afterSource = callTool('count_emails', { mailbox: 'newsletters' });
+  console.log(`\n     → newsletters after (should be 0): ${afterSource.count}`);
+  assert(afterSource.count === 0, `newsletters should be empty, has ${afterSource.count}`);
 
   const afterTarget = callTool('count_emails', { mailbox: 'test' });
   console.log(`\n     → test folder after: ${afterTarget.count}`);
-  assert(afterTarget.count === beforeSource.count, `test folder should have all ${beforeSource.count} emails`);
+  assert(afterTarget.count === beforeSource.count, `test should have ${beforeSource.count}, has ${afterTarget.count}`);
 });
 
-test('bulk_move test → newsletters (restore)', () => {
+test('get_move_status (after completed move)', () => {
+  const result = callTool('get_move_status');
+  // Current should be null (archived after completion), history should have the move
+  assert(result.status === 'no_operation', `expected no_operation after completed move, got ${result.status}`);
+  assert(result.history.length > 0, 'history should have at least one entry');
+  const last = result.history[0];
+  assert(last.status === 'complete', `last operation should be complete, got ${last.status}`);
+  assert(last.source === 'newsletters', `source should be newsletters, got ${last.source}`);
+  assert(last.target === 'test', `target should be test, got ${last.target}`);
+  console.log(`\n     → last op: ${last.status}, ${last.moved}/${last.total} moved from ${last.source} → ${last.target}`);
+});
+
+test('bulk_move test → newsletters (restore, fingerprint verified)', () => {
   const beforeSource = callTool('count_emails', { mailbox: 'test' });
   assert(beforeSource.count > 0, 'test folder should have emails to restore');
-  console.log(`\n     → test folder before restore: ${beforeSource.count}`);
+  console.log(`\n     → test before restore: ${beforeSource.count}`);
 
   const moveBack = callTool('bulk_move', { sourceMailbox: 'test', targetMailbox: 'newsletters' });
-  console.log(`\n     → moved back: ${moveBack.moved}`);
-  assert(moveBack.moved === beforeSource.count, `should move all ${beforeSource.count} emails back`);
+  console.log(`\n     → status: ${moveBack.status}, moved: ${moveBack.moved} of ${moveBack.total}`);
+  assert(moveBack.status === 'complete', `expected complete, got ${moveBack.status}: ${moveBack.message || ''}`);
+  assert(moveBack.moved === beforeSource.count, `moved ${moveBack.moved} but expected ${beforeSource.count}`);
 
-  const afterRestore = callTool('count_emails', { mailbox: 'newsletters' });
-  console.log(`\n     → newsletters restored: ${afterRestore.count}`);
-  assert(afterRestore.count === beforeSource.count, 'newsletters should be fully restored');
+  const afterSource = callTool('count_emails', { mailbox: 'test' });
+  console.log(`\n     → test after (should be 0): ${afterSource.count}`);
+  assert(afterSource.count === 0, `test should be empty, has ${afterSource.count}`);
+
+  const afterTarget = callTool('count_emails', { mailbox: 'newsletters' });
+  console.log(`\n     → newsletters restored: ${afterTarget.count}`);
+  assert(afterTarget.count === beforeSource.count, `newsletters should have ${beforeSource.count}, has ${afterTarget.count}`);
+});
+
+test('get_move_status (history has both moves)', () => {
+  const result = callTool('get_move_status');
+  assert(result.status === 'no_operation', 'no operation should be in progress');
+  assert(result.history.length >= 2, `history should have at least 2 entries, has ${result.history.length}`);
+  const [restore, forward] = result.history;
+  assert(restore.status === 'complete', `restore op should be complete, got ${restore.status}`);
+  assert(restore.source === 'test', `restore source should be test, got ${restore.source}`);
+  assert(forward.status === 'complete', `forward op should be complete, got ${forward.status}`);
+  assert(forward.source === 'newsletters', `forward source should be newsletters, got ${forward.source}`);
+  console.log(`\n     → history[0]: ${restore.source} → ${restore.target} (${restore.status})`);
+  console.log(`\n     → history[1]: ${forward.source} → ${forward.target} (${forward.status})`);
+});
+
+// ─── Session Log ─────────────────────────────────────────────────────────────
+console.log('\n📝 Session Log');
+
+test('log_clear', () => {
+  const result = callTool('log_clear');
+  assert(result.cleared === true, 'should confirm cleared');
+  console.log(`\n     → log cleared`);
+});
+
+test('log_write (plan)', () => {
+  const result = callTool('log_write', { step: 'plan: test log functionality' });
+  assert(Array.isArray(result.steps), 'steps should be an array');
+  assert(result.steps.length === 1, 'should have 1 step');
+  assert(typeof result.startedAt === 'string', 'startedAt should be a string');
+  assert(result.steps[0].step === 'plan: test log functionality', 'step content should match');
+  assert(typeof result.steps[0].time === 'string', 'step should have a timestamp');
+  console.log(`\n     → wrote step, log has ${result.steps.length} entry`);
+});
+
+test('log_write (second step)', () => {
+  const result = callTool('log_write', { step: 'done: log test complete' });
+  assert(Array.isArray(result.steps), 'steps should be an array');
+  assert(result.steps.length === 2, 'should have 2 steps');
+  assert(result.steps[1].step === 'done: log test complete', 'second step content should match');
+  console.log(`\n     → log now has ${result.steps.length} entries`);
+});
+
+test('log_read', () => {
+  const result = callTool('log_read');
+  assert(Array.isArray(result.steps), 'steps should be an array');
+  assert(result.steps.length === 2, 'should have 2 steps');
+  assert(result.steps[0].step === 'plan: test log functionality', 'first step should match');
+  assert(result.steps[1].step === 'done: log test complete', 'second step should match');
+  assert(typeof result.startedAt === 'string', 'startedAt should persist');
+  console.log(`\n     → read log: ${result.steps.length} steps, started ${result.startedAt}`);
+});
+
+test('log_clear (cleanup)', () => {
+  const result = callTool('log_clear');
+  assert(result.cleared === true, 'should confirm cleared');
+  const log = callTool('log_read');
+  assert(log.steps.length === 0, 'log should be empty after clear');
+  assert(log.startedAt === null, 'startedAt should be null after clear');
+  console.log(`\n     → log cleared and verified empty`);
 });
 
 // ─── Destructive (skipped) ────────────────────────────────────────────────────

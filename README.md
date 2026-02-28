@@ -13,6 +13,7 @@ A Model Context Protocol (MCP) server that connects Claude Desktop to your iClou
 - ✅ Mark emails as read/unread, flag/unflag in bulk or individually
 - 🗂️ List, create, rename, and delete mailboxes
 - 🔄 Dry run mode for bulk operations — preview before committing
+- 📝 Session logging — Claude tracks progress across long multi-step operations
 
 ## Prerequisites
 
@@ -70,7 +71,20 @@ Add the following under `mcpServers`, replacing the path with your npm root path
 
 > **Note:** If your `npm root -g` returned a different path, replace `/opt/homebrew/lib/node_modules` with that path.
 
-### 4. Restart Claude Desktop
+### 4. Add Custom Instructions (Recommended)
+
+For large inbox operations, add the following to Claude Desktop's custom instructions to ensure Claude stays on track and checks in with you regularly. Go to **Claude Desktop → Settings → Custom Instructions** and add:
+
+```
+When using icloud-mail tools:
+1. Before starting any multi-step operation, call log_clear then log_write with your full plan
+2. After every single tool call, call log_write with what you did and the result
+3. After every 3 tool calls, stop and summarize progress to the user and wait for confirmation before continuing
+4. Never assume a bulk operation succeeded — always verify with count_emails after
+5. If you are ever unsure what you have done so far, call log_read before proceeding
+```
+
+### 5. Restart Claude Desktop
 
 Fully quit Claude Desktop (Cmd+Q) and reopen it. You should now be able to manage your iCloud inbox through Claude.
 
@@ -106,6 +120,9 @@ Fully quit Claude Desktop (Cmd+Q) and reopen it. You should now be able to manag
 | `rename_mailbox` | Rename an existing folder |
 | `delete_mailbox` | Delete a folder (must be empty first) |
 | `empty_trash` | Permanently delete all emails in Deleted Messages |
+| `log_write` | Write a step to the session log |
+| `log_read` | Read the session log to see what has been done so far |
+| `log_clear` | Clear the session log and start fresh |
 
 ## Bulk Move, Delete & Flag Filters
 
@@ -129,6 +146,10 @@ Fully quit Claude Desktop (Cmd+Q) and reopen it. You should now be able to manag
 Pass `dryRun: true` to `bulk_move` or `bulk_delete` to preview how many emails would be affected without making any changes:
 
 > *"How many emails would be deleted if I removed everything from linkedin.com before 2022?"*
+
+### Session Log
+
+The session log persists to `~/.icloud-mcp-session.json` on your Mac — outside Claude's context window — so progress is never lost during long operations. Claude can write its plan at the start, log each completed step, and read the log back at any point to reorient itself.
 
 ## Example Usage
 

@@ -3,6 +3,13 @@ import { ImapFlow } from 'imapflow';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { homedir } from 'os';
+import { join } from 'path';
+
+const LOG_FILE = join(homedir(), '.icloud-mcp-session.json');
+const MANIFEST_FILE = join(homedir(), '.icloud-mcp-move-manifest.json');
+const MAX_HISTORY = 5;
 
 const IMAP_USER = process.env.IMAP_USER;
 const IMAP_PASSWORD = process.env.IMAP_PASSWORD;
@@ -21,6 +28,385 @@ function createClient() {
     logger: false
   });
 }
+
+// ─── Move Manifest ────────────────────────────────────────────────────────────
+
+const CHUNK_SIZE = 250;
+const CHUNK_SIZE_RETRY = 100;
+
+function readManifest() {
+  if (!existsSync(MANIFEST_FILE)) return { current: null, history: [] };
+  try {
+    return JSON.parse(readFileSync(MANIFEST_FILE, 'utf8'));
+  } catch {
+    return { current: null, history: [] };
+  }
+}
+
+function writeManifest(data) {
+  writeFileSync(MANIFEST_FILE, JSON.stringify(data, null, 2));
+}
+
+function updateManifest(updater) {
+  const data = readManifest();
+  updater(data);
+  data.current.updatedAt = new Date().toISOString();
+  writeManifest(data);
+  return data;
+}
+
+function archiveCurrent(data) {
+  if (data.current) {
+    data.history.unshift(data.current);
+    if (data.history.length > MAX_HISTORY) data.history = data.history.slice(0, MAX_HISTORY);
+    data.current = null;
+  }
+}
+
+function getMoveStatus() {
+  const data = readManifest();
+  if (!data.current) return { status: 'no_operation', history: data.history.map(summarizeOp) };
+  return {
+    current: formatOperation(data.current),
+    history: data.history.map(summarizeOp)
+  };
+}
+
+function abandonMove() {
+  const data = readManifest();
+  if (!data.current) return { abandoned: false, message: 'No in-progress operation to abandon' };
+  if (data.current.status !== 'in_progress') {
+    return { abandoned: false, message: `Current operation is already '${data.current.status}', nothing to abandon` };
+  }
+  const operationId = data.current.operationId;
+  data.current.status = 'abandoned';
+  data.current.updatedAt = new Date().toISOString();
+  archiveCurrent(data);
+  writeManifest(data);
+  return { abandoned: true, operationId };
+}
+
+function startOperation(source, target, uids) {
+  const data = readManifest();
+
+  if (data.current && data.current.status === 'in_progress') {
+    const op = data.current;
+    throw new Error(
+      `Incomplete move operation detected (${op.operationId}): ` +
+      `${op.summary.emailsMoved} of ${op.totalUids} emails moved from '${op.source}' to '${op.target}' ` +
+      `started at ${op.startedAt}. ` +
+      `Call abandon_move to discard it or get_move_status to inspect it before starting a new operation.`
+    );
+  }
+
+  archiveCurrent(data);
+
+  const operationId = `move_${Date.now()}`;
+  const chunks = [];
+
+  for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
+    chunks.push({
+      index: chunks.length,
+      uids: uids.slice(i, i + CHUNK_SIZE),
+      fingerprints: [],
+      status: 'pending',
+      copiedAt: null,
+      verifiedAt: null,
+      deletedAt: null,
+      failureReason: null
+    });
+  }
+
+  data.current = {
+    operationId,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    source,
+    target,
+    totalUids: uids.length,
+    status: 'in_progress',
+    chunks,
+    summary: {
+      chunksComplete: 0,
+      emailsMoved: 0,
+      emailsPending: uids.length,
+      emailsFailed: 0
+    }
+  };
+
+  writeManifest(data);
+  return data.current;
+}
+
+function updateChunk(index, updates) {
+  updateManifest((data) => {
+    const chunk = data.current.chunks[index];
+    Object.assign(chunk, updates);
+
+    let moved = 0, failed = 0, pending = 0;
+    for (const c of data.current.chunks) {
+      if (c.status === 'complete') moved += c.uids.length;
+      else if (c.status === 'failed') failed += c.uids.length;
+      else pending += c.uids.length;
+    }
+    data.current.summary = {
+      chunksComplete: data.current.chunks.filter(c => c.status === 'complete').length,
+      emailsMoved: moved,
+      emailsPending: pending,
+      emailsFailed: failed
+    };
+  });
+}
+
+function completeOperation() {
+  const data = readManifest();
+  if (!data.current) return;
+  data.current.status = 'complete';
+  data.current.updatedAt = new Date().toISOString();
+  archiveCurrent(data);
+  writeManifest(data);
+}
+
+function failOperation(reason) {
+  const data = readManifest();
+  if (!data.current) return;
+  data.current.status = 'failed';
+  data.current.failureReason = reason;
+  data.current.updatedAt = new Date().toISOString();
+  archiveCurrent(data);
+  writeManifest(data);
+}
+
+function formatOperation(op) {
+  return {
+    operationId: op.operationId,
+    status: op.status,
+    source: op.source,
+    target: op.target,
+    startedAt: op.startedAt,
+    updatedAt: op.updatedAt,
+    summary: op.summary,
+    failedChunks: op.chunks.filter(c => c.status === 'failed').map(c => ({
+      index: c.index,
+      uids: c.uids.length,
+      reason: c.failureReason
+    }))
+  };
+}
+
+function summarizeOp(op) {
+  return {
+    operationId: op.operationId,
+    status: op.status,
+    source: op.source,
+    target: op.target,
+    startedAt: op.startedAt,
+    moved: op.summary.emailsMoved,
+    failed: op.summary.emailsFailed,
+    total: op.totalUids
+  };
+}
+
+// ─── Fingerprinting ───────────────────────────────────────────────────────────
+
+function buildFingerprint(msg) {
+  const messageId = msg.envelope?.messageId ?? null;
+  const sender = msg.envelope?.from?.[0]?.address ?? '';
+  const date = msg.envelope?.date ? new Date(msg.envelope.date).toISOString() : '';
+  const subject = msg.envelope?.subject ?? '';
+  const fallback = [sender, date, subject].join('|');
+  return { uid: msg.uid, messageId, fallback };
+}
+
+function fingerprintToKey(fp) {
+  return fp.messageId ?? fp.fallback;
+}
+
+// ─── IMAP Move Helpers ────────────────────────────────────────────────────────
+
+async function fetchEnvelopes(mailbox, uids) {
+  const client = createClient();
+  await client.connect();
+  await client.mailboxOpen(mailbox);
+  const envelopes = [];
+  for await (const msg of client.fetch(uids, { envelope: true }, { uid: true })) {
+    envelopes.push(msg);
+  }
+  await client.logout();
+  return envelopes;
+}
+
+async function copyChunk(sourceMailbox, targetMailbox, uids) {
+  const client = createClient();
+  await client.connect();
+  await client.mailboxOpen(sourceMailbox);
+  await client.messageCopy(uids, targetMailbox, { uid: true });
+  await client.logout();
+}
+
+async function deleteChunk(sourceMailbox, uids) {
+  const client = createClient();
+  await client.connect();
+  await client.mailboxOpen(sourceMailbox);
+  await client.messageDelete(uids, { uid: true });
+  await client.logout();
+}
+
+async function verifyFingerprintsInTarget(targetMailbox, expectedFingerprints) {
+  const client = createClient();
+  await client.connect();
+  const mb = await client.mailboxOpen(targetMailbox);
+  const total = mb.exists;
+
+  // Fetch recent envelopes from target — copies land at the end
+  const fetchCount = Math.min(total, expectedFingerprints.length * 2 + 500);
+  const start = Math.max(1, total - fetchCount + 1);
+  const range = `${start}:${total}`;
+
+  const targetKeys = new Set();
+  for await (const msg of client.fetch(range, { envelope: true })) {
+    const fp = buildFingerprint(msg);
+    targetKeys.add(fingerprintToKey(fp));
+  }
+  await client.logout();
+
+  const missing = [];
+  for (const fp of expectedFingerprints) {
+    const key = fingerprintToKey(fp);
+    if (!targetKeys.has(key)) missing.push(fp);
+  }
+
+  return {
+    verified: missing.length === 0,
+    missing,
+    found: expectedFingerprints.length - missing.length,
+    expected: expectedFingerprints.length
+  };
+}
+
+// ─── Transient error detection ────────────────────────────────────────────────
+
+function isTransient(err) {
+  const msg = err.message ?? '';
+  return msg.includes('ECONNRESET') ||
+    msg.includes('ECONNREFUSED') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('EPIPE') ||
+    msg.includes('socket hang up') ||
+    msg.includes('Connection not available') ||
+    msg.includes('BAD') ||      // IMAP BAD response — often transient on Apple
+    msg.includes('NO ');        // IMAP NO response — often transient on Apple
+}
+
+async function withRetry(label, fn, maxAttempts = 3) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransient(err) || attempt === maxAttempts) throw err;
+      const delay = attempt * 2000; // 2s, 4s backoff
+      process.stderr.write(`[retry] ${label} failed (attempt ${attempt}/${maxAttempts}): ${err.message} — retrying in ${delay}ms\n`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
+// ─── Safe Move ────────────────────────────────────────────────────────────────
+
+async function safeMoveEmails(uids, sourceMailbox, targetMailbox) {
+  const operation = startOperation(sourceMailbox, targetMailbox, uids);
+  let totalMoved = 0;
+  let totalFailed = 0;
+
+  for (const chunk of operation.chunks) {
+    const chunkUids = chunk.uids;
+    let succeeded = false;
+
+    // Try at full chunk size first, then smaller on verification failure
+    for (const attemptChunkSize of [CHUNK_SIZE, CHUNK_SIZE_RETRY]) {
+      const subChunks = [];
+      for (let i = 0; i < chunkUids.length; i += attemptChunkSize) {
+        subChunks.push(chunkUids.slice(i, i + attemptChunkSize));
+      }
+
+      let verificationFailed = false;
+
+      for (const subChunk of subChunks) {
+        // Step 1: fetch fingerprints from source and write to manifest
+        // before doing anything destructive — retries on transient errors
+        const envelopes = await withRetry(
+          `fetchEnvelopes chunk ${chunk.index}`,
+          () => fetchEnvelopes(sourceMailbox, subChunk)
+        );
+        const fingerprints = envelopes.map(buildFingerprint);
+
+        updateManifest((data) => {
+          const c = data.current.chunks[chunk.index];
+          c.fingerprints = [...c.fingerprints, ...fingerprints];
+          c.status = 'pending';
+        });
+
+        // Step 2: copy to target — retries on transient errors
+        await withRetry(
+          `copyChunk chunk ${chunk.index}`,
+          () => copyChunk(sourceMailbox, targetMailbox, subChunk)
+        );
+        updateChunk(chunk.index, { status: 'copied_not_verified', copiedAt: new Date().toISOString() });
+
+        // Step 3: verify by fetching envelopes from target — retries on transient errors
+        const verification = await withRetry(
+          `verifyFingerprints chunk ${chunk.index}`,
+          () => verifyFingerprintsInTarget(targetMailbox, fingerprints)
+        );
+        if (!verification.verified) {
+          verificationFailed = true;
+          break;
+        }
+        updateChunk(chunk.index, { status: 'verified_not_deleted', verifiedAt: new Date().toISOString() });
+
+        // Step 4: safe to delete from source — retries on transient errors
+        await withRetry(
+          `deleteChunk chunk ${chunk.index}`,
+          () => deleteChunk(sourceMailbox, subChunk)
+        );
+        totalMoved += subChunk.length;
+      }
+
+      if (!verificationFailed) {
+        succeeded = true;
+        break;
+      }
+
+      if (attemptChunkSize === CHUNK_SIZE_RETRY) {
+        // Verification failed at both chunk sizes — stop and report, source untouched from here
+        updateChunk(chunk.index, {
+          status: 'failed',
+          failureReason: 'Verification failed at both chunk sizes'
+        });
+        totalFailed += chunkUids.length;
+        failOperation(`Verification failed after retry on chunk ${chunk.index}`);
+        return {
+          status: 'partial',
+          moved: totalMoved,
+          failed: totalFailed,
+          message: `Verification failed after retry. ${totalMoved} emails moved successfully. ${operation.totalUids - totalMoved} remain in source untouched. Call get_move_status for details.`
+        };
+      }
+    }
+
+    if (succeeded) {
+      updateChunk(chunk.index, { status: 'complete', deletedAt: new Date().toISOString() });
+    }
+  }
+
+  completeOperation();
+  return { status: 'complete', moved: totalMoved, total: operation.totalUids };
+}
+
+// ─── Email Functions ──────────────────────────────────────────────────────────
 
 async function fetchEmails(mailbox = 'INBOX', limit = 10, onlyUnread = false, page = 1) {
   const client = createClient();
@@ -165,15 +551,18 @@ async function bulkDeleteBySender(sender, mailbox = 'INBOX') {
   await client.connect();
   await client.mailboxOpen(mailbox);
   const uids = (await client.search({ from: sender }, { uid: true })) ?? [];
-  if (uids.length === 0) { await client.logout(); return { deleted: 0 }; }
-  const chunkSize = 250;
+  await client.logout();
+  if (uids.length === 0) return { deleted: 0 };
   let deleted = 0;
-  for (let i = 0; i < uids.length; i += chunkSize) {
-    const chunk = uids.slice(i, i + chunkSize);
-    await client.messageDelete(chunk, { uid: true });
+  for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
+    const chunk = uids.slice(i, i + CHUNK_SIZE);
+    const dc = createClient();
+    await dc.connect();
+    await dc.mailboxOpen(mailbox);
+    await dc.messageDelete(chunk, { uid: true });
+    await dc.logout();
     deleted += chunk.length;
   }
-  await client.logout();
   return { deleted, sender };
 }
 
@@ -182,16 +571,11 @@ async function bulkMoveBySender(sender, targetMailbox, sourceMailbox = 'INBOX') 
   await client.connect();
   await client.mailboxOpen(sourceMailbox);
   const uids = (await client.search({ from: sender }, { uid: true })) ?? [];
-  if (uids.length === 0) { await client.logout(); return { moved: 0 }; }
-  const chunkSize = 250;
-  let moved = 0;
-  for (let i = 0; i < uids.length; i += chunkSize) {
-    const chunk = uids.slice(i, i + chunkSize);
-    await client.messageMove(chunk, targetMailbox, { uid: true });
-    moved += chunk.length;
-  }
   await client.logout();
-  return { moved, sender, targetMailbox };
+  if (uids.length === 0) return { moved: 0 };
+  await ensureMailbox(targetMailbox);
+  const result = await safeMoveEmails(uids, sourceMailbox, targetMailbox);
+  return { ...result, sender, targetMailbox };
 }
 
 async function bulkDeleteBySubject(subject, mailbox = 'INBOX') {
@@ -199,15 +583,18 @@ async function bulkDeleteBySubject(subject, mailbox = 'INBOX') {
   await client.connect();
   await client.mailboxOpen(mailbox);
   const uids = (await client.search({ subject }, { uid: true })) ?? [];
-  if (uids.length === 0) { await client.logout(); return { deleted: 0 }; }
-  const chunkSize = 250;
+  await client.logout();
+  if (uids.length === 0) return { deleted: 0 };
   let deleted = 0;
-  for (let i = 0; i < uids.length; i += chunkSize) {
-    const chunk = uids.slice(i, i + chunkSize);
-    await client.messageDelete(chunk, { uid: true });
+  for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
+    const chunk = uids.slice(i, i + CHUNK_SIZE);
+    const dc = createClient();
+    await dc.connect();
+    await dc.mailboxOpen(mailbox);
+    await dc.messageDelete(chunk, { uid: true });
+    await dc.logout();
     deleted += chunk.length;
   }
-  await client.logout();
   return { deleted, subject };
 }
 
@@ -218,15 +605,18 @@ async function deleteOlderThan(days, mailbox = 'INBOX') {
   const date = new Date();
   date.setDate(date.getDate() - days);
   const uids = (await client.search({ before: date }, { uid: true })) ?? [];
-  if (uids.length === 0) { await client.logout(); return { deleted: 0 }; }
-  const chunkSize = 250;
+  await client.logout();
+  if (uids.length === 0) return { deleted: 0 };
   let deleted = 0;
-  for (let i = 0; i < uids.length; i += chunkSize) {
-    const chunk = uids.slice(i, i + chunkSize);
-    await client.messageDelete(chunk, { uid: true });
+  for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
+    const chunk = uids.slice(i, i + CHUNK_SIZE);
+    const dc = createClient();
+    await dc.connect();
+    await dc.mailboxOpen(mailbox);
+    await dc.messageDelete(chunk, { uid: true });
+    await dc.logout();
     deleted += chunk.length;
   }
-  await client.logout();
   return { deleted, olderThan: date.toISOString() };
 }
 
@@ -301,10 +691,9 @@ async function emptyTrash() {
   await client.mailboxOpen('Deleted Messages');
   const uids = (await client.search({ all: true }, { uid: true })) ?? [];
   if (uids.length === 0) { await client.logout(); return { deleted: 0 }; }
-  const chunkSize = 250;
   let deleted = 0;
-  for (let i = 0; i < uids.length; i += chunkSize) {
-    const chunk = uids.slice(i, i + chunkSize);
+  for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
+    const chunk = uids.slice(i, i + CHUNK_SIZE);
     await client.messageDelete(chunk, { uid: true });
     deleted += chunk.length;
   }
@@ -323,16 +712,32 @@ async function createMailbox(name) {
 async function renameMailbox(oldName, newName) {
   const client = createClient();
   await client.connect();
-  await client.mailboxRename(oldName, newName);
-  await client.logout();
+  try {
+    await Promise.race([
+      client.mailboxRename(oldName, newName),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('rename timed out after 15s — Apple IMAP may not support renaming this folder')), 15000)
+      )
+    ]);
+  } finally {
+    try { await client.logout(); } catch { client.close(); }
+  }
   return { renamed: { from: oldName, to: newName } };
 }
 
 async function deleteMailbox(name) {
   const client = createClient();
   await client.connect();
-  await client.mailboxDelete(name);
-  await client.logout();
+  try {
+    await Promise.race([
+      client.mailboxDelete(name),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('delete timed out after 15s — Apple IMAP may not support deleting this folder')), 15000)
+      )
+    ]);
+  } finally {
+    try { await client.logout(); } catch { client.close(); }
+  }
   return { deleted: name };
 }
 
@@ -483,26 +888,29 @@ function buildQuery(filters) {
   return query;
 }
 
+async function ensureMailbox(name) {
+  const client = createClient();
+  await client.connect();
+  try { await client.mailboxCreate(name); } catch { /* already exists */ }
+  await client.logout();
+}
+
 async function bulkMove(filters, targetMailbox, sourceMailbox = 'INBOX', dryRun = false) {
   const client = createClient();
   await client.connect();
   await client.mailboxOpen(sourceMailbox);
   const query = buildQuery(filters);
   const uids = (await client.search(query, { uid: true })) ?? [];
+  await client.logout();
+
   if (dryRun) {
-    await client.logout();
     return { dryRun: true, wouldMove: uids.length, sourceMailbox, targetMailbox, filters };
   }
-  if (uids.length === 0) { await client.logout(); return { moved: 0, sourceMailbox, targetMailbox }; }
-  const chunkSize = 250;
-  let moved = 0;
-  for (let i = 0; i < uids.length; i += chunkSize) {
-    const chunk = uids.slice(i, i + chunkSize);
-    await client.messageMove(chunk, targetMailbox, { uid: true });
-    moved += chunk.length;
-  }
-  await client.logout();
-  return { moved, sourceMailbox, targetMailbox, filters };
+  if (uids.length === 0) return { moved: 0, sourceMailbox, targetMailbox };
+
+  await ensureMailbox(targetMailbox);
+  const result = await safeMoveEmails(uids, sourceMailbox, targetMailbox);
+  return { ...result, sourceMailbox, targetMailbox, filters };
 }
 
 async function bulkDelete(filters, sourceMailbox = 'INBOX', dryRun = false) {
@@ -511,19 +919,23 @@ async function bulkDelete(filters, sourceMailbox = 'INBOX', dryRun = false) {
   await client.mailboxOpen(sourceMailbox);
   const query = buildQuery(filters);
   const uids = (await client.search(query, { uid: true })) ?? [];
+  await client.logout();
+
   if (dryRun) {
-    await client.logout();
     return { dryRun: true, wouldDelete: uids.length, sourceMailbox, filters };
   }
-  if (uids.length === 0) { await client.logout(); return { deleted: 0, sourceMailbox }; }
-  const chunkSize = 250;
+  if (uids.length === 0) return { deleted: 0, sourceMailbox };
+
   let deleted = 0;
-  for (let i = 0; i < uids.length; i += chunkSize) {
-    const chunk = uids.slice(i, i + chunkSize);
-    await client.messageDelete(chunk, { uid: true });
+  for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
+    const chunk = uids.slice(i, i + CHUNK_SIZE);
+    const deleteClient = createClient();
+    await deleteClient.connect();
+    await deleteClient.mailboxOpen(sourceMailbox);
+    await deleteClient.messageDelete(chunk, { uid: true });
+    await deleteClient.logout();
     deleted += chunk.length;
   }
-  await client.logout();
   return { deleted, sourceMailbox, filters };
 }
 
@@ -537,9 +949,35 @@ async function countEmails(filters, mailbox = 'INBOX') {
   return { count: uids.length, mailbox, filters };
 }
 
+// ─── Session Log ──────────────────────────────────────────────────────────────
+
+function logRead() {
+  if (!existsSync(LOG_FILE)) return { steps: [], startedAt: null };
+  try {
+    return JSON.parse(readFileSync(LOG_FILE, 'utf8'));
+  } catch {
+    return { steps: [], startedAt: null };
+  }
+}
+
+function logWrite(step) {
+  const log = logRead();
+  if (!log.startedAt) log.startedAt = new Date().toISOString();
+  log.steps.push({ time: new Date().toISOString(), step });
+  writeFileSync(LOG_FILE, JSON.stringify(log, null, 2));
+  return log;
+}
+
+function logClear() {
+  writeFileSync(LOG_FILE, JSON.stringify({ steps: [], startedAt: null }, null, 2));
+  return { cleared: true };
+}
+
+// ─── MCP Server ───────────────────────────────────────────────────────────────
+
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.3.0' },
+    { name: 'icloud-mail', version: '1.6.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -568,9 +1006,7 @@ async function main() {
         description: 'Get total, unread, and recent email counts for any specific mailbox/folder',
         inputSchema: {
           type: 'object',
-          properties: {
-            mailbox: { type: 'string', description: 'Mailbox path to summarize (e.g. Newsletters, Archive)' }
-          },
+          properties: { mailbox: { type: 'string', description: 'Mailbox path to summarize (e.g. Newsletters, Archive)' } },
           required: ['mailbox']
         }
       },
@@ -663,7 +1099,7 @@ async function main() {
       },
       {
         name: 'bulk_move',
-        description: 'Move emails matching any combination of filters from one mailbox to another. Processes in chunks of 250 for reliability. Use dryRun: true to preview without making changes.',
+        description: 'Move emails matching any combination of filters from one mailbox to another. Uses safe copy-verify-delete with fingerprint verification and a persistent manifest. Use dryRun: true to preview without making changes.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -846,9 +1282,7 @@ async function main() {
         description: 'Create a new mailbox/folder',
         inputSchema: {
           type: 'object',
-          properties: {
-            name: { type: 'string', description: 'Name of the new mailbox' }
-          },
+          properties: { name: { type: 'string', description: 'Name of the new mailbox' } },
           required: ['name']
         }
       },
@@ -869,15 +1303,44 @@ async function main() {
         description: 'Delete a mailbox/folder. The folder must be empty first.',
         inputSchema: {
           type: 'object',
-          properties: {
-            name: { type: 'string', description: 'Mailbox path to delete' }
-          },
+          properties: { name: { type: 'string', description: 'Mailbox path to delete' } },
           required: ['name']
         }
       },
       {
         name: 'empty_trash',
         description: 'Permanently delete all emails in Deleted Messages',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'get_move_status',
+        description: 'Check the status of the current or most recent bulk move operation. Shows progress, chunk statuses, and any failures. Call this to monitor a long-running move or inspect a failed one.',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'abandon_move',
+        description: 'Abandon an in-progress move operation so a new one can start. Only use if you are certain the operation should not be resumed. Emails already moved will not be returned to source.',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'log_write',
+        description: 'Write a step to the session log. Use this to record your plan before starting, and after each completed step. Helps maintain progress across long operations.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            step: { type: 'string', description: 'Description of what you are doing or just completed' }
+          },
+          required: ['step']
+        }
+      },
+      {
+        name: 'log_read',
+        description: 'Read the current session log to see what has been done so far.',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'log_clear',
+        description: 'Clear the session log and start fresh. Use this at the start of a new task.',
         inputSchema: { type: 'object', properties: {} }
       }
     ]
@@ -948,6 +1411,16 @@ async function main() {
         result = await deleteMailbox(args.name);
       } else if (name === 'empty_trash') {
         result = await emptyTrash();
+      } else if (name === 'get_move_status') {
+        result = getMoveStatus();
+      } else if (name === 'abandon_move') {
+        result = abandonMove();
+      } else if (name === 'log_write') {
+        result = logWrite(args.step);
+      } else if (name === 'log_read') {
+        result = logRead();
+      } else if (name === 'log_clear') {
+        result = logClear();
       } else {
         throw new Error(`Unknown tool: ${name}`);
       }
