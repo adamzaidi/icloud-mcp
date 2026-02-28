@@ -13,6 +13,7 @@ A Model Context Protocol (MCP) server that connects Claude Desktop to your iClou
 - ✅ Mark emails as read/unread, flag/unflag in bulk or individually
 - 🗂️ List, create, rename, and delete mailboxes
 - 🔄 Dry run mode for bulk operations — preview before committing
+- 🔐 Safe move — emails are fingerprinted and verified in the destination before being removed from the source
 - 📝 Session logging — Claude tracks progress across long multi-step operations
 
 ## Prerequisites
@@ -120,6 +121,8 @@ Fully quit Claude Desktop (Cmd+Q) and reopen it. You should now be able to manag
 | `rename_mailbox` | Rename an existing folder |
 | `delete_mailbox` | Delete a folder (must be empty first) |
 | `empty_trash` | Permanently delete all emails in Deleted Messages |
+| `get_move_status` | Check the status of the current or most recent bulk move operation |
+| `abandon_move` | Abandon an in-progress move operation so a new one can start |
 | `log_write` | Write a step to the session log |
 | `log_read` | Read the session log to see what has been done so far |
 | `log_clear` | Clear the session log and start fresh |
@@ -141,13 +144,17 @@ Fully quit Claude Desktop (Cmd+Q) and reopen it. You should now be able to manag
 | `smaller` | number | Only emails smaller than this size in KB |
 | `hasAttachment` | boolean | Only emails with attachments |
 
-### Dry Run Mode
+## Dry Run Mode
 
 Pass `dryRun: true` to `bulk_move` or `bulk_delete` to preview how many emails would be affected without making any changes:
 
 > *"How many emails would be deleted if I removed everything from linkedin.com before 2022?"*
 
-### Session Log
+## Safe Move
+
+All bulk move operations use a copy-verify-delete approach. Emails are fingerprinted before copying, confirmed present in the destination, and only then removed from the source. A persistent manifest at `~/.icloud-mcp-move-manifest.json` tracks progress across chunks so that a crash or connection drop mid-operation never results in data loss. Use `get_move_status` to inspect any operation and `abandon_move` to clear a stuck one.
+
+## Session Log
 
 The session log persists to `~/.icloud-mcp-session.json` on your Mac — outside Claude's context window — so progress is never lost during long operations. Claude can write its plan at the start, log each completed step, and read the log back at any point to reorient itself.
 

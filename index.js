@@ -977,7 +977,7 @@ function logClear() {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.6.0' },
+    { name: 'icloud-mail', version: '1.4.1' },
     { capabilities: { tools: {} } }
   );
 
