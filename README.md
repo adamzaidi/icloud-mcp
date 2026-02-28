@@ -43,9 +43,39 @@ Then find the install location:
 npm root -g
 ```
 
-This will return a path like `/opt/homebrew/lib/node_modules` or `/usr/local/lib/node_modules`.
+The path varies by setup:
 
-### 3. Configure Claude Desktop
+| Setup | Typical path |
+|-------|-------------|
+| Mac with Homebrew Node | `/opt/homebrew/lib/node_modules` |
+| Mac with system Node | `/usr/local/lib/node_modules` |
+| nvm | `~/.nvm/versions/node/v20.x.x/lib/node_modules` |
+
+### 3. Verify your setup
+
+Before configuring Claude Desktop, run the doctor command to confirm everything is working:
+
+```bash
+IMAP_USER="you@icloud.com" IMAP_PASSWORD="your-app-specific-password" node $(npm root -g)/icloud-mcp/index.js --doctor
+```
+
+You should see:
+
+```
+icloud-mcp doctor
+─────────────────────────────
+✅ IMAP_USER is set
+✅ IMAP_PASSWORD is set
+✅ Connected to imap.mail.me.com:993
+✅ Authenticated as you@icloud.com
+✅ INBOX opened (12453 messages)
+─────────────────────────────
+All checks passed. Ready to use with Claude Desktop.
+```
+
+If any step fails, a plain-English explanation and suggested fix will be shown.
+
+### 4. Configure Claude Desktop
 
 Open your Claude Desktop config file:
 
@@ -53,7 +83,7 @@ Open your Claude Desktop config file:
 open ~/Library/Application\ Support/Claude/claude_desktop_config.json
 ```
 
-Add the following under `mcpServers`, replacing the path with your npm root path from the previous step:
+Add the following under `mcpServers`, replacing the path with your npm root from step 2:
 
 ```json
 {
@@ -70,9 +100,7 @@ Add the following under `mcpServers`, replacing the path with your npm root path
 }
 ```
 
-> **Note:** If your `npm root -g` returned a different path, replace `/opt/homebrew/lib/node_modules` with that path.
-
-### 4. Add Custom Instructions (Recommended)
+### 5. Add Custom Instructions (Recommended)
 
 For large inbox operations, add the following to Claude Desktop's custom instructions to ensure Claude stays on track and checks in with you regularly. Go to **Claude Desktop → Settings → Custom Instructions** and add:
 
@@ -85,7 +113,7 @@ When using icloud-mail tools:
 5. If you are ever unsure what you have done so far, call log_read before proceeding
 ```
 
-### 5. Restart Claude Desktop
+### 6. Restart Claude Desktop
 
 Fully quit Claude Desktop (Cmd+Q) and reopen it. You should now be able to manage your iCloud inbox through Claude.
 

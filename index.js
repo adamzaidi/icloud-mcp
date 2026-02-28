@@ -15,8 +15,12 @@ const IMAP_USER = process.env.IMAP_USER;
 const IMAP_PASSWORD = process.env.IMAP_PASSWORD;
 
 if (!IMAP_USER || !IMAP_PASSWORD) {
-  process.stderr.write('Error: IMAP_USER and IMAP_PASSWORD environment variables are required\n');
-  process.exit(1);
+  if (process.argv.includes('--doctor')) {
+    // Doctor will handle missing credentials with friendly output
+  } else {
+    process.stderr.write('Error: IMAP_USER and IMAP_PASSWORD environment variables are required\n');
+    process.exit(1);
+  }
 }
 
 function createClient() {
@@ -977,7 +981,7 @@ function logClear() {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.4.1' },
+    { name: 'icloud-mail', version: '1.6.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -1426,7 +1430,7 @@ async function main() {
       }
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     } catch (error) {
-      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: 'text', text: `Error: ${friendlyError(error)}` }], isError: true };
     }
   });
 
@@ -1434,6 +1438,132 @@ async function main() {
   await server.connect(transport);
   process.stderr.write('iCloud Mail MCP Server running\n');
 }
+
+// ─── Friendly error messages ──────────────────────────────────────────────────
+
+function friendlyError(err) {
+  const msg = err.message ?? '';
+
+  if (msg.includes('AUTHENTICATIONFAILED') || msg.includes('Invalid credentials') || msg.includes('Authentication failed')) {
+    return [
+      'Authentication failed.',
+      '→ Make sure IMAP_PASSWORD is an app-specific password, not your regular iCloud password.',
+      '→ Generate one at: appleid.apple.com → Sign-In and Security → App-Specific Passwords',
+      '→ Also check that IMAP_USER is your full iCloud email address (e.g. you@icloud.com)'
+    ].join('\n');
+  }
+
+  if (msg.includes('ECONNREFUSED') || msg.includes('ENOTFOUND') || msg.includes('ENETUNREACH')) {
+    return [
+      'Could not reach imap.mail.me.com:993.',
+      '→ Check your internet connection.',
+      '→ If you are behind a firewall or VPN, port 993 may be blocked.'
+    ].join('\n');
+  }
+
+  if (msg.includes('ETIMEDOUT') || msg.includes('socket hang up')) {
+    return [
+      'Connection to iCloud timed out.',
+      '→ Check your internet connection and try again.',
+      '→ iCloud IMAP can be slow under load — this is usually transient.'
+    ].join('\n');
+  }
+
+  if (msg.includes('ECONNRESET')) {
+    return [
+      'iCloud closed the connection unexpectedly.',
+      '→ This is usually transient. Try again in a few seconds.'
+    ].join('\n');
+  }
+
+  if (msg.includes('Mailbox does not exist') || msg.includes('does not exist') || msg.includes('NONEXISTENT')) {
+    return [
+      `Mailbox not found: ${msg}`,
+      '→ Check the folder name is correct — iCloud folder names are case-sensitive.',
+      '→ Use list_mailboxes to see all available folders.'
+    ].join('\n');
+  }
+
+  // Fall through — return original message
+  return msg;
+}
+
+// ─── Doctor command ───────────────────────────────────────────────────────────
+
+async function runDoctor() {
+  const divider = '─'.repeat(45);
+  process.stdout.write(`\nicloud-mcp doctor\n${divider}\n`);
+
+  const checks = [
+    {
+      label: 'IMAP_USER is set',
+      run: () => {
+        if (!IMAP_USER) throw new Error('IMAP_USER environment variable is not set.\n→ Add it to your Claude Desktop config env block.');
+      }
+    },
+    {
+      label: 'IMAP_PASSWORD is set',
+      run: () => {
+        if (!IMAP_PASSWORD) throw new Error('IMAP_PASSWORD environment variable is not set.\n→ Add it to your Claude Desktop config env block.');
+      }
+    },
+    {
+      label: 'IMAP_USER looks like an email address',
+      run: () => {
+        if (!IMAP_USER?.includes('@')) throw new Error(`IMAP_USER "${IMAP_USER}" doesn't look like an email address.\n→ Use your full iCloud address, e.g. you@icloud.com`);
+      }
+    },
+    {
+      label: `Connected to imap.mail.me.com:993`,
+      run: async () => {
+        const client = createClient();
+        await client.connect();
+        await client.logout();
+      }
+    },
+    {
+      label: `Authenticated as ${IMAP_USER}`,
+      run: async () => {
+        // Auth is validated as part of connect — if we reach here it passed.
+        // This check exists to give a clearer label in the output.
+      }
+    },
+    {
+      label: 'INBOX opened',
+      run: async () => {
+        const client = createClient();
+        await client.connect();
+        const mb = await client.mailboxOpen('INBOX');
+        await client.logout();
+        return `${mb.exists.toLocaleString()} messages`;
+      }
+    }
+  ];
+
+  let allPassed = true;
+
+  for (const check of checks) {
+    try {
+      const detail = await check.run();
+      const suffix = detail ? ` (${detail})` : '';
+      process.stdout.write(`✅ ${check.label}${suffix}\n`);
+    } catch (err) {
+      process.stdout.write(`❌ ${check.label}\n   ${friendlyError(err).replace(/\n/g, '\n   ')}\n`);
+      allPassed = false;
+      break; // No point continuing after a failure
+    }
+  }
+
+  process.stdout.write(`${divider}\n`);
+  if (allPassed) {
+    process.stdout.write('All checks passed. Ready to use with Claude Desktop.\n\n');
+    process.exit(0);
+  } else {
+    process.stdout.write('Setup is not complete. Fix the issue above and run --doctor again.\n\n');
+    process.exit(1);
+  }
+}
+
 
 process.on('uncaughtException', (err) => {
   process.stderr.write(`Uncaught exception: ${err.message}\n${err.stack}\n`);
@@ -1445,7 +1575,14 @@ process.on('unhandledRejection', (reason) => {
   process.exit(1);
 });
 
-main().catch((err) => {
-  process.stderr.write(`Fatal error: ${err.message}\n${err.stack}\n`);
-  process.exit(1);
-});
+if (process.argv.includes('--doctor')) {
+  runDoctor().catch((err) => {
+    process.stderr.write(`Doctor failed unexpectedly: ${err.message}\n`);
+    process.exit(1);
+  });
+} else {
+  main().catch((err) => {
+    process.stderr.write(`Fatal error: ${err.message}\n${err.stack}\n`);
+    process.exit(1);
+  });
+}
