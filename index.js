@@ -42,8 +42,35 @@ function createClient() {
 
 // ─── Managed client helpers ───────────────────────────────────────────────────
 
-async function openClient(mailbox) {
+// Rate limit: space out connection initiations within a single server process
+// to avoid triggering iCloud's connection throttle under concurrent tool calls.
+// Wraps connect() on every client returned by createClient() so the gate
+// applies regardless of whether tools use openClient() or createClient() directly.
+// Uses a serialized gate — concurrent callers queue up; each waits 200ms after
+// the previous before initiating its connection. Connections run concurrently
+// after passing the gate.
+let _lastConnectTime = 0;
+let _connectGate = Promise.resolve();
+const MIN_CONNECT_INTERVAL = 200; // ms between connection initiations
+
+function createRateLimitedClient() {
   const client = createClient();
+  const originalConnect = client.connect.bind(client);
+  client.connect = async () => {
+    await new Promise(resolve => {
+      _connectGate = _connectGate.then(async () => {
+        const wait = MIN_CONNECT_INTERVAL - (Date.now() - _lastConnectTime);
+        if (wait > 0) await new Promise(r => setTimeout(r, wait));
+        _lastConnectTime = Date.now();
+      }).then(resolve, resolve);
+    });
+    return originalConnect();
+  };
+  return client;
+}
+
+async function openClient(mailbox) {
+  const client = createRateLimitedClient();
   await client.connect();
   if (mailbox) await client.mailboxOpen(mailbox);
   return client;
@@ -583,7 +610,7 @@ async function safeMoveEmails(uids, sourceMailbox, targetMailbox) {
 // ─── Email Functions ──────────────────────────────────────────────────────────
 
 async function fetchEmails(mailbox = 'INBOX', limit = 10, onlyUnread = false, page = 1) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   const mb = await client.mailboxOpen(mailbox);
   const total = mb.exists;
@@ -637,7 +664,7 @@ async function fetchEmails(mailbox = 'INBOX', limit = 10, onlyUnread = false, pa
 }
 
 async function getInboxSummary(mailbox = 'INBOX') {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   const status = await client.status(mailbox, { messages: true, unseen: true, recent: true });
   await client.logout();
@@ -645,7 +672,7 @@ async function getInboxSummary(mailbox = 'INBOX') {
 }
 
 async function getTopSenders(mailbox = 'INBOX', sampleSize = 500, maxResults = 20) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   const mb = await client.mailboxOpen(mailbox);
   const total = mb.exists;
@@ -674,7 +701,7 @@ async function getTopSenders(mailbox = 'INBOX', sampleSize = 500, maxResults = 2
 }
 
 async function getUnreadSenders(mailbox = 'INBOX', sampleSize = 500, maxResults = 20) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   const uids = (await client.search({ seen: false }, { uid: true })) ?? [];
@@ -696,7 +723,7 @@ async function getUnreadSenders(mailbox = 'INBOX', sampleSize = 500, maxResults 
 }
 
 async function getEmailsBySender(sender, mailbox = 'INBOX', limit = 10) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   const uids = (await client.search({ from: sender }, { uid: true })) ?? [];
@@ -721,7 +748,7 @@ async function getEmailsBySender(sender, mailbox = 'INBOX', limit = 10) {
 }
 
 async function bulkDeleteBySender(sender, mailbox = 'INBOX') {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   const uids = (await client.search({ from: sender }, { uid: true })) ?? [];
@@ -736,12 +763,13 @@ async function bulkDeleteBySender(sender, mailbox = 'INBOX') {
   return { deleted, sender };
 }
 
-async function bulkMoveBySender(sender, targetMailbox, sourceMailbox = 'INBOX') {
-  const client = createClient();
+async function bulkMoveBySender(sender, targetMailbox, sourceMailbox = 'INBOX', dryRun = false) {
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(sourceMailbox);
   const uids = (await client.search({ from: sender }, { uid: true })) ?? [];
   await client.logout();
+  if (dryRun) return { dryRun: true, wouldMove: uids.length, sender, sourceMailbox, targetMailbox };
   if (uids.length === 0) return { moved: 0 };
   await ensureMailbox(targetMailbox);
   const result = await safeMoveEmails(uids, sourceMailbox, targetMailbox);
@@ -749,7 +777,7 @@ async function bulkMoveBySender(sender, targetMailbox, sourceMailbox = 'INBOX') 
 }
 
 async function bulkDeleteBySubject(subject, mailbox = 'INBOX') {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   const uids = (await client.search({ subject }, { uid: true })) ?? [];
@@ -765,7 +793,7 @@ async function bulkDeleteBySubject(subject, mailbox = 'INBOX') {
 }
 
 async function deleteOlderThan(days, mailbox = 'INBOX') {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   const date = new Date();
@@ -783,7 +811,7 @@ async function deleteOlderThan(days, mailbox = 'INBOX') {
 }
 
 async function getEmailsByDateRange(startDate, endDate, mailbox = 'INBOX', limit = 10) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   const uids = (await client.search({ since: new Date(startDate), before: new Date(endDate) }, { uid: true })) ?? [];
@@ -808,7 +836,7 @@ async function getEmailsByDateRange(startDate, endDate, mailbox = 'INBOX', limit
 }
 
 async function bulkMarkRead(mailbox = 'INBOX', sender = null) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   const query = sender ? { from: sender, seen: false } : { seen: false };
@@ -820,7 +848,7 @@ async function bulkMarkRead(mailbox = 'INBOX', sender = null) {
 }
 
 async function bulkMarkUnread(mailbox = 'INBOX', sender = null) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   const query = sender ? { from: sender, seen: true } : { seen: true };
@@ -832,7 +860,7 @@ async function bulkMarkUnread(mailbox = 'INBOX', sender = null) {
 }
 
 async function bulkFlag(filters, flagged, mailbox = 'INBOX') {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   const query = buildQuery(filters);
@@ -848,7 +876,7 @@ async function bulkFlag(filters, flagged, mailbox = 'INBOX') {
 }
 
 async function emptyTrash() {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen('Deleted Messages');
   const uids = (await client.search({ all: true }, { uid: true })) ?? [];
@@ -864,7 +892,7 @@ async function emptyTrash() {
 }
 
 async function createMailbox(name) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxCreate(name);
   await client.logout();
@@ -872,7 +900,7 @@ async function createMailbox(name) {
 }
 
 async function renameMailbox(oldName, newName) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   try {
     await Promise.race([
@@ -888,7 +916,7 @@ async function renameMailbox(oldName, newName) {
 }
 
 async function deleteMailbox(name) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   try {
     await Promise.race([
@@ -904,7 +932,7 @@ async function deleteMailbox(name) {
 }
 
 async function getMailboxSummary(mailbox) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   const status = await client.status(mailbox, { messages: true, unseen: true, recent: true });
   await client.logout();
@@ -912,7 +940,7 @@ async function getMailboxSummary(mailbox) {
 }
 
 async function getEmailContent(uid, mailbox = 'INBOX') {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   const meta = await client.fetchOne(uid, { envelope: true, flags: true }, { uid: true });
@@ -942,7 +970,7 @@ async function getEmailContent(uid, mailbox = 'INBOX') {
 }
 
 async function flagEmail(uid, flagged, mailbox = 'INBOX') {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   if (flagged) {
@@ -955,7 +983,7 @@ async function flagEmail(uid, flagged, mailbox = 'INBOX') {
 }
 
 async function markAsRead(uid, seen, mailbox = 'INBOX') {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   if (seen) {
@@ -968,7 +996,7 @@ async function markAsRead(uid, seen, mailbox = 'INBOX') {
 }
 
 async function deleteEmail(uid, mailbox = 'INBOX') {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   await client.messageDelete(uid, { uid: true });
@@ -977,7 +1005,7 @@ async function deleteEmail(uid, mailbox = 'INBOX') {
 }
 
 async function listMailboxes() {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   const tree = await client.listTree();
   const mailboxes = [];
@@ -993,7 +1021,7 @@ async function listMailboxes() {
 }
 
 async function searchEmails(query, mailbox = 'INBOX', limit = 10, filters = {}) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
 
@@ -1024,7 +1052,7 @@ async function searchEmails(query, mailbox = 'INBOX', limit = 10, filters = {}) 
 }
 
 async function moveEmail(uid, targetMailbox, sourceMailbox = 'INBOX') {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(sourceMailbox);
   await client.messageMove(uid, targetMailbox, { uid: true });
@@ -1051,14 +1079,14 @@ function buildQuery(filters) {
 }
 
 async function ensureMailbox(name) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   try { await client.mailboxCreate(name); } catch { /* already exists */ }
   await client.logout();
 }
 
 async function bulkMove(filters, targetMailbox, sourceMailbox = 'INBOX', dryRun = false, limit = null) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(sourceMailbox);
   const query = buildQuery(filters);
@@ -1083,7 +1111,7 @@ async function bulkMove(filters, targetMailbox, sourceMailbox = 'INBOX', dryRun 
 // hanging forever.
 
 async function bulkDelete(filters, sourceMailbox = 'INBOX', dryRun = false) {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(sourceMailbox);
   const query = buildQuery(filters);
@@ -1120,7 +1148,7 @@ async function bulkDelete(filters, sourceMailbox = 'INBOX', dryRun = false) {
 }
 
 async function countEmails(filters, mailbox = 'INBOX') {
-  const client = createClient();
+  const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
   const query = buildQuery(filters);
@@ -1157,7 +1185,7 @@ function logClear() {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.5.0' },
+    { name: 'icloud-mail', version: '1.5.1' },
     { capabilities: { tools: {} } }
   );
 
@@ -1337,7 +1365,8 @@ async function main() {
           properties: {
             sender: { type: 'string', description: 'Sender email address' },
             targetMailbox: { type: 'string', description: 'Destination folder' },
-            sourceMailbox: { type: 'string', description: 'Source mailbox (default INBOX)' }
+            sourceMailbox: { type: 'string', description: 'Source mailbox (default INBOX)' },
+            dryRun: { type: 'boolean', description: 'Preview only — return count without moving' }
           },
           required: ['sender', 'targetMailbox']
         }
@@ -1585,7 +1614,7 @@ async function main() {
         const { targetMailbox, sourceMailbox, dryRun, limit, ...filters } = args;
         result = await bulkMove(filters, targetMailbox, sourceMailbox || 'INBOX', dryRun || false, limit ?? null);
       } else if (name === 'bulk_move_by_sender') {
-        result = await bulkMoveBySender(args.sender, args.targetMailbox, args.sourceMailbox || 'INBOX');
+        result = await bulkMoveBySender(args.sender, args.targetMailbox, args.sourceMailbox || 'INBOX', args.dryRun || false);
       } else if (name === 'bulk_delete') {
         // IMPROVEMENT 3: bulk_delete now has per-chunk timeouts internally
         const { sourceMailbox, dryRun, ...filters } = args;
@@ -1710,7 +1739,7 @@ async function runDoctor() {
     {
       label: `Connected to imap.mail.me.com:993`,
       run: async () => {
-        const client = createClient();
+        const client = createRateLimitedClient();
         await client.connect();
         await client.logout();
       }
@@ -1725,7 +1754,7 @@ async function runDoctor() {
     {
       label: 'INBOX opened',
       run: async () => {
-        const client = createClient();
+        const client = createRateLimitedClient();
         await client.connect();
         const mb = await client.mailboxOpen('INBOX');
         await client.logout();
