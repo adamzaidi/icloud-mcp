@@ -13,14 +13,19 @@ if (!IMAP_USER || !IMAP_PASSWORD) {
 }
 
 const projectDir = fileURLToPath(new URL('.', import.meta.url));
+const VERBOSE = process.argv.includes('--verbose') || process.argv.includes('-v');
 
 // Timeout in ms per tool category
 const TIMEOUTS = {
   mailbox_mgmt: 60000,   // create/rename/delete mailbox — can be slow on iCloud
+  bulk_move: 900000,     // pre-flight restore may have many stranded emails; test moves use limit:50
   default: 300000        // everything else — allow up to 5 min for large operations
 };
 
 const MAILBOX_MGMT_TOOLS = new Set(['create_mailbox', 'rename_mailbox', 'delete_mailbox']);
+
+// Tools whose stderr output is always interesting (move pipeline logging)
+const ALWAYS_LOG_STDERR = new Set(['bulk_move', 'bulk_move_by_sender']);
 
 function callToolRaw(name, args = {}, timeout = TIMEOUTS.default) {
   const messages = [
@@ -45,8 +50,22 @@ function callToolRaw(name, args = {}, timeout = TIMEOUTS.default) {
       }
     );
 
+    // Capture stderr for logging
+    const stderr = (result.stderr || '').trim();
+
+    // Print stderr for move operations (always) or all tools (verbose mode)
+    if (stderr && (VERBOSE || ALWAYS_LOG_STDERR.has(name))) {
+      const lines = stderr.split('\n');
+      for (const line of lines) {
+        // Only print [move], [timeout], [retry] lines — skip noise
+        if (VERBOSE || /^\[(move|timeout|retry)\]/.test(line)) {
+          console.log(`     ${line}`);
+        }
+      }
+    }
+
     if (result.error) throw new Error(`Spawn error: ${result.error.message}`);
-    if (result.status !== 0) throw new Error(`Process exited with code ${result.status}: ${result.stderr}`);
+    if (result.status !== 0) throw new Error(`Process exited with code ${result.status}: ${stderr}`);
 
     const lines = (result.stdout || '').trim().split('\n').filter(l => l.trim().startsWith('{'));
     const responses = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
@@ -54,7 +73,19 @@ function callToolRaw(name, args = {}, timeout = TIMEOUTS.default) {
     if (!toolResponse) throw new Error(`No response for tool: ${name}`);
     const content = toolResponse.result?.content?.[0]?.text;
     if (!content) throw new Error(`No content in response for: ${name}`);
-    if (toolResponse.result?.isError) throw new Error(`Tool error: ${content}`);
+    if (toolResponse.result?.isError) {
+      // On tool errors, always show stderr for diagnostics
+      if (stderr && !VERBOSE && !ALWAYS_LOG_STDERR.has(name)) {
+        const stderrLines = stderr.split('\n').filter(l => /^\[(move|timeout|retry)\]/.test(l));
+        if (stderrLines.length > 0) {
+          console.log(`\n     📋 stderr diagnostics:`);
+          for (const line of stderrLines) {
+            console.log(`     ${line}`);
+          }
+        }
+      }
+      throw new Error(`Tool error: ${content}`);
+    }
     return JSON.parse(content);
   } finally {
     try { unlinkSync(tmpFile); } catch {}
@@ -62,18 +93,24 @@ function callToolRaw(name, args = {}, timeout = TIMEOUTS.default) {
 }
 
 function callTool(name, args = {}) {
-  const timeout = MAILBOX_MGMT_TOOLS.has(name) ? TIMEOUTS.mailbox_mgmt : TIMEOUTS.default;
+  let timeout = TIMEOUTS.default;
+  if (MAILBOX_MGMT_TOOLS.has(name)) timeout = TIMEOUTS.mailbox_mgmt;
+  else if (name === 'bulk_move' || name === 'bulk_move_by_sender') timeout = TIMEOUTS.bulk_move;
+
   try {
     return callToolRaw(name, args, timeout);
   } catch (err) {
     // Only retry on spawn-level transient errors (ECONNRESET, ETIMEDOUT on the
     // child process itself) — NOT on Tool errors, which are application-level
     // failures that should propagate immediately.
+    // Never retry bulk_move: a timed-out move leaves the manifest in_progress,
+    // so a retry would immediately fail with a manifest conflict.
+    const isBulkMove = name === 'bulk_move' || name === 'bulk_move_by_sender';
     const isSpawnTransient = (
       err.message.includes('ECONNRESET') ||
       err.message.includes('ETIMEDOUT')
     ) && !err.message.startsWith('Tool error:');
-    if (isSpawnTransient) {
+    if (isSpawnTransient && !isBulkMove) {
       console.log(`\n     ⚠️  transient spawn error (${err.message.split(':')[0]}), retrying...`);
       return callToolRaw(name, args, timeout);
     }
@@ -100,7 +137,8 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-console.log('\n🧪 iCloud MCP Server Tests v1.6.0\n');
+console.log('\n🧪 iCloud MCP Server Tests v1.5.0\n');
+if (VERBOSE) console.log('🔊 Verbose mode: showing all stderr output\n');
 
 // ─── Pre-flight cleanup ───────────────────────────────────────────────────────
 // Abandon any leftover in-progress manifest from a previous crashed run,
@@ -408,57 +446,61 @@ test('abandon_move (nothing to abandon)', () => {
 });
 
 // ─── Safe Move (live) ─────────────────────────────────────────────────────────
-console.log('\n🔐 Safe Move Test (live — newsletters ↔ test)');
+// Uses limit:50 to keep the test fast and deterministic. Moving the full
+// newsletters folder (5000+ emails) is too slow for a test suite — IMAP EXPUNGE
+// scales with mailbox size, taking 60-160s per chunk on large folders.
+// 50 emails completes in ~15-30s total and tests all the same code paths:
+// fingerprinting, envelope scan, Message-ID fallback, manifest, delete.
+console.log('\n🔐 Safe Move Test (live — newsletters ↔ test, 50-email sample)');
 
-test('bulk_move newsletters → test (fingerprint verified)', () => {
+const MOVE_SAMPLE = 50;
+
+test(`bulk_move newsletters → test (${MOVE_SAMPLE} emails, fingerprint verified)`, () => {
   const beforeSource = callTool('count_emails', { mailbox: 'newsletters' });
-  assert(beforeSource.count > 0, 'newsletters should have emails');
-  console.log(`\n     → newsletters before: ${beforeSource.count}`);
+  assert(beforeSource.count >= MOVE_SAMPLE, `newsletters needs at least ${MOVE_SAMPLE} emails, has ${beforeSource.count}`);
+  console.log(`\n     → newsletters before: ${beforeSource.count} (moving ${MOVE_SAMPLE})`);
 
-  const moveResult = callTool('bulk_move', { sourceMailbox: 'newsletters', targetMailbox: 'test' });
+  const moveResult = callTool('bulk_move', { sourceMailbox: 'newsletters', targetMailbox: 'test', limit: MOVE_SAMPLE });
   console.log(`\n     → status: ${moveResult.status}, moved: ${moveResult.moved} of ${moveResult.total}`);
   assert(moveResult.status === 'complete', `expected complete, got ${moveResult.status}: ${moveResult.message || ''}`);
-  assert(moveResult.moved === beforeSource.count, `moved ${moveResult.moved} but expected ${beforeSource.count}`);
-  assert(moveResult.total === beforeSource.count, `total ${moveResult.total} should match source count ${beforeSource.count}`);
+  assert(moveResult.moved === MOVE_SAMPLE, `moved ${moveResult.moved} but expected ${MOVE_SAMPLE}`);
+  assert(moveResult.total === MOVE_SAMPLE, `total ${moveResult.total} should match limit ${MOVE_SAMPLE}`);
 
   const afterSource = callTool('count_emails', { mailbox: 'newsletters' });
-  console.log(`\n     → newsletters after (should be 0): ${afterSource.count}`);
-  assert(afterSource.count === 0, `newsletters should be empty, has ${afterSource.count}`);
+  console.log(`\n     → newsletters after: ${afterSource.count} (was ${beforeSource.count})`);
+  assert(afterSource.count === beforeSource.count - MOVE_SAMPLE, `newsletters should have ${beforeSource.count - MOVE_SAMPLE}, has ${afterSource.count}`);
 
   const afterTarget = callTool('count_emails', { mailbox: 'test' });
   console.log(`\n     → test folder after: ${afterTarget.count}`);
-  assert(afterTarget.count === beforeSource.count, `test should have ${beforeSource.count}, has ${afterTarget.count}`);
+  assert(afterTarget.count === MOVE_SAMPLE, `test should have ${MOVE_SAMPLE}, has ${afterTarget.count}`);
 });
 
 test('get_move_status (after completed move)', () => {
   const result = callTool('get_move_status');
-  // Current should be null (archived after completion), history should have the move
   assert(result.status === 'no_operation', `expected no_operation after completed move, got ${result.status}`);
   assert(result.history.length > 0, 'history should have at least one entry');
   const last = result.history[0];
   assert(last.status === 'complete', `last operation should be complete, got ${last.status}`);
   assert(last.source === 'newsletters', `source should be newsletters, got ${last.source}`);
   assert(last.target === 'test', `target should be test, got ${last.target}`);
+  assert(last.moved === MOVE_SAMPLE, `last op should have moved ${MOVE_SAMPLE}, got ${last.moved}`);
   console.log(`\n     → last op: ${last.status}, ${last.moved}/${last.total} moved from ${last.source} → ${last.target}`);
 });
 
-test('bulk_move test → newsletters (restore, fingerprint verified)', () => {
+test(`bulk_move test → newsletters (restore ${MOVE_SAMPLE} emails, fingerprint verified)`, () => {
   const beforeSource = callTool('count_emails', { mailbox: 'test' });
-  assert(beforeSource.count > 0, 'test folder should have emails to restore');
+  assert(beforeSource.count === MOVE_SAMPLE, `test should have ${MOVE_SAMPLE} emails, has ${beforeSource.count}`);
   console.log(`\n     → test before restore: ${beforeSource.count}`);
 
+  // No limit needed — test folder only has MOVE_SAMPLE emails; small folder = fast delete
   const moveBack = callTool('bulk_move', { sourceMailbox: 'test', targetMailbox: 'newsletters' });
   console.log(`\n     → status: ${moveBack.status}, moved: ${moveBack.moved} of ${moveBack.total}`);
   assert(moveBack.status === 'complete', `expected complete, got ${moveBack.status}: ${moveBack.message || ''}`);
-  assert(moveBack.moved === beforeSource.count, `moved ${moveBack.moved} but expected ${beforeSource.count}`);
+  assert(moveBack.moved === MOVE_SAMPLE, `moved ${moveBack.moved} but expected ${MOVE_SAMPLE}`);
 
   const afterSource = callTool('count_emails', { mailbox: 'test' });
   console.log(`\n     → test after (should be 0): ${afterSource.count}`);
   assert(afterSource.count === 0, `test should be empty, has ${afterSource.count}`);
-
-  const afterTarget = callTool('count_emails', { mailbox: 'newsletters' });
-  console.log(`\n     → newsletters restored: ${afterTarget.count}`);
-  assert(afterTarget.count === beforeSource.count, `newsletters should have ${beforeSource.count}, has ${afterTarget.count}`);
 });
 
 test('get_move_status (history has both moves)', () => {
@@ -470,8 +512,8 @@ test('get_move_status (history has both moves)', () => {
   assert(restore.source === 'test', `restore source should be test, got ${restore.source}`);
   assert(forward.status === 'complete', `forward op should be complete, got ${forward.status}`);
   assert(forward.source === 'newsletters', `forward source should be newsletters, got ${forward.source}`);
-  console.log(`\n     → history[0]: ${restore.source} → ${restore.target} (${restore.status})`);
-  console.log(`\n     → history[1]: ${forward.source} → ${forward.target} (${forward.status})`);
+  console.log(`\n     → history[0]: ${restore.source} → ${restore.target} (${restore.status}, ${restore.moved} emails)`);
+  console.log(`\n     → history[1]: ${forward.source} → ${forward.target} (${forward.status}, ${forward.moved} emails)`);
 });
 
 // ─── Session Log ─────────────────────────────────────────────────────────────

@@ -23,19 +23,44 @@ if (!IMAP_USER || !IMAP_PASSWORD) {
   }
 }
 
+// ─── IMPROVEMENT 1: Connection-level timeout on createClient ──────────────────
+// ImapFlow supports connectionTimeout and greetingTimeout options.
+// This ensures we don't hang forever waiting for iCloud to respond.
+
 function createClient() {
   return new ImapFlow({
     host: 'imap.mail.me.com',
     port: 993,
     secure: true,
     auth: { user: IMAP_USER, pass: IMAP_PASSWORD },
-    logger: false
+    logger: false,
+    connectionTimeout: 15_000,   // 15s to establish TCP+TLS connection
+    greetingTimeout: 15_000,     // 15s to receive IMAP greeting after connect
+    socketTimeout: 60_000,       // 60s of inactivity before socket is killed
   });
+}
+
+// ─── Managed client helpers ───────────────────────────────────────────────────
+
+async function openClient(mailbox) {
+  const client = createClient();
+  await client.connect();
+  if (mailbox) await client.mailboxOpen(mailbox);
+  return client;
+}
+
+async function safeClose(client) {
+  try { await client.logout(); } catch { try { client.close(); } catch { /* already gone */ } }
+}
+
+async function reconnect(client, mailbox) {
+  safeClose(client);
+  return openClient(mailbox);
 }
 
 // ─── Move Manifest ────────────────────────────────────────────────────────────
 
-const CHUNK_SIZE = 250;
+const CHUNK_SIZE = 500;
 const CHUNK_SIZE_RETRY = 100;
 
 function readManifest() {
@@ -53,7 +78,9 @@ function writeManifest(data) {
 
 function updateManifest(updater) {
   const data = readManifest();
+  if (!data.current) return data; // guard: operation already archived/failed
   updater(data);
+  if (!data.current) return data; // guard: updater may have archived it
   data.current.updatedAt = new Date().toISOString();
   writeManifest(data);
   return data;
@@ -144,7 +171,9 @@ function startOperation(source, target, uids) {
 
 function updateChunk(index, updates) {
   updateManifest((data) => {
+    if (!data.current) return; // guard: operation already archived
     const chunk = data.current.chunks[index];
+    if (!chunk) return; // guard: chunk index out of range
     Object.assign(chunk, updates);
 
     let moved = 0, failed = 0, pending = 0;
@@ -226,68 +255,6 @@ function fingerprintToKey(fp) {
   return fp.messageId ?? fp.fallback;
 }
 
-// ─── IMAP Move Helpers ────────────────────────────────────────────────────────
-
-async function fetchEnvelopes(mailbox, uids) {
-  const client = createClient();
-  await client.connect();
-  await client.mailboxOpen(mailbox);
-  const envelopes = [];
-  for await (const msg of client.fetch(uids, { envelope: true }, { uid: true })) {
-    envelopes.push(msg);
-  }
-  await client.logout();
-  return envelopes;
-}
-
-async function copyChunk(sourceMailbox, targetMailbox, uids) {
-  const client = createClient();
-  await client.connect();
-  await client.mailboxOpen(sourceMailbox);
-  await client.messageCopy(uids, targetMailbox, { uid: true });
-  await client.logout();
-}
-
-async function deleteChunk(sourceMailbox, uids) {
-  const client = createClient();
-  await client.connect();
-  await client.mailboxOpen(sourceMailbox);
-  await client.messageDelete(uids, { uid: true });
-  await client.logout();
-}
-
-async function verifyFingerprintsInTarget(targetMailbox, expectedFingerprints) {
-  const client = createClient();
-  await client.connect();
-  const mb = await client.mailboxOpen(targetMailbox);
-  const total = mb.exists;
-
-  // Fetch recent envelopes from target — copies land at the end
-  const fetchCount = Math.min(total, expectedFingerprints.length * 2 + 500);
-  const start = Math.max(1, total - fetchCount + 1);
-  const range = `${start}:${total}`;
-
-  const targetKeys = new Set();
-  for await (const msg of client.fetch(range, { envelope: true })) {
-    const fp = buildFingerprint(msg);
-    targetKeys.add(fingerprintToKey(fp));
-  }
-  await client.logout();
-
-  const missing = [];
-  for (const fp of expectedFingerprints) {
-    const key = fingerprintToKey(fp);
-    if (!targetKeys.has(key)) missing.push(fp);
-  }
-
-  return {
-    verified: missing.length === 0,
-    missing,
-    found: expectedFingerprints.length - missing.length,
-    expected: expectedFingerprints.length
-  };
-}
-
 // ─── Transient error detection ────────────────────────────────────────────────
 
 function isTransient(err) {
@@ -298,8 +265,8 @@ function isTransient(err) {
     msg.includes('EPIPE') ||
     msg.includes('socket hang up') ||
     msg.includes('Connection not available') ||
-    msg.includes('BAD') ||      // IMAP BAD response — often transient on Apple
-    msg.includes('NO ');        // IMAP NO response — often transient on Apple
+    msg.includes('BAD') ||
+    msg.includes('NO ');
 }
 
 async function withRetry(label, fn, maxAttempts = 3) {
@@ -310,7 +277,7 @@ async function withRetry(label, fn, maxAttempts = 3) {
     } catch (err) {
       lastErr = err;
       if (!isTransient(err) || attempt === maxAttempts) throw err;
-      const delay = attempt * 2000; // 2s, 4s backoff
+      const delay = attempt * 2000;
       process.stderr.write(`[retry] ${label} failed (attempt ${attempt}/${maxAttempts}): ${err.message} — retrying in ${delay}ms\n`);
       await new Promise(r => setTimeout(r, delay));
     }
@@ -318,96 +285,299 @@ async function withRetry(label, fn, maxAttempts = 3) {
   throw lastErr;
 }
 
-// ─── Safe Move ────────────────────────────────────────────────────────────────
+// ─── Per-operation timeouts ───────────────────────────────────────────────────
+
+const TIMEOUT = {
+  METADATA: 15_000,
+  FETCH:    30_000,
+  SCAN:     60_000,
+  BULK_OP:  60_000,
+  CHUNK:   300_000,
+  SINGLE:   15_000,
+};
+
+function withTimeout(label, ms, fn) {
+  let timer;
+  return Promise.race([
+    fn().finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        process.stderr.write(`[timeout] ${label} timed out after ${ms / 1000}s\n`);
+        reject(new Error(`${label} timed out after ${ms / 1000}s`));
+      }, ms);
+    })
+  ]);
+}
+
+// ─── Move logging ─────────────────────────────────────────────────────────────
+
+function elapsed(startMs) {
+  return ((Date.now() - startMs) / 1000).toFixed(1) + 's';
+}
+
+function moveLog(chunkIndex, msg) {
+  process.stderr.write(`[move] chunk ${chunkIndex}: ${msg}\n`);
+}
+
+// ─── Verification (v3: envelope scan first, Message-ID fallback) ──────────────
+// Strategy: one bulk FETCH of recent envelopes in the target is far faster than
+// N individual SEARCH commands. We use envelope scan as the primary check, then
+// only fall back to per-email Message-ID SEARCH for the few that didn't match
+// (which can happen if the envelope fingerprint differs slightly between source
+// and target, e.g. date normalization).
+
+async function verifyByEnvelopeScan(client, fingerprints, chunkIndex, knownTotal = null) {
+  if (fingerprints.length === 0) return { missing: [], found: 0 };
+
+  const t0 = Date.now();
+  const total = knownTotal ?? (await client.status(client.mailbox.path, { messages: true })).messages;
+  const fetchCount = Math.min(total, fingerprints.length + 150);
+  const start = Math.max(1, total - fetchCount + 1);
+  const range = `${start}:${total}`;
+
+  const targetKeys = new Set();
+  let scanned = 0;
+  for await (const msg of client.fetch(range, { envelope: true })) {
+    const fp = buildFingerprint(msg);
+    targetKeys.add(fingerprintToKey(fp));
+    scanned++;
+  }
+
+  const missing = [];
+  for (const fp of fingerprints) {
+    if (!targetKeys.has(fingerprintToKey(fp))) missing.push(fp);
+  }
+
+  moveLog(chunkIndex, `envelope scan: ${scanned} scanned, ${fingerprints.length - missing.length}/${fingerprints.length} matched (${elapsed(t0)})`);
+  return { missing, found: fingerprints.length - missing.length };
+}
+
+async function verifyByMessageId(client, fingerprints, chunkIndex) {
+  if (fingerprints.length === 0) return { missing: [], verified: 0 };
+
+  const t0 = Date.now();
+  const missing = [];
+  let verified = 0;
+
+  for (const fp of fingerprints) {
+    if (!fp.messageId) {
+      // No Message-ID — can't verify this way, count as missing
+      missing.push(fp);
+      continue;
+    }
+    const uids = (await client.search({ header: ['Message-ID', fp.messageId] }, { uid: true })) ?? [];
+    if (uids.length === 0) {
+      missing.push(fp);
+    } else {
+      verified++;
+    }
+    // Progress logging every 25 emails
+    const checked = verified + missing.length;
+    if (checked % 25 === 0) {
+      moveLog(chunkIndex, `Message-ID fallback: ${checked}/${fingerprints.length} checked (${verified} found, ${missing.length} missing, ${elapsed(t0)})`);
+    }
+  }
+
+  moveLog(chunkIndex, `Message-ID fallback: ${verified}/${fingerprints.length} verified, ${missing.length} still missing (${elapsed(t0)})`);
+  return { missing, verified };
+}
+
+async function verifyInTarget(targetClient, fingerprints, chunkIndex, knownTotal = null) {
+  // Primary: fast envelope scan (one FETCH command)
+  const { missing: afterScan } = await verifyByEnvelopeScan(targetClient, fingerprints, chunkIndex, knownTotal);
+
+  if (afterScan.length === 0) {
+    return { verified: true, missing: [], found: fingerprints.length, expected: fingerprints.length };
+  }
+
+  // Secondary: Message-ID search only for the ones envelope scan missed
+  moveLog(chunkIndex, `${afterScan.length} unmatched after envelope scan — trying Message-ID search`);
+  const withMessageId = afterScan.filter(fp => fp.messageId);
+  const noMessageId = afterScan.filter(fp => !fp.messageId);
+
+  if (withMessageId.length > 0) {
+    const { missing: stillMissing } = await verifyByMessageId(targetClient, withMessageId, chunkIndex);
+    const allMissing = [...stillMissing, ...noMessageId];
+    return {
+      verified: allMissing.length === 0,
+      missing: allMissing,
+      found: fingerprints.length - allMissing.length,
+      expected: fingerprints.length
+    };
+  }
+
+  // No Message-IDs to try — whatever envelope scan missed is truly missing
+  return {
+    verified: noMessageId.length === 0,
+    missing: noMessageId,
+    found: fingerprints.length - noMessageId.length,
+    expected: fingerprints.length
+  };
+}
+
+// ─── Safe Move (v3: connection reuse + envelope-first verify + logging) ───────
 
 async function safeMoveEmails(uids, sourceMailbox, targetMailbox) {
   const operation = startOperation(sourceMailbox, targetMailbox, uids);
   let totalMoved = 0;
   let totalFailed = 0;
+  const opStart = Date.now();
 
-  for (const chunk of operation.chunks) {
-    const chunkUids = chunk.uids;
-    let succeeded = false;
+  process.stderr.write(`[move] starting: ${uids.length} emails, ${operation.chunks.length} chunks, ${sourceMailbox} → ${targetMailbox}\n`);
 
-    // Try at full chunk size first, then smaller on verification failure
-    for (const attemptChunkSize of [CHUNK_SIZE, CHUNK_SIZE_RETRY]) {
-      const subChunks = [];
-      for (let i = 0; i < chunkUids.length; i += attemptChunkSize) {
-        subChunks.push(chunkUids.slice(i, i + attemptChunkSize));
-      }
+  let srcClient = await openClient(sourceMailbox);
+  let tgtClient = await openClient(targetMailbox);
 
-      let verificationFailed = false;
+  try {
+    for (const chunk of operation.chunks) {
+      const chunkUids = chunk.uids;
+      let succeeded = false;
+      const chunkStart = Date.now();
 
-      for (const subChunk of subChunks) {
-        // Step 1: fetch fingerprints from source and write to manifest
-        // before doing anything destructive — retries on transient errors
-        const envelopes = await withRetry(
-          `fetchEnvelopes chunk ${chunk.index}`,
-          () => fetchEnvelopes(sourceMailbox, subChunk)
-        );
-        const fingerprints = envelopes.map(buildFingerprint);
+      moveLog(chunk.index, `starting (${chunkUids.length} emails)`);
 
-        updateManifest((data) => {
-          const c = data.current.chunks[chunk.index];
-          c.fingerprints = [...c.fingerprints, ...fingerprints];
-          c.status = 'pending';
-        });
+      for (const attemptChunkSize of [CHUNK_SIZE, CHUNK_SIZE_RETRY]) {
+        const subChunks = [];
+        for (let i = 0; i < chunkUids.length; i += attemptChunkSize) {
+          subChunks.push(chunkUids.slice(i, i + attemptChunkSize));
+        }
 
-        // Step 2: copy to target — retries on transient errors
-        await withRetry(
-          `copyChunk chunk ${chunk.index}`,
-          () => copyChunk(sourceMailbox, targetMailbox, subChunk)
-        );
-        updateChunk(chunk.index, { status: 'copied_not_verified', copiedAt: new Date().toISOString() });
+        let verificationFailed = false;
 
-        // Step 3: verify by fetching envelopes from target — retries on transient errors
-        const verification = await withRetry(
-          `verifyFingerprints chunk ${chunk.index}`,
-          () => verifyFingerprintsInTarget(targetMailbox, fingerprints)
-        );
-        if (!verification.verified) {
-          verificationFailed = true;
+        for (const subChunk of subChunks) {
+          try {
+            await withTimeout(`safeMoveEmails chunk ${chunk.index}`, TIMEOUT.CHUNK, async () => {
+              // Step 1: fetch fingerprints from source
+              let t = Date.now();
+              const envelopes = [];
+              try {
+                for await (const msg of srcClient.fetch(subChunk, { envelope: true }, { uid: true })) {
+                  envelopes.push(msg);
+                }
+              } catch (err) {
+                if (!isTransient(err)) throw err;
+                moveLog(chunk.index, `fetch envelopes failed (${err.message}), reconnecting...`);
+                srcClient = await reconnect(srcClient, sourceMailbox);
+                for await (const msg of srcClient.fetch(subChunk, { envelope: true }, { uid: true })) {
+                  envelopes.push(msg);
+                }
+              }
+              const fingerprints = envelopes.map(buildFingerprint);
+              const withMsgId = fingerprints.filter(fp => fp.messageId).length;
+              moveLog(chunk.index, `fetched ${envelopes.length} envelopes (${withMsgId} with Message-ID) (${elapsed(t)})`);
+
+              updateManifest((data) => {
+                if (!data.current) return;
+                const c = data.current.chunks[chunk.index];
+                if (!c) return;
+                c.fingerprints = [...c.fingerprints, ...fingerprints];
+                c.status = 'pending';
+              });
+
+              // Step 2: copy to target
+              t = Date.now();
+              try {
+                await srcClient.messageCopy(subChunk, targetMailbox, { uid: true });
+              } catch (err) {
+                if (!isTransient(err)) throw err;
+                moveLog(chunk.index, `copy failed (${err.message}), reconnecting...`);
+                srcClient = await reconnect(srcClient, sourceMailbox);
+                await srcClient.messageCopy(subChunk, targetMailbox, { uid: true });
+              }
+              moveLog(chunk.index, `copied ${subChunk.length} emails to target (${elapsed(t)})`);
+              updateChunk(chunk.index, { status: 'copied_not_verified', copiedAt: new Date().toISOString() });
+
+              // Step 3: verify in target
+              t = Date.now();
+              let verification;
+              try {
+                const tgtMb = await tgtClient.mailboxOpen(targetMailbox);
+                verification = await verifyInTarget(tgtClient, fingerprints, chunk.index, tgtMb.exists);
+              } catch (err) {
+                if (!isTransient(err)) throw err;
+                moveLog(chunk.index, `verify failed (${err.message}), reconnecting...`);
+                tgtClient = await reconnect(tgtClient, targetMailbox);
+                verification = await verifyInTarget(tgtClient, fingerprints, chunk.index);
+              }
+              moveLog(chunk.index, `verification: ${verification.found}/${verification.expected} confirmed (${elapsed(t)})`);
+
+              if (!verification.verified) {
+                throw Object.assign(new Error('verification_failed'), { _verificationFailed: true });
+              }
+              updateChunk(chunk.index, { status: 'verified_not_deleted', verifiedAt: new Date().toISOString() });
+
+              // Step 4: delete from source
+              t = Date.now();
+              try {
+                await srcClient.messageDelete(subChunk, { uid: true });
+              } catch (err) {
+                if (!isTransient(err)) throw err;
+                moveLog(chunk.index, `delete failed (${err.message}), reconnecting...`);
+                srcClient = await reconnect(srcClient, sourceMailbox);
+                await srcClient.messageDelete(subChunk, { uid: true });
+              }
+              moveLog(chunk.index, `deleted ${subChunk.length} from source (${elapsed(t)})`);
+            });
+            totalMoved += subChunk.length;
+            moveLog(chunk.index, `sub-chunk complete: ${subChunk.length} moved (chunk total: ${totalMoved}/${operation.totalUids})`);
+          } catch (err) {
+            if (err._verificationFailed) {
+              verificationFailed = true;
+              break;
+            }
+            moveLog(chunk.index, `FAILED: ${err.message}`);
+            updateChunk(chunk.index, {
+              status: 'failed',
+              failureReason: err.message
+            });
+            totalFailed += chunkUids.length;
+            failOperation(`Chunk ${chunk.index} failed: ${err.message}`);
+            return {
+              status: 'partial',
+              moved: totalMoved,
+              failed: totalFailed,
+              message: `${err.message}. ${totalMoved} emails moved successfully. ${operation.totalUids - totalMoved} remain in source untouched. Call get_move_status for details.`
+            };
+          }
+        }
+
+        if (!verificationFailed) {
+          succeeded = true;
           break;
         }
-        updateChunk(chunk.index, { status: 'verified_not_deleted', verifiedAt: new Date().toISOString() });
 
-        // Step 4: safe to delete from source — retries on transient errors
-        await withRetry(
-          `deleteChunk chunk ${chunk.index}`,
-          () => deleteChunk(sourceMailbox, subChunk)
-        );
-        totalMoved += subChunk.length;
+        if (attemptChunkSize === CHUNK_SIZE_RETRY) {
+          moveLog(chunk.index, `FAILED: verification failed at both chunk sizes`);
+          updateChunk(chunk.index, {
+            status: 'failed',
+            failureReason: 'Verification failed at both chunk sizes'
+          });
+          totalFailed += chunkUids.length;
+          failOperation(`Verification failed after retry on chunk ${chunk.index}`);
+          return {
+            status: 'partial',
+            moved: totalMoved,
+            failed: totalFailed,
+            message: `Verification failed after retry. ${totalMoved} emails moved successfully. ${operation.totalUids - totalMoved} remain in source untouched. Call get_move_status for details.`
+          };
+        }
+
+        moveLog(chunk.index, `verification failed at chunk size ${attemptChunkSize}, retrying at ${CHUNK_SIZE_RETRY}`);
       }
 
-      if (!verificationFailed) {
-        succeeded = true;
-        break;
-      }
-
-      if (attemptChunkSize === CHUNK_SIZE_RETRY) {
-        // Verification failed at both chunk sizes — stop and report, source untouched from here
-        updateChunk(chunk.index, {
-          status: 'failed',
-          failureReason: 'Verification failed at both chunk sizes'
-        });
-        totalFailed += chunkUids.length;
-        failOperation(`Verification failed after retry on chunk ${chunk.index}`);
-        return {
-          status: 'partial',
-          moved: totalMoved,
-          failed: totalFailed,
-          message: `Verification failed after retry. ${totalMoved} emails moved successfully. ${operation.totalUids - totalMoved} remain in source untouched. Call get_move_status for details.`
-        };
+      if (succeeded) {
+        updateChunk(chunk.index, { status: 'complete', deletedAt: new Date().toISOString() });
+        moveLog(chunk.index, `COMPLETE (${elapsed(chunkStart)})`);
       }
     }
 
-    if (succeeded) {
-      updateChunk(chunk.index, { status: 'complete', deletedAt: new Date().toISOString() });
-    }
+    completeOperation();
+    process.stderr.write(`[move] COMPLETE: ${totalMoved}/${operation.totalUids} emails moved (${elapsed(opStart)})\n`);
+    return { status: 'complete', moved: totalMoved, total: operation.totalUids };
+  } finally {
+    await safeClose(srcClient);
+    await safeClose(tgtClient);
   }
-
-  completeOperation();
-  return { status: 'complete', moved: totalMoved, total: operation.totalUids };
 }
 
 // ─── Email Functions ──────────────────────────────────────────────────────────
@@ -555,18 +725,14 @@ async function bulkDeleteBySender(sender, mailbox = 'INBOX') {
   await client.connect();
   await client.mailboxOpen(mailbox);
   const uids = (await client.search({ from: sender }, { uid: true })) ?? [];
-  await client.logout();
-  if (uids.length === 0) return { deleted: 0 };
+  if (uids.length === 0) { await client.logout(); return { deleted: 0 }; }
   let deleted = 0;
   for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
     const chunk = uids.slice(i, i + CHUNK_SIZE);
-    const dc = createClient();
-    await dc.connect();
-    await dc.mailboxOpen(mailbox);
-    await dc.messageDelete(chunk, { uid: true });
-    await dc.logout();
+    await client.messageDelete(chunk, { uid: true });
     deleted += chunk.length;
   }
+  await client.logout();
   return { deleted, sender };
 }
 
@@ -587,18 +753,14 @@ async function bulkDeleteBySubject(subject, mailbox = 'INBOX') {
   await client.connect();
   await client.mailboxOpen(mailbox);
   const uids = (await client.search({ subject }, { uid: true })) ?? [];
-  await client.logout();
-  if (uids.length === 0) return { deleted: 0 };
+  if (uids.length === 0) { await client.logout(); return { deleted: 0 }; }
   let deleted = 0;
   for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
     const chunk = uids.slice(i, i + CHUNK_SIZE);
-    const dc = createClient();
-    await dc.connect();
-    await dc.mailboxOpen(mailbox);
-    await dc.messageDelete(chunk, { uid: true });
-    await dc.logout();
+    await client.messageDelete(chunk, { uid: true });
     deleted += chunk.length;
   }
+  await client.logout();
   return { deleted, subject };
 }
 
@@ -609,18 +771,14 @@ async function deleteOlderThan(days, mailbox = 'INBOX') {
   const date = new Date();
   date.setDate(date.getDate() - days);
   const uids = (await client.search({ before: date }, { uid: true })) ?? [];
-  await client.logout();
-  if (uids.length === 0) return { deleted: 0 };
+  if (uids.length === 0) { await client.logout(); return { deleted: 0 }; }
   let deleted = 0;
   for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
     const chunk = uids.slice(i, i + CHUNK_SIZE);
-    const dc = createClient();
-    await dc.connect();
-    await dc.mailboxOpen(mailbox);
-    await dc.messageDelete(chunk, { uid: true });
-    await dc.logout();
+    await client.messageDelete(chunk, { uid: true });
     deleted += chunk.length;
   }
+  await client.logout();
   return { deleted, olderThan: date.toISOString() };
 }
 
@@ -899,13 +1057,15 @@ async function ensureMailbox(name) {
   await client.logout();
 }
 
-async function bulkMove(filters, targetMailbox, sourceMailbox = 'INBOX', dryRun = false) {
+async function bulkMove(filters, targetMailbox, sourceMailbox = 'INBOX', dryRun = false, limit = null) {
   const client = createClient();
   await client.connect();
   await client.mailboxOpen(sourceMailbox);
   const query = buildQuery(filters);
-  const uids = (await client.search(query, { uid: true })) ?? [];
+  let uids = (await client.search(query, { uid: true })) ?? [];
   await client.logout();
+
+  if (limit !== null) uids = uids.slice(0, limit);
 
   if (dryRun) {
     return { dryRun: true, wouldMove: uids.length, sourceMailbox, targetMailbox, filters };
@@ -917,29 +1077,45 @@ async function bulkMove(filters, targetMailbox, sourceMailbox = 'INBOX', dryRun 
   return { ...result, sourceMailbox, targetMailbox, filters };
 }
 
+// ─── IMPROVEMENT 3: bulk_delete now has per-chunk timeout ─────────────────────
+// Previously the chunk loop could run unbounded. Now each chunk gets a BULK_OP
+// timeout. If a single chunk hangs, we bail with a partial result instead of
+// hanging forever.
+
 async function bulkDelete(filters, sourceMailbox = 'INBOX', dryRun = false) {
   const client = createClient();
   await client.connect();
   await client.mailboxOpen(sourceMailbox);
   const query = buildQuery(filters);
   const uids = (await client.search(query, { uid: true })) ?? [];
-  await client.logout();
 
   if (dryRun) {
+    await client.logout();
     return { dryRun: true, wouldDelete: uids.length, sourceMailbox, filters };
   }
-  if (uids.length === 0) return { deleted: 0, sourceMailbox };
+  if (uids.length === 0) { await client.logout(); return { deleted: 0, sourceMailbox }; }
 
   let deleted = 0;
   for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
     const chunk = uids.slice(i, i + CHUNK_SIZE);
-    const deleteClient = createClient();
-    await deleteClient.connect();
-    await deleteClient.mailboxOpen(sourceMailbox);
-    await deleteClient.messageDelete(chunk, { uid: true });
-    await deleteClient.logout();
-    deleted += chunk.length;
+    const chunkIndex = Math.floor(i / CHUNK_SIZE);
+    try {
+      await withTimeout(`bulk_delete chunk ${chunkIndex}`, TIMEOUT.BULK_OP, async () => {
+        await client.messageDelete(chunk, { uid: true });
+      });
+      deleted += chunk.length;
+    } catch (err) {
+      await safeClose(client);
+      return {
+        deleted,
+        failed: uids.length - deleted,
+        sourceMailbox,
+        filters,
+        error: `Chunk ${chunkIndex} failed: ${err.message}. ${deleted} deleted so far, ${uids.length - deleted} remaining.`
+      };
+    }
   }
+  await client.logout();
   return { deleted, sourceMailbox, filters };
 }
 
@@ -981,7 +1157,7 @@ function logClear() {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.6.0' },
+    { name: 'icloud-mail', version: '1.5.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -1110,6 +1286,7 @@ async function main() {
             targetMailbox: { type: 'string', description: 'Destination mailbox path' },
             sourceMailbox: { type: 'string', description: 'Source mailbox (default INBOX)' },
             dryRun: { type: 'boolean', description: 'If true, preview what would be moved without actually moving' },
+            limit: { type: 'number', description: 'Maximum number of emails to move (default: all matching)' },
             ...filtersSchema
           },
           required: ['targetMailbox']
@@ -1117,7 +1294,7 @@ async function main() {
       },
       {
         name: 'bulk_delete',
-        description: 'Delete emails matching any combination of filters. Processes in chunks of 250 for reliability. Use dryRun: true to preview without making changes.',
+        description: 'Delete emails matching any combination of filters. Processes in chunks of 250 with per-chunk timeouts for reliability. Use dryRun: true to preview without making changes.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -1354,71 +1531,80 @@ async function main() {
     const { name, arguments: args } = request.params;
     try {
       let result;
+      // ── Metadata tier (15s) ──
       if (name === 'get_inbox_summary') {
-        result = await getInboxSummary(args.mailbox || 'INBOX');
+        result = await withTimeout('get_inbox_summary', TIMEOUT.METADATA, () => getInboxSummary(args.mailbox || 'INBOX'));
       } else if (name === 'get_mailbox_summary') {
-        result = await getMailboxSummary(args.mailbox);
-      } else if (name === 'get_top_senders') {
-        result = await getTopSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20);
-      } else if (name === 'get_unread_senders') {
-        result = await getUnreadSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20);
-      } else if (name === 'get_emails_by_sender') {
-        result = await getEmailsBySender(args.sender, args.mailbox || 'INBOX', args.limit || 10);
-      } else if (name === 'read_inbox') {
-        result = await fetchEmails(args.mailbox || 'INBOX', args.limit || 10, args.onlyUnread || false, args.page || 1);
-      } else if (name === 'get_email') {
-        result = await getEmailContent(args.uid, args.mailbox || 'INBOX');
-      } else if (name === 'search_emails') {
-        const { query, mailbox, limit, ...filters } = args;
-        result = await searchEmails(query, mailbox || 'INBOX', limit || 10, filters);
+        result = await withTimeout('get_mailbox_summary', TIMEOUT.METADATA, () => getMailboxSummary(args.mailbox));
       } else if (name === 'count_emails') {
         const { mailbox, ...filters } = args;
-        result = await countEmails(filters, mailbox || 'INBOX');
-      } else if (name === 'bulk_move') {
-        const { targetMailbox, sourceMailbox, dryRun, ...filters } = args;
-        result = await bulkMove(filters, targetMailbox, sourceMailbox || 'INBOX', dryRun || false);
-      } else if (name === 'bulk_delete') {
-        const { sourceMailbox, dryRun, ...filters } = args;
-        result = await bulkDelete(filters, sourceMailbox || 'INBOX', dryRun || false);
+        result = await withTimeout('count_emails', TIMEOUT.METADATA, () => countEmails(filters, mailbox || 'INBOX'));
+      } else if (name === 'list_mailboxes') {
+        result = await withTimeout('list_mailboxes', TIMEOUT.METADATA, () => listMailboxes());
+      } else if (name === 'create_mailbox') {
+        result = await withTimeout('create_mailbox', TIMEOUT.METADATA, () => createMailbox(args.name));
+      } else if (name === 'rename_mailbox') {
+        result = await renameMailbox(args.oldName, args.newName); // already has its own 15s timeout
+      } else if (name === 'delete_mailbox') {
+        result = await deleteMailbox(args.name); // already has its own 15s timeout
+      // ── Fetch tier (30s) ──
+      } else if (name === 'read_inbox') {
+        result = await withTimeout('read_inbox', TIMEOUT.FETCH, () => fetchEmails(args.mailbox || 'INBOX', args.limit || 10, args.onlyUnread || false, args.page || 1));
+      } else if (name === 'get_email') {
+        result = await withTimeout('get_email', TIMEOUT.FETCH, () => getEmailContent(args.uid, args.mailbox || 'INBOX'));
+      } else if (name === 'search_emails') {
+        const { query, mailbox, limit, ...filters } = args;
+        result = await withTimeout('search_emails', TIMEOUT.FETCH, () => searchEmails(query, mailbox || 'INBOX', limit || 10, filters));
+      } else if (name === 'get_emails_by_sender') {
+        result = await withTimeout('get_emails_by_sender', TIMEOUT.FETCH, () => getEmailsBySender(args.sender, args.mailbox || 'INBOX', args.limit || 10));
+      } else if (name === 'get_emails_by_date_range') {
+        result = await withTimeout('get_emails_by_date_range', TIMEOUT.FETCH, () => getEmailsByDateRange(args.startDate, args.endDate, args.mailbox || 'INBOX', args.limit || 10));
+      // ── Scan tier (60s) ──
+      } else if (name === 'get_top_senders') {
+        result = await withTimeout('get_top_senders', TIMEOUT.SCAN, () => getTopSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20));
+      } else if (name === 'get_unread_senders') {
+        result = await withTimeout('get_unread_senders', TIMEOUT.SCAN, () => getUnreadSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20));
+      // ── Bulk operation tier (60s) ──
+      } else if (name === 'bulk_delete_by_sender') {
+        result = await withTimeout('bulk_delete_by_sender', TIMEOUT.BULK_OP, () => bulkDeleteBySender(args.sender, args.mailbox || 'INBOX'));
+      } else if (name === 'bulk_delete_by_subject') {
+        result = await withTimeout('bulk_delete_by_subject', TIMEOUT.BULK_OP, () => bulkDeleteBySubject(args.subject, args.mailbox || 'INBOX'));
+      } else if (name === 'bulk_mark_read') {
+        result = await withTimeout('bulk_mark_read', TIMEOUT.BULK_OP, () => bulkMarkRead(args.mailbox || 'INBOX', args.sender || null));
+      } else if (name === 'bulk_mark_unread') {
+        result = await withTimeout('bulk_mark_unread', TIMEOUT.BULK_OP, () => bulkMarkUnread(args.mailbox || 'INBOX', args.sender || null));
       } else if (name === 'bulk_flag') {
         const { flagged, mailbox, ...filters } = args;
-        result = await bulkFlag(filters, flagged, mailbox || 'INBOX');
-      } else if (name === 'bulk_delete_by_sender') {
-        result = await bulkDeleteBySender(args.sender, args.mailbox || 'INBOX');
+        result = await withTimeout('bulk_flag', TIMEOUT.BULK_OP, () => bulkFlag(filters, flagged, mailbox || 'INBOX'));
+      } else if (name === 'delete_older_than') {
+        result = await withTimeout('delete_older_than', TIMEOUT.BULK_OP, () => deleteOlderThan(args.days, args.mailbox || 'INBOX'));
+      } else if (name === 'empty_trash') {
+        result = await withTimeout('empty_trash', TIMEOUT.BULK_OP, () => emptyTrash());
+      // ── No top-level timeout — chunked with internal timeouts ──
+      } else if (name === 'bulk_move') {
+        const { targetMailbox, sourceMailbox, dryRun, limit, ...filters } = args;
+        result = await bulkMove(filters, targetMailbox, sourceMailbox || 'INBOX', dryRun || false, limit ?? null);
       } else if (name === 'bulk_move_by_sender') {
         result = await bulkMoveBySender(args.sender, args.targetMailbox, args.sourceMailbox || 'INBOX');
-      } else if (name === 'bulk_delete_by_subject') {
-        result = await bulkDeleteBySubject(args.subject, args.mailbox || 'INBOX');
-      } else if (name === 'bulk_mark_read') {
-        result = await bulkMarkRead(args.mailbox || 'INBOX', args.sender || null);
-      } else if (name === 'bulk_mark_unread') {
-        result = await bulkMarkUnread(args.mailbox || 'INBOX', args.sender || null);
-      } else if (name === 'delete_older_than') {
-        result = await deleteOlderThan(args.days, args.mailbox || 'INBOX');
-      } else if (name === 'get_emails_by_date_range') {
-        result = await getEmailsByDateRange(args.startDate, args.endDate, args.mailbox || 'INBOX', args.limit || 10);
+      } else if (name === 'bulk_delete') {
+        // IMPROVEMENT 3: bulk_delete now has per-chunk timeouts internally
+        const { sourceMailbox, dryRun, ...filters } = args;
+        result = await bulkDelete(filters, sourceMailbox || 'INBOX', dryRun || false);
+      // ── Single-email tier (15s) ──
       } else if (name === 'flag_email') {
-        result = await flagEmail(args.uid, args.flagged, args.mailbox || 'INBOX');
+        result = await withTimeout('flag_email', TIMEOUT.SINGLE, () => flagEmail(args.uid, args.flagged, args.mailbox || 'INBOX'));
       } else if (name === 'mark_as_read') {
-        result = await markAsRead(args.uid, args.seen, args.mailbox || 'INBOX');
+        result = await withTimeout('mark_as_read', TIMEOUT.SINGLE, () => markAsRead(args.uid, args.seen, args.mailbox || 'INBOX'));
       } else if (name === 'delete_email') {
-        result = await deleteEmail(args.uid, args.mailbox || 'INBOX');
+        result = await withTimeout('delete_email', TIMEOUT.SINGLE, () => deleteEmail(args.uid, args.mailbox || 'INBOX'));
       } else if (name === 'move_email') {
-        result = await moveEmail(args.uid, args.targetMailbox, args.sourceMailbox || 'INBOX');
-      } else if (name === 'list_mailboxes') {
-        result = await listMailboxes();
-      } else if (name === 'create_mailbox') {
-        result = await createMailbox(args.name);
-      } else if (name === 'rename_mailbox') {
-        result = await renameMailbox(args.oldName, args.newName);
-      } else if (name === 'delete_mailbox') {
-        result = await deleteMailbox(args.name);
-      } else if (name === 'empty_trash') {
-        result = await emptyTrash();
+        result = await withTimeout('move_email', TIMEOUT.SINGLE, () => moveEmail(args.uid, args.targetMailbox, args.sourceMailbox || 'INBOX'));
+      // ── Move status (synchronous, no timeout needed) ──
       } else if (name === 'get_move_status') {
         result = getMoveStatus();
       } else if (name === 'abandon_move') {
         result = abandonMove();
+      // ── Session log (synchronous, no timeout needed) ──
       } else if (name === 'log_write') {
         result = logWrite(args.step);
       } else if (name === 'log_read') {
@@ -1473,6 +1659,14 @@ function friendlyError(err) {
     return [
       'iCloud closed the connection unexpectedly.',
       '→ This is usually transient. Try again in a few seconds.'
+    ].join('\n');
+  }
+
+  if (msg.includes('timed out after')) {
+    return [
+      `Operation ${msg}`,
+      '→ This usually means iCloud is slow or the operation is larger than expected.',
+      '→ Try again — if it persists, the operation may need to be broken into smaller steps.'
     ].join('\n');
   }
 

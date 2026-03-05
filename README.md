@@ -66,6 +66,7 @@ icloud-mcp doctor
 ─────────────────────────────
 ✅ IMAP_USER is set
 ✅ IMAP_PASSWORD is set
+✅ IMAP_USER looks like an email address
 ✅ Connected to imap.mail.me.com:993
 ✅ Authenticated as you@icloud.com
 ✅ INBOX opened (12453 messages)
@@ -131,7 +132,7 @@ Fully quit Claude Desktop (Cmd+Q) and reopen it. You should now be able to manag
 | `get_emails_by_date_range` | Emails between two dates |
 | `search_emails` | Search by keyword with optional filters (date, unread, domain, etc.) |
 | `count_emails` | Count emails matching any combination of filters without modifying them |
-| `bulk_move` | Move emails matching any combination of filters between folders (supports `dryRun`) |
+| `bulk_move` | Move emails matching any combination of filters between folders (supports `dryRun` and `limit`) |
 | `bulk_delete` | Delete emails matching any combination of filters (supports `dryRun`) |
 | `bulk_flag` | Flag or unflag emails matching any combination of filters |
 | `bulk_mark_read` | Mark all emails (or all from a sender) as read |
