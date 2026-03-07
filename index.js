@@ -1119,6 +1119,25 @@ function findTextPart(node) {
   return null;
 }
 
+function findAttachments(node, parts = []) {
+  if (node.childNodes) {
+    for (const child of node.childNodes) findAttachments(child, parts);
+  } else {
+    const filename = node.dispositionParameters?.filename ?? node.parameters?.name ?? null;
+    const isTextBody = (node.type === 'text/plain' || node.type === 'text/html') && node.disposition !== 'attachment';
+    if (node.disposition === 'attachment' || node.disposition === 'inline' || (filename && !isTextBody)) {
+      parts.push({
+        partId: node.part ?? 'TEXT',
+        filename,
+        mimeType: node.type ?? 'application/octet-stream',
+        size: node.size ?? 0,
+        disposition: node.disposition ?? 'attachment'
+      });
+    }
+  }
+  return parts;
+}
+
 // ─── Email content fetcher (MIME-aware) ───────────────────────────────────────
 
 async function getEmailContent(uid, mailbox = 'INBOX') {
@@ -1202,6 +1221,22 @@ async function getEmailContent(uid, mailbox = 'INBOX') {
     date: meta.envelope.date,
     flags: [...meta.flags],
     body
+  };
+}
+
+async function listAttachments(uid, mailbox = 'INBOX') {
+  const client = createRateLimitedClient();
+  await client.connect();
+  await client.mailboxOpen(mailbox);
+  const meta = await client.fetchOne(uid, { envelope: true, bodyStructure: true }, { uid: true });
+  await client.logout();
+  if (!meta) return { uid, subject: null, attachmentCount: 0, attachments: [] };
+  const attachments = meta.bodyStructure ? findAttachments(meta.bodyStructure) : [];
+  return {
+    uid: meta.uid,
+    subject: meta.envelope.subject,
+    attachmentCount: attachments.length,
+    attachments
   };
 }
 
@@ -1309,7 +1344,12 @@ function buildQuery(filters) {
   if (filters.flagged === false) query.unflagged = true;
   if (filters.larger) query.larger = filters.larger * 1024;
   if (filters.smaller) query.smaller = filters.smaller * 1024;
-  if (filters.hasAttachment) query.header = ['Content-Type', 'multipart/mixed'];
+  if (filters.hasAttachment) {
+    query.or = [
+      { header: { 'Content-Disposition': 'attachment' } },
+      { header: { 'Content-Type': 'multipart/mixed' } }
+    ];
+  }
   if (Object.keys(query).length === 0) query.all = true;
   return query;
 }
@@ -1421,7 +1461,7 @@ function logClear() {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.7.0' },
+    { name: 'icloud-mail', version: '1.8.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -1788,6 +1828,18 @@ async function main() {
         name: 'log_clear',
         description: 'Clear the session log and start fresh. Use this at the start of a new task.',
         inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'list_attachments',
+        description: 'List all attachments in an email without downloading them. Returns filename, MIME type, size, and IMAP part ID for each attachment.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            uid: { type: 'number', description: 'Email UID' },
+            mailbox: { type: 'string', description: 'Mailbox name (default INBOX)' }
+          },
+          required: ['uid']
+        }
       }
     ]
   }));
@@ -1817,6 +1869,8 @@ async function main() {
         result = await withTimeout('read_inbox', TIMEOUT.FETCH, () => fetchEmails(args.mailbox || 'INBOX', args.limit || 10, args.onlyUnread || false, args.page || 1));
       } else if (name === 'get_email') {
         result = await withTimeout('get_email', TIMEOUT.FETCH, () => getEmailContent(args.uid, args.mailbox || 'INBOX'));
+      } else if (name === 'list_attachments') {
+        result = await withTimeout('list_attachments', TIMEOUT.FETCH, () => listAttachments(args.uid, args.mailbox || 'INBOX'));
       } else if (name === 'search_emails') {
         const { query, mailbox, limit, ...filters } = args;
         result = await withTimeout('search_emails', TIMEOUT.FETCH, () => searchEmails(query, mailbox || 'INBOX', limit || 10, filters));
