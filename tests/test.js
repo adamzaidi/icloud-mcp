@@ -12,7 +12,7 @@ if (!IMAP_USER || !IMAP_PASSWORD) {
   process.exit(1);
 }
 
-const projectDir = fileURLToPath(new URL('.', import.meta.url));
+const projectDir = fileURLToPath(new URL('..', import.meta.url));
 const VERBOSE = process.argv.includes('--verbose') || process.argv.includes('-v');
 
 // Timeout in ms per tool category

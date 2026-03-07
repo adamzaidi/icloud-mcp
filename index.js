@@ -51,7 +51,7 @@ function createClient() {
 // after passing the gate.
 let _lastConnectTime = 0;
 let _connectGate = Promise.resolve();
-const MIN_CONNECT_INTERVAL = 200; // ms between connection initiations
+const MIN_CONNECT_INTERVAL = 10; // ms between connection initiations
 
 function createRateLimitedClient() {
   const client = createClient();
@@ -183,6 +183,10 @@ function startOperation(source, target, uids) {
     target,
     totalUids: uids.length,
     status: 'in_progress',
+    phase: 'copying',
+    verifiedAt: null,
+    deletedAt: null,
+    allFingerprints: null,
     chunks,
     summary: {
       chunksComplete: 0,
@@ -218,6 +222,14 @@ function updateChunk(index, updates) {
   });
 }
 
+function updateOperationPhase(phase, extraFields = {}) {
+  updateManifest((data) => {
+    if (!data.current) return;
+    data.current.phase = phase;
+    Object.assign(data.current, extraFields);
+  });
+}
+
 function completeOperation() {
   const data = readManifest();
   if (!data.current) return;
@@ -241,10 +253,13 @@ function formatOperation(op) {
   return {
     operationId: op.operationId,
     status: op.status,
+    phase: op.phase ?? null,
     source: op.source,
     target: op.target,
     startedAt: op.startedAt,
     updatedAt: op.updatedAt,
+    verifiedAt: op.verifiedAt ?? null,
+    deletedAt: op.deletedAt ?? null,
     summary: op.summary,
     failedChunks: op.chunks.filter(c => c.status === 'failed').map(c => ({
       index: c.index,
@@ -314,13 +329,17 @@ async function withRetry(label, fn, maxAttempts = 3) {
 
 // ─── Per-operation timeouts ───────────────────────────────────────────────────
 
+const COPY_CHUNK_DELAY_MS = 500; // ms between COPY chunks — mitigates iCloud copy throttling
+
 const TIMEOUT = {
-  METADATA: 15_000,
-  FETCH:    30_000,
-  SCAN:     60_000,
-  BULK_OP:  60_000,
-  CHUNK:   300_000,
-  SINGLE:   15_000,
+  METADATA:   15_000,
+  FETCH:      30_000,
+  SCAN:       60_000,
+  BULK_OP:    60_000,
+  CHUNK:     300_000,
+  SINGLE:     15_000,
+  VERIFY_ALL: 120_000, // full envelope scan for all N emails
+  DELETE_ALL: 600_000, // flag all + single UID EXPUNGE (measured up to 521s at 5k)
 };
 
 function withTimeout(label, ms, fn) {
@@ -417,6 +436,11 @@ async function verifyInTarget(targetClient, fingerprints, chunkIndex, knownTotal
     return { verified: true, missing: [], found: fingerprints.length, expected: fingerprints.length };
   }
 
+  if (afterScan.length > 200) {
+    moveLog(chunkIndex, `${afterScan.length} unmatched after envelope scan — too many for Message-ID fallback, treating as failed`);
+    return { verified: false, missing: afterScan, found: fingerprints.length - afterScan.length, expected: fingerprints.length };
+  }
+
   // Secondary: Message-ID search only for the ones envelope scan missed
   moveLog(chunkIndex, `${afterScan.length} unmatched after envelope scan — trying Message-ID search`);
   const withMessageId = afterScan.filter(fp => fp.messageId);
@@ -442,12 +466,146 @@ async function verifyInTarget(targetClient, fingerprints, chunkIndex, knownTotal
   };
 }
 
-// ─── Safe Move (v3: connection reuse + envelope-first verify + logging) ───────
+// ─── Option B phase helpers ────────────────────────────────────────────────────
+
+// Phase 1: Copy all chunks to target without deleting.
+// Returns { success, totalCopied, srcClient, errorResult }
+async function copyAllChunks(operation, srcClient, targetMailbox, sourceMailbox) {
+  let totalCopied = 0;
+
+  for (const chunk of operation.chunks) {
+    const chunkUids = chunk.uids;
+    const chunkStart = Date.now();
+    moveLog(chunk.index, `starting copy (${chunkUids.length} emails)`);
+
+    try {
+      await withTimeout(`copy chunk ${chunk.index}`, TIMEOUT.CHUNK, async () => {
+        // Step 1: fetch envelopes → fingerprints
+        let t = Date.now();
+        const envelopes = [];
+        try {
+          for await (const msg of srcClient.fetch(chunkUids, { envelope: true }, { uid: true })) {
+            envelopes.push(msg);
+          }
+        } catch (err) {
+          if (!isTransient(err)) throw err;
+          moveLog(chunk.index, `fetch envelopes failed (${err.message}), reconnecting...`);
+          srcClient = await reconnect(srcClient, sourceMailbox);
+          for await (const msg of srcClient.fetch(chunkUids, { envelope: true }, { uid: true })) {
+            envelopes.push(msg);
+          }
+        }
+        const fingerprints = envelopes.map(buildFingerprint);
+        const withMsgId = fingerprints.filter(fp => fp.messageId).length;
+        moveLog(chunk.index, `fetched ${envelopes.length} envelopes (${withMsgId} with Message-ID) (${elapsed(t)})`);
+
+        // Update in-memory chunk so verifyAllChunks can flatMap fingerprints later
+        chunk.fingerprints = fingerprints;
+        updateManifest((data) => {
+          if (!data.current) return;
+          const c = data.current.chunks[chunk.index];
+          if (!c) return;
+          c.fingerprints = fingerprints;
+        });
+
+        // Step 2: copy to target
+        t = Date.now();
+        try {
+          await srcClient.messageCopy(chunkUids, targetMailbox, { uid: true });
+        } catch (err) {
+          if (!isTransient(err)) throw err;
+          moveLog(chunk.index, `copy failed (${err.message}), reconnecting...`);
+          srcClient = await reconnect(srcClient, sourceMailbox);
+          await srcClient.messageCopy(chunkUids, targetMailbox, { uid: true });
+        }
+        moveLog(chunk.index, `copied ${chunkUids.length} emails to target (${elapsed(t)})`);
+        updateChunk(chunk.index, { status: 'copied_not_verified', copiedAt: new Date().toISOString() });
+      });
+
+      totalCopied += chunkUids.length;
+      moveLog(chunk.index, `copy complete (${elapsed(chunkStart)})`);
+    } catch (err) {
+      moveLog(chunk.index, `copy FAILED: ${err.message}`);
+      updateChunk(chunk.index, { status: 'failed', failureReason: err.message });
+      return {
+        success: false,
+        totalCopied,
+        srcClient,
+        errorResult: {
+          status: 'partial',
+          moved: 0,
+          failed: operation.totalUids,
+          message: `Copy failed on chunk ${chunk.index}: ${err.message}. No emails deleted from source. ${totalCopied} emails were copied to target but not verified — call get_move_status for details.`
+        }
+      };
+    }
+
+    // Delay between chunks to mitigate iCloud copy throttling
+    if (chunk.index < operation.chunks.length - 1) {
+      await new Promise(r => setTimeout(r, COPY_CHUNK_DELAY_MS));
+    }
+  }
+
+  return { success: true, totalCopied, srcClient, errorResult: null };
+}
+
+// Phase 2: Verify all copied emails are present in target.
+// Returns { verification, tgtClient }
+async function verifyAllChunks(tgtClient, operation, targetMailbox) {
+  const allFingerprints = operation.chunks.flatMap(c => c.fingerprints);
+
+  updateManifest((data) => {
+    if (!data.current) return;
+    data.current.allFingerprints = allFingerprints;
+  });
+
+  let tgtMb;
+  try {
+    tgtMb = await tgtClient.mailboxOpen(targetMailbox);
+  } catch (err) {
+    if (!isTransient(err)) throw err;
+    moveLog('global', `mailboxOpen failed (${err.message}), reconnecting...`);
+    tgtClient = await reconnect(tgtClient, targetMailbox);
+    tgtMb = await tgtClient.mailboxOpen(targetMailbox);
+  }
+
+  let verification;
+  try {
+    verification = await verifyInTarget(tgtClient, allFingerprints, 'global', tgtMb.exists);
+  } catch (err) {
+    if (!isTransient(err)) throw err;
+    moveLog('global', `verify failed (${err.message}), reconnecting...`);
+    tgtClient = await reconnect(tgtClient, targetMailbox);
+    verification = await verifyInTarget(tgtClient, allFingerprints, 'global');
+  }
+
+  return { verification, tgtClient };
+}
+
+// Phase 3: Delete all source emails in a single EXPUNGE.
+// Returns { srcClient }
+async function deleteAllChunks(srcClient, operation, sourceMailbox) {
+  const allUids = operation.chunks.flatMap(c => c.uids);
+  const t = Date.now();
+
+  try {
+    await srcClient.messageDelete(allUids, { uid: true });
+  } catch (err) {
+    if (!isTransient(err)) throw err;
+    moveLog('global', `delete failed (${err.message}), reconnecting...`);
+    srcClient = await reconnect(srcClient, sourceMailbox);
+    // Retry is idempotent — expunging already-gone UIDs is a no-op
+    await srcClient.messageDelete(allUids, { uid: true });
+  }
+
+  moveLog('global', `deleted ${allUids.length} from source — single EXPUNGE (${elapsed(t)})`);
+  return { srcClient };
+}
+
+// ─── Safe Move (Option B: COPY-all → VERIFY-all → single EXPUNGE) ─────────────
 
 async function safeMoveEmails(uids, sourceMailbox, targetMailbox) {
   const operation = startOperation(sourceMailbox, targetMailbox, uids);
-  let totalMoved = 0;
-  let totalFailed = 0;
   const opStart = Date.now();
 
   process.stderr.write(`[move] starting: ${uids.length} emails, ${operation.chunks.length} chunks, ${sourceMailbox} → ${targetMailbox}\n`);
@@ -456,151 +614,87 @@ async function safeMoveEmails(uids, sourceMailbox, targetMailbox) {
   let tgtClient = await openClient(targetMailbox);
 
   try {
-    for (const chunk of operation.chunks) {
-      const chunkUids = chunk.uids;
-      let succeeded = false;
-      const chunkStart = Date.now();
+    // Phase 1: COPY all chunks to target (no delete yet)
+    process.stderr.write(`[move] phase 1/3: copying ${uids.length} emails in ${operation.chunks.length} chunks\n`);
+    const copyResult = await copyAllChunks(operation, srcClient, targetMailbox, sourceMailbox);
+    srcClient = copyResult.srcClient;
 
-      moveLog(chunk.index, `starting (${chunkUids.length} emails)`);
-
-      for (const attemptChunkSize of [CHUNK_SIZE, CHUNK_SIZE_RETRY]) {
-        const subChunks = [];
-        for (let i = 0; i < chunkUids.length; i += attemptChunkSize) {
-          subChunks.push(chunkUids.slice(i, i + attemptChunkSize));
-        }
-
-        let verificationFailed = false;
-
-        for (const subChunk of subChunks) {
-          try {
-            await withTimeout(`safeMoveEmails chunk ${chunk.index}`, TIMEOUT.CHUNK, async () => {
-              // Step 1: fetch fingerprints from source
-              let t = Date.now();
-              const envelopes = [];
-              try {
-                for await (const msg of srcClient.fetch(subChunk, { envelope: true }, { uid: true })) {
-                  envelopes.push(msg);
-                }
-              } catch (err) {
-                if (!isTransient(err)) throw err;
-                moveLog(chunk.index, `fetch envelopes failed (${err.message}), reconnecting...`);
-                srcClient = await reconnect(srcClient, sourceMailbox);
-                for await (const msg of srcClient.fetch(subChunk, { envelope: true }, { uid: true })) {
-                  envelopes.push(msg);
-                }
-              }
-              const fingerprints = envelopes.map(buildFingerprint);
-              const withMsgId = fingerprints.filter(fp => fp.messageId).length;
-              moveLog(chunk.index, `fetched ${envelopes.length} envelopes (${withMsgId} with Message-ID) (${elapsed(t)})`);
-
-              updateManifest((data) => {
-                if (!data.current) return;
-                const c = data.current.chunks[chunk.index];
-                if (!c) return;
-                c.fingerprints = [...c.fingerprints, ...fingerprints];
-                c.status = 'pending';
-              });
-
-              // Step 2: copy to target
-              t = Date.now();
-              try {
-                await srcClient.messageCopy(subChunk, targetMailbox, { uid: true });
-              } catch (err) {
-                if (!isTransient(err)) throw err;
-                moveLog(chunk.index, `copy failed (${err.message}), reconnecting...`);
-                srcClient = await reconnect(srcClient, sourceMailbox);
-                await srcClient.messageCopy(subChunk, targetMailbox, { uid: true });
-              }
-              moveLog(chunk.index, `copied ${subChunk.length} emails to target (${elapsed(t)})`);
-              updateChunk(chunk.index, { status: 'copied_not_verified', copiedAt: new Date().toISOString() });
-
-              // Step 3: verify in target
-              t = Date.now();
-              let verification;
-              try {
-                const tgtMb = await tgtClient.mailboxOpen(targetMailbox);
-                verification = await verifyInTarget(tgtClient, fingerprints, chunk.index, tgtMb.exists);
-              } catch (err) {
-                if (!isTransient(err)) throw err;
-                moveLog(chunk.index, `verify failed (${err.message}), reconnecting...`);
-                tgtClient = await reconnect(tgtClient, targetMailbox);
-                verification = await verifyInTarget(tgtClient, fingerprints, chunk.index);
-              }
-              moveLog(chunk.index, `verification: ${verification.found}/${verification.expected} confirmed (${elapsed(t)})`);
-
-              if (!verification.verified) {
-                throw Object.assign(new Error('verification_failed'), { _verificationFailed: true });
-              }
-              updateChunk(chunk.index, { status: 'verified_not_deleted', verifiedAt: new Date().toISOString() });
-
-              // Step 4: delete from source
-              t = Date.now();
-              try {
-                await srcClient.messageDelete(subChunk, { uid: true });
-              } catch (err) {
-                if (!isTransient(err)) throw err;
-                moveLog(chunk.index, `delete failed (${err.message}), reconnecting...`);
-                srcClient = await reconnect(srcClient, sourceMailbox);
-                await srcClient.messageDelete(subChunk, { uid: true });
-              }
-              moveLog(chunk.index, `deleted ${subChunk.length} from source (${elapsed(t)})`);
-            });
-            totalMoved += subChunk.length;
-            moveLog(chunk.index, `sub-chunk complete: ${subChunk.length} moved (chunk total: ${totalMoved}/${operation.totalUids})`);
-          } catch (err) {
-            if (err._verificationFailed) {
-              verificationFailed = true;
-              break;
-            }
-            moveLog(chunk.index, `FAILED: ${err.message}`);
-            updateChunk(chunk.index, {
-              status: 'failed',
-              failureReason: err.message
-            });
-            totalFailed += chunkUids.length;
-            failOperation(`Chunk ${chunk.index} failed: ${err.message}`);
-            return {
-              status: 'partial',
-              moved: totalMoved,
-              failed: totalFailed,
-              message: `${err.message}. ${totalMoved} emails moved successfully. ${operation.totalUids - totalMoved} remain in source untouched. Call get_move_status for details.`
-            };
-          }
-        }
-
-        if (!verificationFailed) {
-          succeeded = true;
-          break;
-        }
-
-        if (attemptChunkSize === CHUNK_SIZE_RETRY) {
-          moveLog(chunk.index, `FAILED: verification failed at both chunk sizes`);
-          updateChunk(chunk.index, {
-            status: 'failed',
-            failureReason: 'Verification failed at both chunk sizes'
-          });
-          totalFailed += chunkUids.length;
-          failOperation(`Verification failed after retry on chunk ${chunk.index}`);
-          return {
-            status: 'partial',
-            moved: totalMoved,
-            failed: totalFailed,
-            message: `Verification failed after retry. ${totalMoved} emails moved successfully. ${operation.totalUids - totalMoved} remain in source untouched. Call get_move_status for details.`
-          };
-        }
-
-        moveLog(chunk.index, `verification failed at chunk size ${attemptChunkSize}, retrying at ${CHUNK_SIZE_RETRY}`);
-      }
-
-      if (succeeded) {
-        updateChunk(chunk.index, { status: 'complete', deletedAt: new Date().toISOString() });
-        moveLog(chunk.index, `COMPLETE (${elapsed(chunkStart)})`);
-      }
+    if (!copyResult.success) {
+      failOperation(`Copy phase failed: ${copyResult.errorResult.message}`);
+      return copyResult.errorResult;
     }
 
+    // Phase 2: VERIFY all emails are present in target
+    process.stderr.write(`[move] phase 2/3: verifying all ${copyResult.totalCopied} emails in target\n`);
+    updateOperationPhase('verifying');
+
+    let verifyResult;
+    try {
+      verifyResult = await withTimeout('verify all', TIMEOUT.VERIFY_ALL, () =>
+        verifyAllChunks(tgtClient, operation, targetMailbox)
+      );
+      tgtClient = verifyResult.tgtClient;
+    } catch (err) {
+      moveLog('global', `verify phase FAILED: ${err.message}`);
+      failOperation(`Verify phase failed: ${err.message}`);
+      return {
+        status: 'failed',
+        moved: 0,
+        message: `Verification timed out or failed: ${err.message}. All ${copyResult.totalCopied} emails remain in source (not deleted). Call get_move_status for details.`
+      };
+    }
+
+    const { verification } = verifyResult;
+    moveLog('global', `verification: ${verification.found}/${verification.expected} confirmed`);
+
+    if (!verification.verified) {
+      moveLog('global', `FAILED: ${verification.missing.length} emails missing from target after copy`);
+      failOperation(`Verification failed: ${verification.missing.length} emails missing from target`);
+      return {
+        status: 'failed',
+        moved: 0,
+        message: `Verification failed: ${verification.missing.length} of ${verification.expected} emails did not arrive in target. Source emails untouched. Call get_move_status for details.`
+      };
+    }
+
+    updateOperationPhase('verifying', { verifiedAt: new Date().toISOString() });
+
+    // Mark all chunks as verified
+    for (const chunk of operation.chunks) {
+      updateChunk(chunk.index, { status: 'verified_not_deleted', verifiedAt: new Date().toISOString() });
+    }
+
+    // Phase 3: DELETE all source emails — single EXPUNGE
+    process.stderr.write(`[move] phase 3/3: deleting all ${uids.length} emails from source (1 EXPUNGE)\n`);
+    updateOperationPhase('deleting');
+
+    let deleteResult;
+    try {
+      deleteResult = await withTimeout('delete all', TIMEOUT.DELETE_ALL, () =>
+        deleteAllChunks(srcClient, operation, sourceMailbox)
+      );
+      srcClient = deleteResult.srcClient;
+    } catch (err) {
+      moveLog('global', `delete phase FAILED: ${err.message}`);
+      // Emails are safe in target (verified). Source may still have them.
+      failOperation(`Delete phase failed: ${err.message}`);
+      return {
+        status: 'failed',
+        moved: 0,
+        message: `Delete phase failed: ${err.message}. All ${copyResult.totalCopied} emails exist in target (verified) but may still exist in source. Call get_move_status for details.`
+      };
+    }
+
+    // Mark all chunks complete
+    const now = new Date().toISOString();
+    for (const chunk of operation.chunks) {
+      updateChunk(chunk.index, { status: 'complete', deletedAt: now });
+    }
+    updateOperationPhase('deleting', { deletedAt: now });
     completeOperation();
-    process.stderr.write(`[move] COMPLETE: ${totalMoved}/${operation.totalUids} emails moved (${elapsed(opStart)})\n`);
-    return { status: 'complete', moved: totalMoved, total: operation.totalUids };
+
+    process.stderr.write(`[move] COMPLETE: ${copyResult.totalCopied}/${operation.totalUids} emails moved (${elapsed(opStart)})\n`);
+    return { status: 'complete', moved: copyResult.totalCopied, total: operation.totalUids };
   } finally {
     await safeClose(srcClient);
     await safeClose(tgtClient);
@@ -1185,7 +1279,7 @@ function logClear() {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.5.1' },
+    { name: 'icloud-mail', version: '1.6.0' },
     { capabilities: { tools: {} } }
   );
 
