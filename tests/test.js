@@ -137,7 +137,7 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-console.log('\n🧪 iCloud MCP Server Tests v1.5.1\n');
+console.log('\n🧪 iCloud MCP Server Tests v1.9.0\n');
 if (VERBOSE) console.log('🔊 Verbose mode: showing all stderr output\n');
 
 // ─── Pre-flight cleanup ───────────────────────────────────────────────────────

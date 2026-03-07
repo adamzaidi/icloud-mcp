@@ -90,6 +90,7 @@ async function reconnect(client, mailbox) {
 const CHUNK_SIZE = 500;
 const CHUNK_SIZE_RETRY = 100;
 const ATTACHMENT_SCAN_LIMIT = 500; // max UIDs to scan client-side for hasAttachment filter
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // 20 MB cap for get_attachment downloads
 
 function readManifest() {
   if (!existsSync(MANIFEST_FILE)) return { current: null, history: [] };
@@ -1132,6 +1133,7 @@ function findAttachments(node, parts = []) {
         filename,
         mimeType: node.type ?? 'application/octet-stream',
         size: node.size ?? 0,
+        encoding: node.encoding ?? '7bit',
         disposition: node.disposition ?? 'attachment'
       });
     }
@@ -1238,6 +1240,65 @@ async function listAttachments(uid, mailbox = 'INBOX') {
     subject: meta.envelope.subject,
     attachmentCount: attachments.length,
     attachments
+  };
+}
+
+async function getAttachment(uid, partId, mailbox = 'INBOX') {
+  const client = createRateLimitedClient();
+  await client.connect();
+  await client.mailboxOpen(mailbox);
+
+  // First fetch bodyStructure to find the attachment and validate size
+  const meta = await client.fetchOne(uid, { bodyStructure: true }, { uid: true });
+  if (!meta) throw new Error(`Email UID ${uid} not found`);
+
+  const attachments = meta.bodyStructure ? findAttachments(meta.bodyStructure) : [];
+  const att = attachments.find(a => a.partId === partId);
+  if (!att) throw new Error(`Part ID "${partId}" not found in email UID ${uid}. Use list_attachments to see available parts.`);
+
+  if (att.size > MAX_ATTACHMENT_BYTES) {
+    await client.logout();
+    return {
+      error: `Attachment too large to download (${Math.round(att.size / 1024 / 1024 * 10) / 10} MB). Maximum allowed: ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB.`,
+      filename: att.filename,
+      mimeType: att.mimeType,
+      size: att.size
+    };
+  }
+
+  // Fetch the raw body part bytes
+  const rawChunks = [];
+  for await (const msg of client.fetch({ uid }, { bodyParts: [partId] }, { uid: true })) {
+    const buf = msg.bodyParts?.get(partId);
+    if (buf) rawChunks.push(buf);
+  }
+  await client.logout();
+
+  if (rawChunks.length === 0) throw new Error(`No data returned for part "${partId}" of UID ${uid}`);
+
+  const raw = Buffer.concat(rawChunks);
+  const encoding = att.encoding.toLowerCase();
+
+  let decoded;
+  if (encoding === 'base64') {
+    decoded = Buffer.from(raw.toString('ascii').replace(/\s/g, ''), 'base64');
+  } else if (encoding === 'quoted-printable') {
+    // decode QP: replace soft line breaks then decode =XX sequences
+    const qp = raw.toString('binary').replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+    decoded = Buffer.from(qp, 'binary');
+  } else {
+    decoded = raw; // 7bit / 8bit / binary — use as-is
+  }
+
+  return {
+    uid,
+    partId,
+    filename: att.filename,
+    mimeType: att.mimeType,
+    size: decoded.length,
+    encoding: att.encoding,
+    data: decoded.toString('base64'),
+    dataEncoding: 'base64'
   };
 }
 
@@ -1497,7 +1558,7 @@ function logClear() {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.8.1' },
+    { name: 'icloud-mail', version: '1.9.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -1876,6 +1937,19 @@ async function main() {
           },
           required: ['uid']
         }
+      },
+      {
+        name: 'get_attachment',
+        description: 'Download a specific attachment from an email. Returns the file content as base64-encoded data. Use list_attachments first to get the partId. Maximum 20 MB per attachment.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            uid: { type: 'number', description: 'Email UID' },
+            partId: { type: 'string', description: 'IMAP body part ID from list_attachments (e.g. "2", "1.2")' },
+            mailbox: { type: 'string', description: 'Mailbox name (default INBOX)' }
+          },
+          required: ['uid', 'partId']
+        }
       }
     ]
   }));
@@ -1907,6 +1981,8 @@ async function main() {
         result = await withTimeout('get_email', TIMEOUT.FETCH, () => getEmailContent(args.uid, args.mailbox || 'INBOX'));
       } else if (name === 'list_attachments') {
         result = await withTimeout('list_attachments', TIMEOUT.FETCH, () => listAttachments(args.uid, args.mailbox || 'INBOX'));
+      } else if (name === 'get_attachment') {
+        result = await withTimeout('get_attachment', TIMEOUT.FETCH, () => getAttachment(args.uid, args.partId, args.mailbox || 'INBOX'));
       } else if (name === 'search_emails') {
         const { query, mailbox, limit, ...filters } = args;
         result = await withTimeout('search_emails', TIMEOUT.FETCH, () => searchEmails(query, mailbox || 'INBOX', limit || 10, filters));
