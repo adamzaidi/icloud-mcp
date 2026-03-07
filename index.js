@@ -89,6 +89,7 @@ async function reconnect(client, mailbox) {
 
 const CHUNK_SIZE = 500;
 const CHUNK_SIZE_RETRY = 100;
+const ATTACHMENT_SCAN_LIMIT = 500; // max UIDs to scan client-side for hasAttachment filter
 
 function readManifest() {
   if (!existsSync(MANIFEST_FILE)) return { current: null, history: [] };
@@ -1302,7 +1303,14 @@ async function searchEmails(query, mailbox = 'INBOX', limit = 10, filters = {}) 
     ? { ...textQuery, ...extraQuery }
     : textQuery;
 
-  const uids = (await client.search(finalQuery, { uid: true })) ?? [];
+  let uids = (await client.search(finalQuery, { uid: true })) ?? [];
+  if (filters.hasAttachment) {
+    if (uids.length > ATTACHMENT_SCAN_LIMIT) {
+      await client.logout();
+      return { total: null, showing: 0, emails: [], error: `hasAttachment requires narrower filters first — ${uids.length} candidates exceeds scan limit of ${ATTACHMENT_SCAN_LIMIT}. Add from/since/before/subject filters to reduce the set.` };
+    }
+    uids = await filterUidsByAttachment(client, uids);
+  }
   const emails = [];
   const recentUids = uids.slice(-limit).reverse();
   for (const uid of recentUids) {
@@ -1344,14 +1352,21 @@ function buildQuery(filters) {
   if (filters.flagged === false) query.unflagged = true;
   if (filters.larger) query.larger = filters.larger * 1024;
   if (filters.smaller) query.smaller = filters.smaller * 1024;
-  if (filters.hasAttachment) {
-    query.or = [
-      { header: { 'Content-Disposition': 'attachment' } },
-      { header: { 'Content-Type': 'multipart/mixed' } }
-    ];
-  }
+  // hasAttachment is handled as a client-side post-filter (see filterUidsByAttachment)
+  // iCloud does not support SEARCH HEADER or reliable size-based attachment detection
   if (Object.keys(query).length === 0) query.all = true;
   return query;
+}
+
+async function filterUidsByAttachment(client, uids) {
+  if (uids.length === 0) return [];
+  const result = [];
+  for await (const msg of client.fetch(uids, { bodyStructure: true }, { uid: true })) {
+    if (msg.bodyStructure && findAttachments(msg.bodyStructure).length > 0) {
+      result.push(msg.uid);
+    }
+  }
+  return result;
 }
 
 async function ensureMailbox(name) {
@@ -1367,6 +1382,13 @@ async function bulkMove(filters, targetMailbox, sourceMailbox = 'INBOX', dryRun 
   await client.mailboxOpen(sourceMailbox);
   const query = buildQuery(filters);
   let uids = (await client.search(query, { uid: true })) ?? [];
+  if (filters.hasAttachment) {
+    if (uids.length > ATTACHMENT_SCAN_LIMIT) {
+      await client.logout();
+      return { error: `hasAttachment requires narrower filters first — ${uids.length} candidates exceeds scan limit of ${ATTACHMENT_SCAN_LIMIT}.` };
+    }
+    uids = await filterUidsByAttachment(client, uids);
+  }
   await client.logout();
 
   if (limit !== null) uids = uids.slice(0, limit);
@@ -1391,7 +1413,14 @@ async function bulkDelete(filters, sourceMailbox = 'INBOX', dryRun = false) {
   await client.connect();
   await client.mailboxOpen(sourceMailbox);
   const query = buildQuery(filters);
-  const uids = (await client.search(query, { uid: true })) ?? [];
+  let uids = (await client.search(query, { uid: true })) ?? [];
+  if (filters.hasAttachment) {
+    if (uids.length > ATTACHMENT_SCAN_LIMIT) {
+      await client.logout();
+      return { error: `hasAttachment requires narrower filters first — ${uids.length} candidates exceeds scan limit of ${ATTACHMENT_SCAN_LIMIT}.` };
+    }
+    uids = await filterUidsByAttachment(client, uids);
+  }
 
   if (dryRun) {
     await client.logout();
@@ -1428,7 +1457,14 @@ async function countEmails(filters, mailbox = 'INBOX') {
   await client.connect();
   await client.mailboxOpen(mailbox);
   const query = buildQuery(filters);
-  const uids = (await client.search(query, { uid: true })) ?? [];
+  let uids = (await client.search(query, { uid: true })) ?? [];
+  if (filters.hasAttachment) {
+    if (uids.length > ATTACHMENT_SCAN_LIMIT) {
+      await client.logout();
+      return { count: null, mailbox, filters, error: `hasAttachment requires narrower filters first — ${uids.length} candidates exceeds scan limit of ${ATTACHMENT_SCAN_LIMIT}. Add from/since/before/subject filters to reduce the set.` };
+    }
+    uids = await filterUidsByAttachment(client, uids);
+  }
   await client.logout();
   return { count: uids.length, mailbox, filters };
 }
@@ -1461,7 +1497,7 @@ function logClear() {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.8.0' },
+    { name: 'icloud-mail', version: '1.8.1' },
     { capabilities: { tools: {} } }
   );
 
@@ -1475,7 +1511,7 @@ async function main() {
     flagged: { type: 'boolean', description: 'True for flagged only, false for unflagged only' },
     larger: { type: 'number', description: 'Only emails larger than this size in KB' },
     smaller: { type: 'number', description: 'Only emails smaller than this size in KB' },
-    hasAttachment: { type: 'boolean', description: 'Only emails with attachments' }
+    hasAttachment: { type: 'boolean', description: 'Only emails with attachments (client-side BODYSTRUCTURE scan — must be combined with other filters that narrow results to under 500 emails first)' }
   };
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
