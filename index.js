@@ -1033,25 +1033,167 @@ async function getMailboxSummary(mailbox) {
   return { mailbox, total: status.messages, unread: status.unseen, recent: status.recent };
 }
 
+// ─── MIME body parsing helpers ────────────────────────────────────────────────
+
+function decodeTransferEncoding(buffer, encoding) {
+  const enc = (encoding || '7bit').toLowerCase().trim();
+  if (enc === 'base64') {
+    return Buffer.from(buffer.toString('ascii').replace(/\s/g, ''), 'base64');
+  }
+  if (enc === 'quoted-printable') {
+    const str = buffer.toString('binary')
+      .replace(/[\t ]+$/gm, '')
+      .replace(/=(?:\r?\n|$)/g, '');
+    const result = Buffer.alloc(str.length);
+    let pos = 0;
+    for (let i = 0; i < str.length; i++) {
+      if (str[i] === '=' && i + 2 < str.length) {
+        const hex = str.slice(i + 1, i + 3);
+        if (/^[\da-fA-F]{2}$/.test(hex)) {
+          result[pos++] = parseInt(hex, 16);
+          i += 2;
+          continue;
+        }
+      }
+      result[pos++] = str.charCodeAt(i) & 0xff;
+    }
+    return result.slice(0, pos);
+  }
+  return buffer;
+}
+
+async function decodeCharset(buffer, charset) {
+  const cs = (charset || 'utf-8').toLowerCase().trim();
+  const nativeMap = { 'utf-8': 'utf8', 'utf8': 'utf8', 'us-ascii': 'ascii',
+    'ascii': 'ascii', 'latin1': 'latin1', 'iso-8859-1': 'latin1', 'binary': 'binary' };
+  if (nativeMap[cs]) return buffer.toString(nativeMap[cs]);
+  try {
+    const { default: iconv } = await import('iconv-lite');
+    if (iconv.encodingExists(cs)) return iconv.decode(buffer, cs);
+  } catch { /* iconv unavailable */ }
+  return buffer.toString('utf8');
+}
+
+function stripHtml(html) {
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<\/li>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n)))
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function findTextPart(node) {
+  if (!node.childNodes) {
+    if (node.type && node.type.startsWith('text/') && node.disposition !== 'attachment') {
+      return { partId: null, type: node.type, encoding: node.encoding, charset: node.parameters?.charset, size: node.size };
+    }
+    return null;
+  }
+  if (node.type === 'multipart/alternative') {
+    let plainPart = null, htmlPart = null;
+    for (const child of node.childNodes) {
+      if (child.childNodes || child.disposition === 'attachment') continue;
+      if (child.type === 'text/plain') plainPart = child;
+      else if (child.type === 'text/html') htmlPart = child;
+    }
+    const chosen = plainPart || htmlPart;
+    if (chosen) return { partId: chosen.part, type: chosen.type, encoding: chosen.encoding, charset: chosen.parameters?.charset, size: chosen.size };
+  }
+  for (const child of node.childNodes) {
+    if (child.disposition === 'attachment') continue;
+    const found = findTextPart(child);
+    if (found) return found;
+  }
+  return null;
+}
+
+// ─── Email content fetcher (MIME-aware) ───────────────────────────────────────
+
 async function getEmailContent(uid, mailbox = 'INBOX') {
   const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
-  const meta = await client.fetchOne(uid, { envelope: true, flags: true }, { uid: true });
+
+  const meta = await client.fetchOne(uid, { envelope: true, flags: true, bodyStructure: true }, { uid: true });
+  if (!meta) {
+    await client.logout();
+    return { uid, subject: null, from: null, date: null, flags: [], body: '(email not found)' };
+  }
+
   let body = '(body unavailable)';
+
   try {
-    const sourceMsg = await Promise.race([
-      client.fetchOne(uid, { source: true }, { uid: true }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000))
-    ]);
-    if (sourceMsg?.source) {
-      const raw = sourceMsg.source.toString();
-      const bodyStart = raw.indexOf('\r\n\r\n');
-      body = bodyStart > -1 ? raw.slice(bodyStart + 4, bodyStart + 2000) : raw.slice(0, 2000);
+    const struct = meta.bodyStructure;
+    if (!struct) throw new Error('no bodyStructure');
+
+    const textPart = findTextPart(struct);
+
+    if (!textPart) {
+      body = '(no readable text — email may be image-only or have no text parts)';
+    } else {
+      // Single-part messages use 'TEXT'; multipart use dot-notation part id (e.g. '1', '1.1')
+      const imapKey = textPart.partId ?? 'TEXT';
+
+      // For large parts, cap the fetch at 12KB to avoid downloading multi-MB newsletters
+      const fetchSpec = (textPart.size && textPart.size > 150_000)
+        ? [{ key: imapKey, start: 0, maxLength: 12_000 }]
+        : [imapKey];
+
+      const partMsg = await Promise.race([
+        client.fetchOne(uid, { bodyParts: fetchSpec }, { uid: true }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('body fetch timeout')), 10_000))
+      ]);
+
+      // bodyParts is a Map — try the key as-is, then uppercase, then lowercase
+      const partBuffer = partMsg?.bodyParts?.get(imapKey)
+        ?? partMsg?.bodyParts?.get(imapKey.toUpperCase())
+        ?? partMsg?.bodyParts?.get(imapKey.toLowerCase());
+
+      if (!partBuffer || partBuffer.length === 0) throw new Error('empty body part');
+
+      const decoded = decodeTransferEncoding(partBuffer, textPart.encoding);
+      let text = await decodeCharset(decoded, textPart.charset);
+
+      if (textPart.type === 'text/html') text = stripHtml(text);
+
+      const MAX_BODY = 8_000;
+      if (text.length > MAX_BODY) {
+        text = text.slice(0, MAX_BODY) + `\n\n[... truncated — ${text.length.toLocaleString()} chars total]`;
+      }
+
+      body = text.trim() || '(empty body)';
+
+      if (textPart.size && textPart.size > 150_000) {
+        body += `\n\n[Note: email body is large (${Math.round(textPart.size / 1024)}KB) — showing first 12KB]`;
+      }
     }
   } catch {
-    body = '(body unavailable - email may be too large)';
+    // Fallback: raw source slice (original behaviour)
+    try {
+      const sourceMsg = await Promise.race([
+        client.fetchOne(uid, { source: true }, { uid: true }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5_000))
+      ]);
+      if (sourceMsg?.source) {
+        const raw = sourceMsg.source.toString();
+        const bodyStart = raw.indexOf('\r\n\r\n');
+        body = '[raw fallback]\n' + (bodyStart > -1 ? raw.slice(bodyStart + 4, bodyStart + 2000) : raw.slice(0, 2000));
+      }
+    } catch { /* leave as unavailable */ }
   }
+
   await client.logout();
   return {
     uid: meta.uid,
@@ -1279,7 +1421,7 @@ function logClear() {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.6.0' },
+    { name: 'icloud-mail', version: '1.7.0' },
     { capabilities: { tools: {} } }
   );
 
