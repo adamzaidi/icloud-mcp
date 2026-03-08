@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "icloud-mail": {
+      "command": "node",
+      "args": ["./index.js"],
+      "env": {
+        "IMAP_USER": "${ICLOUD_EMAIL}",
+        "IMAP_PASSWORD": "${ICLOUD_APP_PASSWORD}"
+      }
+    }
+  }
+}

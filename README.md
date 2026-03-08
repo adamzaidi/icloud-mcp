@@ -80,7 +80,9 @@ All checks passed. Ready to use with Claude Desktop.
 
 If any step fails, a plain-English explanation and suggested fix will be shown.
 
-### 4. Configure Claude Desktop
+### 4. Connect to Claude
+
+#### Claude Desktop
 
 Open your Claude Desktop config file:
 
@@ -105,6 +107,40 @@ Add the following under `mcpServers`, replacing the path with your npm root from
 }
 ```
 
+Then fully quit Claude Desktop (Cmd+Q) and reopen it.
+
+#### Claude Code
+
+Run this command once to register the server for your user account (available across all projects):
+
+```bash
+claude mcp add icloud-mail \
+  --scope user \
+  -e IMAP_USER=you@icloud.com \
+  -e IMAP_PASSWORD=your-app-specific-password \
+  -- node $(npm root -g)/icloud-mcp/index.js
+```
+
+Or use `npx` to avoid needing a global install:
+
+```bash
+claude mcp add icloud-mail \
+  --scope user \
+  -e IMAP_USER=you@icloud.com \
+  -e IMAP_PASSWORD=your-app-specific-password \
+  -- npx -y icloud-mcp
+```
+
+Verify it registered correctly:
+
+```bash
+claude mcp list
+```
+
+The tools will be available in any Claude Code session. To check they're live, run `claude` and ask: *"What iCloud mail tools do you have?"*
+
+> **Running from source?** Copy `.mcp.json.example` to `.mcp.json`, set `ICLOUD_EMAIL` and `ICLOUD_APP_PASSWORD` in your shell, then run `claude` from the repo directory. Claude Code will pick up the config automatically.
+
 ### 5. Add Custom Instructions (Recommended)
 
 For large inbox operations, add the following to Claude Desktop's custom instructions to ensure Claude stays on track and checks in with you regularly. Go to **Claude Desktop → Settings → Custom Instructions** and add:
@@ -118,9 +154,12 @@ When using icloud-mail tools:
 5. If you are ever unsure what you have done so far, call log_read before proceeding
 ```
 
-### 6. Restart Claude Desktop
+### 6. Start using it
 
-Fully quit Claude Desktop (Cmd+Q) and reopen it. You should now be able to manage your iCloud inbox through Claude.
+You're all set. Try asking Claude:
+
+- *"Show me the top senders in my iCloud inbox"*
+- *"How many unread emails do I have?"*
 
 ## Available Tools (46)
 
