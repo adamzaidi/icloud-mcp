@@ -126,10 +126,21 @@ function archiveCurrent(data) {
 function getMoveStatus() {
   const data = readManifest();
   if (!data.current) return { status: 'no_operation', history: data.history.map(summarizeOp) };
-  return {
+
+  const result = {
     current: formatOperation(data.current),
     history: data.history.map(summarizeOp)
   };
+
+  // Stale warning: in_progress but updatedAt is more than 24h ago
+  if (data.current.status === 'in_progress') {
+    const ageMs = Date.now() - new Date(data.current.updatedAt).getTime();
+    if (ageMs > 24 * 60 * 60 * 1000) {
+      result.staleWarning = `Operation ${data.current.operationId} has not been updated in ${Math.round(ageMs / 3_600_000)}h — it may be stale. Call abandon_move to discard it if you want to start a new operation.`;
+    }
+  }
+
+  return result;
 }
 
 function abandonMove() {
@@ -859,6 +870,25 @@ async function bulkDeleteBySender(sender, mailbox = 'INBOX') {
   return { deleted, sender };
 }
 
+async function markOlderThanRead(days, mailbox = 'INBOX') {
+  const client = createRateLimitedClient();
+  await client.connect();
+  await client.mailboxOpen(mailbox);
+  const date = new Date();
+  date.setDate(date.getDate() - days);
+  const raw = await client.search({ before: date, seen: false }, { uid: true });
+  const uids = Array.isArray(raw) ? raw : [];
+  if (uids.length === 0) { await client.logout(); return { marked: 0, olderThan: date.toISOString() }; }
+  await client.messageFlagsAdd(uids, ['\\Seen'], { uid: true });
+  await client.logout();
+  return { marked: uids.length, olderThan: date.toISOString() };
+}
+
+async function bulkMoveByDomain(domain, targetMailbox, sourceMailbox = 'INBOX', dryRun = false) {
+  const result = await bulkMove({ domain }, targetMailbox, sourceMailbox, dryRun);
+  return { ...result, domain };
+}
+
 async function bulkMoveBySender(sender, targetMailbox, sourceMailbox = 'INBOX', dryRun = false) {
   const client = createRateLimitedClient();
   await client.connect();
@@ -971,20 +1001,235 @@ async function bulkFlag(filters, flagged, mailbox = 'INBOX') {
   return { [flagged ? 'flagged' : 'unflagged']: uids.length, filters };
 }
 
-async function emptyTrash() {
+async function bulkFlagBySender(sender, flagged, mailbox = 'INBOX') {
   const client = createRateLimitedClient();
   await client.connect();
-  await client.mailboxOpen('Deleted Messages');
-  const uids = (await client.search({ all: true }, { uid: true })) ?? [];
-  if (uids.length === 0) { await client.logout(); return { deleted: 0 }; }
+  await client.mailboxOpen(mailbox);
+  const raw = await client.search({ from: sender }, { uid: true });
+  const uids = Array.isArray(raw) ? raw : [];
+  if (uids.length === 0) { await client.logout(); return { [flagged ? 'flagged' : 'unflagged']: 0, sender }; }
+  if (flagged) {
+    await client.messageFlagsAdd(uids, ['\\Flagged'], { uid: true });
+  } else {
+    await client.messageFlagsRemove(uids, ['\\Flagged'], { uid: true });
+  }
+  await client.logout();
+  return { [flagged ? 'flagged' : 'unflagged']: uids.length, sender };
+}
+
+async function emptyTrash(dryRun = false) {
+  const t0 = Date.now();
+  const trashFolders = ['Deleted Messages', 'Trash'];
+  const client = createRateLimitedClient();
+  await client.connect();
+
+  let mailbox = null;
+  for (const folder of trashFolders) {
+    try {
+      await client.mailboxOpen(folder);
+      mailbox = folder;
+      break;
+    } catch (err) {
+      if (!err.message.includes('Mailbox does not exist') && !err.message.includes('NONEXISTENT') && !err.message.includes('does not exist')) {
+        await safeClose(client);
+        throw err;
+      }
+    }
+  }
+
+  if (!mailbox) {
+    await safeClose(client);
+    throw new Error('No trash folder found — tried: ' + trashFolders.join(', '));
+  }
+
+  const raw = await client.search({ all: true }, { uid: true });
+  const uids = Array.isArray(raw) ? raw : [];
+
+  if (dryRun) {
+    await safeClose(client);
+    return { dryRun: true, wouldDelete: uids.length, mailbox };
+  }
+
+  if (uids.length === 0) {
+    await safeClose(client);
+    return { deleted: 0, mailbox, timeTaken: ((Date.now() - t0) / 1000).toFixed(1) + 's' };
+  }
+
   let deleted = 0;
   for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
     const chunk = uids.slice(i, i + CHUNK_SIZE);
     await client.messageDelete(chunk, { uid: true });
     deleted += chunk.length;
   }
+  await safeClose(client);
+  return { deleted, mailbox, timeTaken: ((Date.now() - t0) / 1000).toFixed(1) + 's' };
+}
+
+async function archiveOlderThan(days, targetMailbox, sourceMailbox = 'INBOX', dryRun = false) {
+  const client = createRateLimitedClient();
+  await client.connect();
+  await client.mailboxOpen(sourceMailbox);
+  const date = new Date();
+  date.setDate(date.getDate() - days);
+  const raw = await client.search({ before: date }, { uid: true });
+  const uids = Array.isArray(raw) ? raw : [];
   await client.logout();
-  return { deleted };
+  if (dryRun) return { dryRun: true, wouldMove: uids.length, olderThan: date.toISOString(), sourceMailbox, targetMailbox };
+  if (uids.length === 0) return { moved: 0, olderThan: date.toISOString(), sourceMailbox, targetMailbox };
+  await ensureMailbox(targetMailbox);
+  const result = await safeMoveEmails(uids, sourceMailbox, targetMailbox);
+  return { ...result, olderThan: date.toISOString(), sourceMailbox, targetMailbox };
+}
+
+async function getStorageReport(mailbox = 'INBOX', sampleSize = 100) {
+  const client = createRateLimitedClient();
+  await client.connect();
+  await client.mailboxOpen(mailbox);
+
+  // Count emails by size bucket using 4x SEARCH LARGER
+  const thresholds = [10 * 1024, 100 * 1024, 1024 * 1024, 10 * 1024 * 1024];
+  const counts = [];
+  for (const thresh of thresholds) {
+    const r = await client.search({ larger: thresh }, { uid: true }).catch(() => []);
+    counts.push(Array.isArray(r) ? r.length : 0);
+  }
+
+  const buckets = [
+    { range: '10KB–100KB', count: counts[0] - counts[1] },
+    { range: '100KB–1MB', count: counts[1] - counts[2] },
+    { range: '1MB–10MB', count: counts[2] - counts[3] },
+    { range: '10MB+', count: counts[3] }
+  ];
+
+  // Sample top senders among large emails (> 100 KB)
+  const largeRaw = await client.search({ larger: 100 * 1024 }, { uid: true }).catch(() => []);
+  const largeUids = Array.isArray(largeRaw) ? largeRaw : [];
+  const sampleUids = largeUids.slice(-sampleSize);
+
+  const senderSizes = {};
+  if (sampleUids.length > 0) {
+    for await (const msg of client.fetch(sampleUids, { envelope: true, bodyStructure: true }, { uid: true })) {
+      const address = msg.envelope?.from?.[0]?.address;
+      if (address && msg.bodyStructure) {
+        senderSizes[address] = (senderSizes[address] || 0) + estimateEmailSize(msg.bodyStructure);
+      }
+    }
+  }
+
+  await client.logout();
+
+  const topSendersBySize = Object.entries(senderSizes)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([address, estimateBytes]) => ({ address, estimateKB: Math.round(estimateBytes / 1024) }));
+
+  const midpoints = [50, 512, 5120, 15360]; // rough KB midpoint for each bucket
+  const estimatedTotalKB = buckets.reduce((sum, b, i) => sum + b.count * midpoints[i], 0);
+
+  return {
+    mailbox,
+    buckets,
+    estimatedTotalKB,
+    topSendersBySize,
+    ...(sampleUids.length < largeUids.length && {
+      note: `Sender analysis sampled ${sampleUids.length} of ${largeUids.length} large emails (>100 KB)`
+    })
+  };
+}
+
+async function getThread(uid, mailbox = 'INBOX') {
+  const THREAD_CANDIDATE_CAP = 100;
+  const client = createRateLimitedClient();
+  await client.connect();
+  await client.mailboxOpen(mailbox);
+
+  // Fetch target email's envelope + raw headers for threading
+  const meta = await client.fetchOne(uid, {
+    envelope: true,
+    flags: true,
+    headers: new Set(['references', 'in-reply-to'])
+  }, { uid: true });
+  if (!meta) throw new Error(`Email UID ${uid} not found`);
+
+  const targetMessageId = meta.envelope?.messageId ?? null;
+  const rawRefs = extractRawHeader(meta.headers, 'references');
+  const rawInReplyTo = extractRawHeader(meta.headers, 'in-reply-to');
+
+  // Build full reference set for this email
+  const threadRefs = new Set();
+  if (targetMessageId) threadRefs.add(targetMessageId.trim());
+  if (rawInReplyTo) threadRefs.add(rawInReplyTo.trim());
+  if (rawRefs) {
+    rawRefs.split(/\s+/).filter(s => s.startsWith('<') && s.endsWith('>')).forEach(r => threadRefs.add(r));
+  }
+
+  const normalizedSubject = stripSubjectPrefixes(meta.envelope?.subject ?? '');
+
+  // SEARCH SUBJECT for candidates (iCloud doesn't support SEARCH HEADER)
+  let candidateUids = [];
+  if (normalizedSubject) {
+    const raw = await client.search({ subject: normalizedSubject }, { uid: true });
+    candidateUids = Array.isArray(raw) ? raw : [];
+  }
+
+  const candidatesCapped = candidateUids.length > THREAD_CANDIDATE_CAP;
+  if (candidatesCapped) candidateUids = candidateUids.slice(-THREAD_CANDIDATE_CAP);
+
+  // Fetch envelopes + headers for candidates to filter by References overlap
+  const threadEmails = [];
+  if (candidateUids.length > 0) {
+    for await (const msg of client.fetch(candidateUids, {
+      envelope: true,
+      flags: true,
+      headers: new Set(['references', 'in-reply-to'])
+    }, { uid: true })) {
+      const msgId = msg.envelope?.messageId ?? null;
+      const msgRefs = extractRawHeader(msg.headers, 'references');
+      const msgInReplyTo = extractRawHeader(msg.headers, 'in-reply-to');
+
+      // Build this message's reference set
+      const msgRefSet = new Set();
+      if (msgId) msgRefSet.add(msgId.trim());
+      if (msgInReplyTo) msgRefSet.add(msgInReplyTo.trim());
+      if (msgRefs) msgRefs.split(/\s+/).filter(s => s.startsWith('<')).forEach(r => msgRefSet.add(r));
+
+      // Include if there's any Reference chain overlap
+      const hasOverlap = (msgId && threadRefs.has(msgId.trim())) ||
+        [...threadRefs].some(r => msgRefSet.has(r));
+
+      if (hasOverlap) {
+        threadEmails.push({
+          uid: msg.uid,
+          subject: msg.envelope?.subject,
+          from: msg.envelope?.from?.[0]?.address,
+          date: msg.envelope?.date,
+          seen: msg.flags?.has('\\Seen') ?? false,
+          flagged: msg.flags?.has('\\Flagged') ?? false,
+          messageId: msgId
+        });
+      }
+    }
+  }
+
+  await client.logout();
+
+  // Sort by date ascending
+  threadEmails.sort((a, b) => {
+    const da = a.date ? new Date(a.date).getTime() : 0;
+    const db = b.date ? new Date(b.date).getTime() : 0;
+    return da - db;
+  });
+
+  return {
+    uid,
+    subject: normalizedSubject || meta.envelope?.subject,
+    count: threadEmails.length,
+    emails: threadEmails,
+    ...(candidatesCapped && {
+      candidatesCapped: true,
+      note: `Subject search returned more than ${THREAD_CANDIDATE_CAP} candidates — thread results may be incomplete`
+    })
+  };
 }
 
 async function createMailbox(name) {
@@ -1096,6 +1341,24 @@ function stripHtml(html) {
     .trim();
 }
 
+// Extract a specific header from imapflow's headers property.
+// imapflow returns headers as a raw Buffer (BODY[HEADER.FIELDS ...] response bytes),
+// so we parse it as text with MIME unfolding. Falls back to .get() if it's a Map.
+function extractRawHeader(headers, name) {
+  if (!headers) return '';
+  let str;
+  if (Buffer.isBuffer(headers)) {
+    str = headers.toString();
+  } else if (typeof headers.get === 'function') {
+    return (headers.get(name) ?? '').toString().trim();
+  } else {
+    str = headers.toString();
+  }
+  // Unfold MIME-folded header values (CRLF + whitespace = continuation)
+  const unfolded = str.replace(/\r?\n[ \t]+/g, ' ');
+  return unfolded.match(new RegExp(`^${name}:\\s*(.+)`, 'im'))?.[1]?.trim() ?? '';
+}
+
 function findTextPart(node) {
   if (!node.childNodes) {
     if (node.type && node.type.startsWith('text/') && node.disposition !== 'attachment') {
@@ -1141,14 +1404,26 @@ function findAttachments(node, parts = []) {
   return parts;
 }
 
+function estimateEmailSize(node) {
+  if (node.childNodes) return node.childNodes.reduce((s, c) => s + estimateEmailSize(c), 0);
+  return node.size || 0;
+}
+
+function stripSubjectPrefixes(subject) {
+  if (!subject) return '';
+  return subject.replace(/^(Re:|RE:|Fwd:|FWD:|Fw:|FW:|AW:|回复:|转发:)\s*/i, '').trim();
+}
+
 // ─── Email content fetcher (MIME-aware) ───────────────────────────────────────
 
-async function getEmailContent(uid, mailbox = 'INBOX') {
+async function getEmailContent(uid, mailbox = 'INBOX', maxChars = 8000, includeHeaders = false) {
   const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
 
-  const meta = await client.fetchOne(uid, { envelope: true, flags: true, bodyStructure: true }, { uid: true });
+  const fetchOpts = { envelope: true, flags: true, bodyStructure: true };
+  if (includeHeaders) fetchOpts.headers = new Set(['references', 'list-unsubscribe']);
+  const meta = await client.fetchOne(uid, fetchOpts, { uid: true });
   if (!meta) {
     await client.logout();
     return { uid, subject: null, from: null, date: null, flags: [], body: '(email not found)' };
@@ -1190,9 +1465,9 @@ async function getEmailContent(uid, mailbox = 'INBOX') {
 
       if (textPart.type === 'text/html') text = stripHtml(text);
 
-      const MAX_BODY = 8_000;
-      if (text.length > MAX_BODY) {
-        text = text.slice(0, MAX_BODY) + `\n\n[... truncated — ${text.length.toLocaleString()} chars total]`;
+      const clampedMaxChars = Math.min(maxChars, 50_000);
+      if (text.length > clampedMaxChars) {
+        text = text.slice(0, clampedMaxChars) + `\n\n[... truncated — ${text.length.toLocaleString()} chars total]`;
       }
 
       body = text.trim() || '(empty body)';
@@ -1217,14 +1492,37 @@ async function getEmailContent(uid, mailbox = 'INBOX') {
   }
 
   await client.logout();
-  return {
+
+  const attachments = meta.bodyStructure ? findAttachments(meta.bodyStructure) : [];
+  const result = {
     uid: meta.uid,
     subject: meta.envelope.subject,
     from: meta.envelope.from?.[0]?.address,
     date: meta.envelope.date,
     flags: [...meta.flags],
+    attachments: {
+      count: attachments.length,
+      items: attachments.map(a => ({ partId: a.partId, filename: a.filename, mimeType: a.mimeType, size: a.size }))
+    },
     body
   };
+
+  if (includeHeaders) {
+    // imapflow returns headers as a raw Buffer — parse it as text
+    const rawRefs = extractRawHeader(meta.headers, 'references');
+    const rawUnsub = extractRawHeader(meta.headers, 'list-unsubscribe');
+    result.headers = {
+      to: meta.envelope.to?.map(a => a.address) ?? [],
+      cc: meta.envelope.cc?.map(a => a.address) ?? [],
+      replyTo: meta.envelope.replyTo?.[0]?.address ?? null,
+      messageId: meta.envelope.messageId ?? null,
+      inReplyTo: meta.envelope.inReplyTo ?? null,
+      references: rawRefs ? rawRefs.split(/\s+/).filter(s => s.startsWith('<')) : [],
+      listUnsubscribe: rawUnsub || null
+    };
+  }
+
+  return result;
 }
 
 async function listAttachments(uid, mailbox = 'INBOX') {
@@ -1243,7 +1541,41 @@ async function listAttachments(uid, mailbox = 'INBOX') {
   };
 }
 
-async function getAttachment(uid, partId, mailbox = 'INBOX') {
+async function getUnsubscribeInfo(uid, mailbox = 'INBOX') {
+  const client = createRateLimitedClient();
+  await client.connect();
+  await client.mailboxOpen(mailbox);
+  const meta = await client.fetchOne(uid, { headers: new Set(['list-unsubscribe', 'list-unsubscribe-post']) }, { uid: true });
+  await client.logout();
+  if (!meta) return { uid, email: null, url: null, raw: null };
+  const raw = extractRawHeader(meta.headers, 'list-unsubscribe') || null;
+  if (!raw) return { uid, email: null, url: null, raw: null };
+  const email = raw.match(/<mailto:([^>]+)>/i)?.[1] ?? null;
+  const url = raw.match(/<(https?:[^>]+)>/i)?.[1] ?? null;
+  return { uid, email, url, raw };
+}
+
+async function getEmailRaw(uid, mailbox = 'INBOX') {
+  const MAX_RAW_BYTES = 1 * 1024 * 1024; // 1 MB cap
+  const client = createRateLimitedClient();
+  await client.connect();
+  await client.mailboxOpen(mailbox);
+  const msg = await client.fetchOne(uid, { source: true }, { uid: true });
+  await client.logout();
+  if (!msg || !msg.source) throw new Error(`Email UID ${uid} not found`);
+  const source = msg.source;
+  const truncated = source.length > MAX_RAW_BYTES;
+  const slice = truncated ? source.slice(0, MAX_RAW_BYTES) : source;
+  return {
+    uid,
+    size: source.length,
+    truncated,
+    data: slice.toString('base64'),
+    dataEncoding: 'base64'
+  };
+}
+
+async function getAttachment(uid, partId, mailbox = 'INBOX', offset = null, length = null) {
   const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
@@ -1256,20 +1588,35 @@ async function getAttachment(uid, partId, mailbox = 'INBOX') {
   const att = attachments.find(a => a.partId === partId);
   if (!att) throw new Error(`Part ID "${partId}" not found in email UID ${uid}. Use list_attachments to see available parts.`);
 
-  if (att.size > MAX_ATTACHMENT_BYTES) {
+  const isPaginated = offset !== null || length !== null;
+
+  if (!isPaginated && att.size > MAX_ATTACHMENT_BYTES) {
     await client.logout();
     return {
-      error: `Attachment too large to download (${Math.round(att.size / 1024 / 1024 * 10) / 10} MB). Maximum allowed: ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB.`,
+      error: `Attachment too large to download in one request (${Math.round(att.size / 1024 / 1024 * 10) / 10} MB). Use offset and length params to download in chunks (max ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB per request).`,
       filename: att.filename,
       mimeType: att.mimeType,
-      size: att.size
+      size: att.size,
+      totalSize: att.size
     };
+  }
+
+  // Build fetch spec
+  let fetchSpec;
+  if (isPaginated) {
+    const start = offset ?? 0;
+    const maxLength = length ?? MAX_ATTACHMENT_BYTES;
+    fetchSpec = [{ key: partId, start, maxLength }];
+  } else {
+    fetchSpec = [partId];
   }
 
   // Fetch the raw body part bytes
   const rawChunks = [];
-  for await (const msg of client.fetch({ uid }, { bodyParts: [partId] }, { uid: true })) {
-    const buf = msg.bodyParts?.get(partId);
+  for await (const msg of client.fetch({ uid }, { bodyParts: fetchSpec }, { uid: true })) {
+    const buf = msg.bodyParts?.get(partId)
+      ?? msg.bodyParts?.get(partId.toUpperCase())
+      ?? msg.bodyParts?.get(partId.toLowerCase());
     if (buf) rawChunks.push(buf);
   }
   await client.logout();
@@ -1277,17 +1624,36 @@ async function getAttachment(uid, partId, mailbox = 'INBOX') {
   if (rawChunks.length === 0) throw new Error(`No data returned for part "${partId}" of UID ${uid}`);
 
   const raw = Buffer.concat(rawChunks);
-  const encoding = att.encoding.toLowerCase();
 
+  if (isPaginated) {
+    // Paginated: return raw encoded bytes without transfer-encoding decode
+    const fetchOffset = offset ?? 0;
+    const actualLength = raw.length;
+    const hasMore = att.size ? (fetchOffset + actualLength < att.size) : false;
+    return {
+      uid, partId,
+      filename: att.filename,
+      mimeType: att.mimeType,
+      encoding: att.encoding,
+      totalSize: att.size,
+      offset: fetchOffset,
+      length: actualLength,
+      hasMore,
+      data: raw.toString('base64'),
+      dataEncoding: 'base64'
+    };
+  }
+
+  // Full download: decode transfer encoding
+  const encoding = att.encoding.toLowerCase();
   let decoded;
   if (encoding === 'base64') {
     decoded = Buffer.from(raw.toString('ascii').replace(/\s/g, ''), 'base64');
   } else if (encoding === 'quoted-printable') {
-    // decode QP: replace soft line breaks then decode =XX sequences
     const qp = raw.toString('binary').replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
     decoded = Buffer.from(qp, 'binary');
   } else {
-    decoded = raw; // 7bit / 8bit / binary — use as-is
+    decoded = raw; // 7bit / 8bit / binary
   }
 
   return {
@@ -1353,18 +1719,42 @@ async function listMailboxes() {
   return mailboxes;
 }
 
-async function searchEmails(query, mailbox = 'INBOX', limit = 10, filters = {}) {
+async function searchEmails(query, mailbox = 'INBOX', limit = 10, filters = {}, options = {}) {
+  const { queryMode = 'or', subjectQuery, bodyQuery, fromQuery, includeSnippet = false } = options;
   const client = createRateLimitedClient();
   await client.connect();
   await client.mailboxOpen(mailbox);
 
-  const textQuery = { or: [{ subject: query }, { from: query }, { body: query }] };
+  // Build text query
+  let textQuery;
+  const targetedParts = [];
+  if (subjectQuery) targetedParts.push({ subject: subjectQuery });
+  if (bodyQuery) targetedParts.push({ body: bodyQuery });
+  if (fromQuery) targetedParts.push({ from: fromQuery });
+
+  if (targetedParts.length > 0) {
+    // Targeted field queries
+    if (queryMode === 'and') {
+      textQuery = Object.assign({}, ...targetedParts); // IMAP AND is implicit
+    } else {
+      textQuery = targetedParts.length === 1 ? targetedParts[0] : { or: targetedParts };
+    }
+  } else if (query) {
+    // Original OR across subject/from/body
+    textQuery = { or: [{ subject: query }, { from: query }, { body: query }] };
+  } else {
+    textQuery = null;
+  }
+
   const extraQuery = buildQuery(filters);
-  const finalQuery = Object.keys(extraQuery).length > 0 && !extraQuery.all
-    ? { ...textQuery, ...extraQuery }
-    : textQuery;
+  const hasExtra = Object.keys(extraQuery).length > 0 && !extraQuery.all;
+  const finalQuery = textQuery
+    ? (hasExtra ? { ...textQuery, ...extraQuery } : textQuery)
+    : (hasExtra ? extraQuery : { all: true });
 
   let uids = (await client.search(finalQuery, { uid: true })) ?? [];
+  if (!Array.isArray(uids)) uids = [];
+
   if (filters.hasAttachment) {
     if (uids.length > ATTACHMENT_SCAN_LIMIT) {
       await client.logout();
@@ -1372,6 +1762,7 @@ async function searchEmails(query, mailbox = 'INBOX', limit = 10, filters = {}) 
     }
     uids = await filterUidsByAttachment(client, uids);
   }
+
   const emails = [];
   const recentUids = uids.slice(-limit).reverse();
   for (const uid of recentUids) {
@@ -1387,6 +1778,31 @@ async function searchEmails(query, mailbox = 'INBOX', limit = 10, filters = {}) 
       });
     }
   }
+
+  // Fetch body snippets if requested (max 10 emails to avoid timeout)
+  if (includeSnippet && emails.length > 0) {
+    for (const email of emails.slice(0, 10)) {
+      try {
+        const meta = await client.fetchOne(email.uid, { bodyStructure: true }, { uid: true });
+        if (!meta?.bodyStructure) continue;
+        const textPart = findTextPart(meta.bodyStructure);
+        if (!textPart) continue;
+        const imapKey = textPart.partId ?? 'TEXT';
+        const partMsg = await client.fetchOne(email.uid, {
+          bodyParts: [{ key: imapKey, start: 0, maxLength: 400 }]
+        }, { uid: true });
+        const buf = partMsg?.bodyParts?.get(imapKey)
+          ?? partMsg?.bodyParts?.get(imapKey.toUpperCase())
+          ?? partMsg?.bodyParts?.get(imapKey.toLowerCase());
+        if (!buf) continue;
+        const decoded = decodeTransferEncoding(buf, textPart.encoding);
+        let text = await decodeCharset(decoded, textPart.charset);
+        if (textPart.type === 'text/html') text = stripHtml(text);
+        email.snippet = text.replace(/\s+/g, ' ').slice(0, 200).trim();
+      } catch { /* skip snippet on error */ }
+    }
+  }
+
   await client.logout();
   return { total: uids.length, showing: emails.length, emails };
 }
@@ -1522,7 +1938,7 @@ async function countEmails(filters, mailbox = 'INBOX') {
   if (filters.hasAttachment) {
     if (uids.length > ATTACHMENT_SCAN_LIMIT) {
       await client.logout();
-      return { count: null, mailbox, filters, error: `hasAttachment requires narrower filters first — ${uids.length} candidates exceeds scan limit of ${ATTACHMENT_SCAN_LIMIT}. Add from/since/before/subject filters to reduce the set.` };
+      return { count: null, candidateCount: uids.length, mailbox, filters, error: `hasAttachment requires narrower filters first — ${uids.length} candidates exceeds scan limit of ${ATTACHMENT_SCAN_LIMIT}. Add from/since/before/subject filters to reduce the set.` };
     }
     uids = await filterUidsByAttachment(client, uids);
   }
@@ -1558,7 +1974,7 @@ function logClear() {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '1.9.0' },
+    { name: 'icloud-mail', version: '2.0.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -1648,23 +2064,29 @@ async function main() {
           type: 'object',
           properties: {
             uid: { type: 'number', description: 'Email UID' },
-            mailbox: { type: 'string', description: 'Mailbox name (default INBOX)' }
+            mailbox: { type: 'string', description: 'Mailbox name (default INBOX)' },
+            maxChars: { type: 'number', description: 'Max body characters to return (default 8000, max 50000)' },
+            includeHeaders: { type: 'boolean', description: 'If true, include a headers object with to/cc/replyTo/messageId/inReplyTo/references/listUnsubscribe' }
           },
           required: ['uid']
         }
       },
       {
         name: 'search_emails',
-        description: 'Search emails by keyword, with optional filters for date, read status, domain, and more',
+        description: 'Search emails by keyword or targeted field queries, with optional filters for date, read status, domain, and more',
         inputSchema: {
           type: 'object',
           properties: {
-            query: { type: 'string', description: 'Search keyword (matches subject, sender, body)' },
+            query: { type: 'string', description: 'Search keyword (matches subject, sender, body — use OR across all fields)' },
+            subjectQuery: { type: 'string', description: 'Match only in subject field' },
+            bodyQuery: { type: 'string', description: 'Match only in body field' },
+            fromQuery: { type: 'string', description: 'Match only in from/sender field' },
+            queryMode: { type: 'string', enum: ['or', 'and'], description: 'How to combine subjectQuery/bodyQuery/fromQuery: or (default) or and' },
             mailbox: { type: 'string', description: 'Mailbox to search (default INBOX)' },
             limit: { type: 'number', description: 'Max results (default 10)' },
+            includeSnippet: { type: 'boolean', description: 'If true, include a 200-char body preview snippet for each result (max 10 emails)' },
             ...filtersSchema
-          },
-          required: ['query']
+          }
         }
       },
       {
@@ -1892,8 +2314,13 @@ async function main() {
       },
       {
         name: 'empty_trash',
-        description: 'Permanently delete all emails in Deleted Messages',
-        inputSchema: { type: 'object', properties: {} }
+        description: 'Permanently delete all emails in the trash (Deleted Messages or Trash folder). Use dryRun: true to preview first.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            dryRun: { type: 'boolean', description: 'If true, preview how many emails would be deleted without deleting' }
+          }
+        }
       },
       {
         name: 'get_move_status',
@@ -1940,15 +2367,117 @@ async function main() {
       },
       {
         name: 'get_attachment',
-        description: 'Download a specific attachment from an email. Returns the file content as base64-encoded data. Use list_attachments first to get the partId. Maximum 20 MB per attachment.',
+        description: 'Download a specific attachment from an email. Returns the file content as base64-encoded data. Use list_attachments first to get the partId. Maximum 20 MB per request; use offset+length for larger files.',
         inputSchema: {
           type: 'object',
           properties: {
             uid: { type: 'number', description: 'Email UID' },
             partId: { type: 'string', description: 'IMAP body part ID from list_attachments (e.g. "2", "1.2")' },
-            mailbox: { type: 'string', description: 'Mailbox name (default INBOX)' }
+            mailbox: { type: 'string', description: 'Mailbox name (default INBOX)' },
+            offset: { type: 'number', description: 'Byte offset for paginated download (returns raw encoded bytes, not decoded)' },
+            length: { type: 'number', description: 'Max bytes to return for paginated download (default 20 MB)' }
           },
           required: ['uid', 'partId']
+        }
+      },
+      {
+        name: 'get_unsubscribe_info',
+        description: 'Get the List-Unsubscribe header from an email, parsed into email and URL components. Useful for AI-assisted inbox cleanup.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            uid: { type: 'number', description: 'Email UID' },
+            mailbox: { type: 'string', description: 'Mailbox name (default INBOX)' }
+          },
+          required: ['uid']
+        }
+      },
+      {
+        name: 'mark_older_than_read',
+        description: 'Mark all unread emails older than N days as read. Useful for bulk triage of a cluttered inbox.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            days: { type: 'number', description: 'Mark emails older than this many days as read' },
+            mailbox: { type: 'string', description: 'Mailbox (default INBOX)' }
+          },
+          required: ['days']
+        }
+      },
+      {
+        name: 'bulk_move_by_domain',
+        description: 'Move all emails from a specific domain to a folder. Convenience wrapper around bulk_move with a domain filter.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            domain: { type: 'string', description: 'Sender domain to match (e.g. github.com, substack.com)' },
+            targetMailbox: { type: 'string', description: 'Destination folder' },
+            sourceMailbox: { type: 'string', description: 'Source mailbox (default INBOX)' },
+            dryRun: { type: 'boolean', description: 'Preview only — return count without moving' }
+          },
+          required: ['domain', 'targetMailbox']
+        }
+      },
+      {
+        name: 'get_email_raw',
+        description: 'Get the raw RFC 2822 source of an email (full headers + MIME body) as base64-encoded data. Useful for debugging or export. Capped at 1 MB.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            uid: { type: 'number', description: 'Email UID' },
+            mailbox: { type: 'string', description: 'Mailbox name (default INBOX)' }
+          },
+          required: ['uid']
+        }
+      },
+      {
+        name: 'bulk_flag_by_sender',
+        description: 'Flag or unflag all emails from a specific sender',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sender: { type: 'string', description: 'Sender email address' },
+            flagged: { type: 'boolean', description: 'True to flag, false to unflag' },
+            mailbox: { type: 'string', description: 'Mailbox (default INBOX)' }
+          },
+          required: ['sender', 'flagged']
+        }
+      },
+      {
+        name: 'archive_older_than',
+        description: 'Safely move emails older than N days from a source mailbox to an archive folder. Uses the same safe copy-verify-delete pipeline as bulk_move. Use dryRun: true to preview.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            days: { type: 'number', description: 'Archive emails older than this many days' },
+            targetMailbox: { type: 'string', description: 'Destination archive folder (e.g. Archive)' },
+            sourceMailbox: { type: 'string', description: 'Source mailbox (default INBOX)' },
+            dryRun: { type: 'boolean', description: 'If true, preview what would be moved without moving' }
+          },
+          required: ['days', 'targetMailbox']
+        }
+      },
+      {
+        name: 'get_storage_report',
+        description: 'Estimate storage usage by size bucket and identify top senders by email size. Uses SEARCH LARGER queries for bucketing and samples large emails for sender analysis.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            mailbox: { type: 'string', description: 'Mailbox to analyze (default INBOX)' },
+            sampleSize: { type: 'number', description: 'Max number of large emails to sample for sender analysis (default 100)' }
+          }
+        }
+      },
+      {
+        name: 'get_thread',
+        description: 'Find all emails in the same thread as a given email. Uses subject matching + References/In-Reply-To header filtering. Note: iCloud does not support server-side threading — results are approximate.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            uid: { type: 'number', description: 'Email UID to find the thread for' },
+            mailbox: { type: 'string', description: 'Mailbox to search (default INBOX)' }
+          },
+          required: ['uid']
         }
       }
     ]
@@ -1978,14 +2507,20 @@ async function main() {
       } else if (name === 'read_inbox') {
         result = await withTimeout('read_inbox', TIMEOUT.FETCH, () => fetchEmails(args.mailbox || 'INBOX', args.limit || 10, args.onlyUnread || false, args.page || 1));
       } else if (name === 'get_email') {
-        result = await withTimeout('get_email', TIMEOUT.FETCH, () => getEmailContent(args.uid, args.mailbox || 'INBOX'));
+        result = await withTimeout('get_email', TIMEOUT.FETCH, () => getEmailContent(args.uid, args.mailbox || 'INBOX', args.maxChars || 8000, args.includeHeaders || false));
       } else if (name === 'list_attachments') {
         result = await withTimeout('list_attachments', TIMEOUT.FETCH, () => listAttachments(args.uid, args.mailbox || 'INBOX'));
       } else if (name === 'get_attachment') {
-        result = await withTimeout('get_attachment', TIMEOUT.FETCH, () => getAttachment(args.uid, args.partId, args.mailbox || 'INBOX'));
+        result = await withTimeout('get_attachment', TIMEOUT.FETCH, () => getAttachment(args.uid, args.partId, args.mailbox || 'INBOX', args.offset ?? null, args.length ?? null));
+      } else if (name === 'get_unsubscribe_info') {
+        result = await withTimeout('get_unsubscribe_info', TIMEOUT.FETCH, () => getUnsubscribeInfo(args.uid, args.mailbox || 'INBOX'));
+      } else if (name === 'get_email_raw') {
+        result = await withTimeout('get_email_raw', TIMEOUT.FETCH, () => getEmailRaw(args.uid, args.mailbox || 'INBOX'));
+      } else if (name === 'get_thread') {
+        result = await withTimeout('get_thread', TIMEOUT.FETCH, () => getThread(args.uid, args.mailbox || 'INBOX'));
       } else if (name === 'search_emails') {
-        const { query, mailbox, limit, ...filters } = args;
-        result = await withTimeout('search_emails', TIMEOUT.FETCH, () => searchEmails(query, mailbox || 'INBOX', limit || 10, filters));
+        const { query, mailbox, limit, queryMode, subjectQuery, bodyQuery, fromQuery, includeSnippet, ...filters } = args;
+        result = await withTimeout('search_emails', TIMEOUT.FETCH, () => searchEmails(query, mailbox || 'INBOX', limit || 10, filters, { queryMode, subjectQuery, bodyQuery, fromQuery, includeSnippet }));
       } else if (name === 'get_emails_by_sender') {
         result = await withTimeout('get_emails_by_sender', TIMEOUT.FETCH, () => getEmailsBySender(args.sender, args.mailbox || 'INBOX', args.limit || 10));
       } else if (name === 'get_emails_by_date_range') {
@@ -1995,6 +2530,8 @@ async function main() {
         result = await withTimeout('get_top_senders', TIMEOUT.SCAN, () => getTopSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20));
       } else if (name === 'get_unread_senders') {
         result = await withTimeout('get_unread_senders', TIMEOUT.SCAN, () => getUnreadSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20));
+      } else if (name === 'get_storage_report') {
+        result = await withTimeout('get_storage_report', TIMEOUT.SCAN, () => getStorageReport(args.mailbox || 'INBOX', args.sampleSize || 100));
       // ── Bulk operation tier (60s) ──
       } else if (name === 'bulk_delete_by_sender') {
         result = await withTimeout('bulk_delete_by_sender', TIMEOUT.BULK_OP, () => bulkDeleteBySender(args.sender, args.mailbox || 'INBOX'));
@@ -2007,16 +2544,24 @@ async function main() {
       } else if (name === 'bulk_flag') {
         const { flagged, mailbox, ...filters } = args;
         result = await withTimeout('bulk_flag', TIMEOUT.BULK_OP, () => bulkFlag(filters, flagged, mailbox || 'INBOX'));
+      } else if (name === 'mark_older_than_read') {
+        result = await withTimeout('mark_older_than_read', TIMEOUT.BULK_OP, () => markOlderThanRead(args.days, args.mailbox || 'INBOX'));
+      } else if (name === 'bulk_flag_by_sender') {
+        result = await withTimeout('bulk_flag_by_sender', TIMEOUT.BULK_OP, () => bulkFlagBySender(args.sender, args.flagged, args.mailbox || 'INBOX'));
       } else if (name === 'delete_older_than') {
         result = await withTimeout('delete_older_than', TIMEOUT.BULK_OP, () => deleteOlderThan(args.days, args.mailbox || 'INBOX'));
       } else if (name === 'empty_trash') {
-        result = await withTimeout('empty_trash', TIMEOUT.BULK_OP, () => emptyTrash());
+        result = await withTimeout('empty_trash', TIMEOUT.BULK_OP, () => emptyTrash(args.dryRun || false));
       // ── No top-level timeout — chunked with internal timeouts ──
       } else if (name === 'bulk_move') {
         const { targetMailbox, sourceMailbox, dryRun, limit, ...filters } = args;
         result = await bulkMove(filters, targetMailbox, sourceMailbox || 'INBOX', dryRun || false, limit ?? null);
       } else if (name === 'bulk_move_by_sender') {
         result = await bulkMoveBySender(args.sender, args.targetMailbox, args.sourceMailbox || 'INBOX', args.dryRun || false);
+      } else if (name === 'bulk_move_by_domain') {
+        result = await bulkMoveByDomain(args.domain, args.targetMailbox, args.sourceMailbox || 'INBOX', args.dryRun || false);
+      } else if (name === 'archive_older_than') {
+        result = await archiveOlderThan(args.days, args.targetMailbox, args.sourceMailbox || 'INBOX', args.dryRun || false);
       } else if (name === 'bulk_delete') {
         // IMPROVEMENT 3: bulk_delete now has per-chunk timeouts internally
         const { sourceMailbox, dryRun, ...filters } = args;

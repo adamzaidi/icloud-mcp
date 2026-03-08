@@ -1,6 +1,6 @@
 {
   "name": "icloud-mcp",
-  "version": "1.9.0",
+  "version": "2.0.0",
   "description": "A Model Context Protocol (MCP) server for iCloud Mail",
   "main": "index.js",
   "bin": {

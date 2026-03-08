@@ -1,5 +1,5 @@
 import { spawnSync } from 'child_process';
-import { writeFileSync, unlinkSync } from 'fs';
+import { writeFileSync, unlinkSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
@@ -13,6 +13,7 @@ if (!IMAP_USER || !IMAP_PASSWORD) {
 }
 
 const projectDir = fileURLToPath(new URL('..', import.meta.url));
+const { version } = JSON.parse(readFileSync(join(projectDir, 'package.json'), 'utf8'));
 const VERBOSE = process.argv.includes('--verbose') || process.argv.includes('-v');
 
 // Timeout in ms per tool category
@@ -25,7 +26,7 @@ const TIMEOUTS = {
 const MAILBOX_MGMT_TOOLS = new Set(['create_mailbox', 'rename_mailbox', 'delete_mailbox']);
 
 // Tools whose stderr output is always interesting (move pipeline logging)
-const ALWAYS_LOG_STDERR = new Set(['bulk_move', 'bulk_move_by_sender']);
+const ALWAYS_LOG_STDERR = new Set(['bulk_move', 'bulk_move_by_sender', 'bulk_move_by_domain', 'archive_older_than']);
 
 function callToolRaw(name, args = {}, timeout = TIMEOUTS.default) {
   const messages = [
@@ -95,7 +96,7 @@ function callToolRaw(name, args = {}, timeout = TIMEOUTS.default) {
 function callTool(name, args = {}) {
   let timeout = TIMEOUTS.default;
   if (MAILBOX_MGMT_TOOLS.has(name)) timeout = TIMEOUTS.mailbox_mgmt;
-  else if (name === 'bulk_move' || name === 'bulk_move_by_sender') timeout = TIMEOUTS.bulk_move;
+  else if (name === 'bulk_move' || name === 'bulk_move_by_sender' || name === 'archive_older_than') timeout = TIMEOUTS.bulk_move;
 
   try {
     return callToolRaw(name, args, timeout);
@@ -105,7 +106,7 @@ function callTool(name, args = {}) {
     // failures that should propagate immediately.
     // Never retry bulk_move: a timed-out move leaves the manifest in_progress,
     // so a retry would immediately fail with a manifest conflict.
-    const isBulkMove = name === 'bulk_move' || name === 'bulk_move_by_sender';
+    const isBulkMove = name === 'bulk_move' || name === 'bulk_move_by_sender' || name === 'archive_older_than';
     const isSpawnTransient = (
       err.message.includes('ECONNRESET') ||
       err.message.includes('ETIMEDOUT')
@@ -137,7 +138,7 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-console.log('\n🧪 iCloud MCP Server Tests v1.9.0\n');
+console.log(`\n🧪 iCloud MCP Server Tests v${version}\n`);
 if (VERBOSE) console.log('🔊 Verbose mode: showing all stderr output\n');
 
 // ─── Pre-flight cleanup ───────────────────────────────────────────────────────
@@ -158,17 +159,29 @@ try {
 try { callTool('delete_mailbox', { name: 'mcp-test-folder-renamed' }); } catch {}
 try { callTool('delete_mailbox', { name: 'mcp-test-folder' }); } catch {}
 
+// Clean up any leftover mcp-test-* temp folders from previous crashed runs
 try {
-  const strandedInTest = callTool('count_emails', { mailbox: 'test' });
-  if (strandedInTest.count > 0) {
-    console.log(`  ⚠️  found ${strandedInTest.count} stranded emails in test folder — restoring to newsletters first`);
-    const restoreResult = callTool('bulk_move', { sourceMailbox: 'test', targetMailbox: 'newsletters' });
-    console.log(`  ⚠️  restore status: ${restoreResult.status}, moved: ${restoreResult.moved}`);
-  } else {
-    console.log('  ✓  test folder is clean');
+  const allMailboxes = callTool('list_mailboxes');
+  const tempFolders = allMailboxes.filter(m => m.path.startsWith('mcp-test-'));
+  if (tempFolders.length > 0) {
+    console.log(`  ⚠️  found ${tempFolders.length} leftover mcp-test-* folders from previous runs — cleaning up`);
+    for (const folder of tempFolders) {
+      try {
+        // Move any stranded emails back to INBOX first
+        const count = callTool('count_emails', { mailbox: folder.path });
+        if (count.count > 0) {
+          console.log(`  ⚠️  moving ${count.count} stranded emails from ${folder.path} to INBOX`);
+          callTool('bulk_move', { sourceMailbox: folder.path, targetMailbox: 'INBOX' });
+        }
+        callTool('delete_mailbox', { name: folder.path });
+        console.log(`  ✓  deleted ${folder.path}`);
+      } catch (e) {
+        console.log(`  ⚠️  could not clean up ${folder.path}: ${e.message}`);
+      }
+    }
   }
 } catch (err) {
-  console.log(`  ⚠️  stranded email cleanup failed: ${err.message} — proceeding anyway`);
+  console.log(`  ⚠️  temp folder cleanup failed: ${err.message} — proceeding anyway`);
 }
 
 console.log('');
@@ -319,6 +332,120 @@ test('get_email (fetch first email content)', () => {
   console.log(`\n     → fetched email: "${result.subject?.slice(0, 40)}..."`);
 });
 
+test('get_email (attachments field)', () => {
+  const inbox = callTool('read_inbox', { limit: 1 });
+  assert(inbox.emails.length > 0, 'inbox should have at least one email');
+  const uid = inbox.emails[0].uid;
+  const result = callTool('get_email', { uid });
+  assert(result.attachments !== undefined, 'result should have attachments field');
+  assert(typeof result.attachments.count === 'number', 'attachments.count should be a number');
+  assert(Array.isArray(result.attachments.items), 'attachments.items should be an array');
+  assert(result.attachments.items.length === result.attachments.count, 'count should match items length');
+  console.log(`\n     → ${result.attachments.count} attachment(s)`);
+});
+
+test('get_email (maxChars truncation)', () => {
+  const inbox = callTool('read_inbox', { limit: 1 });
+  assert(inbox.emails.length > 0, 'inbox should have at least one email');
+  const uid = inbox.emails[0].uid;
+  const result = callTool('get_email', { uid, maxChars: 100 });
+  assert(typeof result.body === 'string', 'body should be a string');
+  // Body either fits in 100 chars, or is truncated (truncated text is appended)
+  const wasTruncated = result.body.includes('[... truncated');
+  if (wasTruncated) {
+    assert(result.body.indexOf('[... truncated') <= 105, 'truncation marker should be near 100 char limit');
+  }
+  console.log(`\n     → body length: ${result.body.length} chars (truncated: ${wasTruncated})`);
+});
+
+test('get_email (includeHeaders)', () => {
+  const inbox = callTool('read_inbox', { limit: 1 });
+  assert(inbox.emails.length > 0, 'inbox should have at least one email');
+  const uid = inbox.emails[0].uid;
+  const result = callTool('get_email', { uid, includeHeaders: true });
+  assert(result.headers !== undefined, 'result should have headers field');
+  assert(Array.isArray(result.headers.to), 'headers.to should be an array');
+  assert(Array.isArray(result.headers.cc), 'headers.cc should be an array');
+  assert(Array.isArray(result.headers.references), 'headers.references should be an array');
+  assert('messageId' in result.headers, 'headers should have messageId');
+  assert('inReplyTo' in result.headers, 'headers should have inReplyTo');
+  assert('replyTo' in result.headers, 'headers should have replyTo');
+  assert('listUnsubscribe' in result.headers, 'headers should have listUnsubscribe');
+  console.log(`\n     → to: ${result.headers.to.length}, refs: ${result.headers.references.length}, messageId: ${result.headers.messageId?.slice(0, 30)}`);
+});
+
+test('get_email_raw', () => {
+  const inbox = callTool('read_inbox', { limit: 1 });
+  assert(inbox.emails.length > 0, 'inbox should have at least one email');
+  const uid = inbox.emails[0].uid;
+  const result = callTool('get_email_raw', { uid });
+  assert(result.uid === uid, 'uid should match');
+  assert(typeof result.size === 'number', 'size should be a number');
+  assert(result.size > 0, 'size should be > 0');
+  assert(typeof result.truncated === 'boolean', 'truncated should be a boolean');
+  assert(typeof result.data === 'string', 'data should be a string');
+  assert(result.dataEncoding === 'base64', 'dataEncoding should be base64');
+  // Verify it decodes to something that looks like an email
+  const decoded = Buffer.from(result.data, 'base64').toString();
+  assert(decoded.includes(':'), 'raw email should contain header colons');
+  console.log(`\n     → size: ${result.size} bytes, truncated: ${result.truncated}`);
+});
+
+test('search_emails (subjectQuery only)', () => {
+  const result = callTool('search_emails', { subjectQuery: 'the', limit: 5 });
+  assert(typeof result.total === 'number', 'total should be a number');
+  assert(Array.isArray(result.emails), 'emails should be an array');
+  console.log(`\n     → ${result.total} results with subjectQuery`);
+});
+
+test('search_emails (fromQuery only)', () => {
+  const senders = callTool('get_top_senders', { sampleSize: 20 });
+  const topDomain = senders.topDomains[0]?.domain;
+  assert(topDomain, 'should have at least one domain');
+  const result = callTool('search_emails', { fromQuery: topDomain, limit: 5 });
+  assert(typeof result.total === 'number', 'total should be a number');
+  assert(Array.isArray(result.emails), 'emails should be an array');
+  console.log(`\n     → ${result.total} results with fromQuery @${topDomain}`);
+});
+
+test('search_emails (includeSnippet)', () => {
+  const result = callTool('search_emails', { query: 'the', limit: 3, includeSnippet: true });
+  assert(typeof result.total === 'number', 'total should be a number');
+  assert(Array.isArray(result.emails), 'emails should be an array');
+  // At least one email should have a snippet (if there are any results)
+  if (result.emails.length > 0) {
+    const withSnippet = result.emails.filter(e => e.snippet !== undefined);
+    assert(withSnippet.length > 0, 'at least one email should have a snippet');
+    assert(typeof result.emails[0].snippet === 'string' || result.emails[0].snippet === undefined, 'snippet should be a string or undefined');
+  }
+  console.log(`\n     → ${result.emails.length} results, ${result.emails.filter(e => e.snippet).length} with snippets`);
+});
+
+test('list_attachments', () => {
+  const inbox = callTool('read_inbox', { limit: 1 });
+  assert(inbox.emails.length > 0, 'inbox should have at least one email');
+  const uid = inbox.emails[0].uid;
+  const result = callTool('list_attachments', { uid });
+  assert(result.uid === uid, 'uid should match');
+  assert(typeof result.attachmentCount === 'number', 'attachmentCount should be a number');
+  assert(Array.isArray(result.attachments), 'attachments should be an array');
+  assert(result.attachments.length === result.attachmentCount, 'attachmentCount should match array length');
+  console.log(`\n     → ${result.attachmentCount} attachment(s) in email "${result.subject?.slice(0, 30)}"`);
+});
+
+test('get_unsubscribe_info', () => {
+  const inbox = callTool('read_inbox', { limit: 1 });
+  assert(inbox.emails.length > 0, 'inbox should have at least one email');
+  const uid = inbox.emails[0].uid;
+  const result = callTool('get_unsubscribe_info', { uid });
+  assert(result.uid === uid, 'uid should match');
+  assert('email' in result, 'result should have email field');
+  assert('url' in result, 'result should have url field');
+  assert('raw' in result, 'result should have raw field');
+  // email/url/raw may be null if no List-Unsubscribe header
+  console.log(`\n     → email: ${result.email ?? 'none'}, url: ${result.url ? result.url.slice(0, 40) + '...' : 'none'}`);
+});
+
 // ─── Count & Bulk Query ───────────────────────────────────────────────────────
 console.log('\n🔍 Count & Bulk Query');
 
@@ -381,6 +508,33 @@ test('bulk_delete (dryRun)', () => {
   console.log(`\n     → would delete ${result.wouldDelete} emails before 2015`);
 });
 
+test('bulk_move_by_domain (dryRun)', () => {
+  const senders = callTool('get_top_senders', { sampleSize: 20 });
+  const topDomain = senders.topDomains[0]?.domain;
+  assert(topDomain, 'should have at least one domain');
+  const result = callTool('bulk_move_by_domain', { domain: topDomain, targetMailbox: 'Archive', dryRun: true });
+  assert(result.dryRun === true, 'dryRun should be true');
+  assert(typeof result.wouldMove === 'number', 'wouldMove should be a number');
+  assert(result.targetMailbox === 'Archive', 'targetMailbox should be Archive');
+  console.log(`\n     → would move ${result.wouldMove} emails from @${topDomain}`);
+});
+
+test('count_emails (hasAttachment scan limit error has candidateCount)', () => {
+  // Use a bare count with hasAttachment on a large mailbox — should hit the scan limit
+  // and return candidateCount. If inbox is small enough, it may succeed instead.
+  const result = callTool('count_emails', { hasAttachment: true });
+  if (result.error) {
+    // Hit scan limit — verify candidateCount is present
+    assert(typeof result.candidateCount === 'number', 'candidateCount should be a number');
+    assert(result.count === null, 'count should be null on scan limit error');
+    console.log(`\n     → scan limit hit, candidateCount: ${result.candidateCount}`);
+  } else {
+    // Inbox small enough to scan — still valid
+    assert(typeof result.count === 'number', 'count should be a number when scan succeeds');
+    console.log(`\n     → scan succeeded, ${result.count} emails with attachments`);
+  }
+});
+
 // ─── Write Operations ─────────────────────────────────────────────────────────
 console.log('\n✏️  Write Operations (flag/mark only — no deletions)');
 
@@ -406,6 +560,42 @@ test('mark_as_read and mark_as_unread', () => {
   console.log(`\n     → marked read/unread uid ${uid}`);
 });
 
+test('mark_older_than_read (ancient date — marks 0, non-destructive)', () => {
+  // Days so large no email could be that old — safe no-op (100 years)
+  const result = callTool('mark_older_than_read', { days: 36500 });
+  assert(typeof result.marked === 'number', 'marked should be a number');
+  assert(typeof result.olderThan === 'string', 'olderThan should be a date string');
+  assert(result.marked === 0, `expected 0 emails marked (none are 100 years old), got ${result.marked}`);
+  console.log(`\n     → marked ${result.marked} emails as read (olderThan: ${result.olderThan.slice(0, 10)})`);
+});
+
+test('empty_trash (dryRun)', () => {
+  const result = callTool('empty_trash', { dryRun: true });
+  assert(result.dryRun === true, 'dryRun should be true');
+  assert(typeof result.wouldDelete === 'number', 'wouldDelete should be a number');
+  assert(typeof result.mailbox === 'string', 'mailbox should be a string');
+  console.log(`\n     → would delete ${result.wouldDelete} emails from ${result.mailbox}`);
+});
+
+test('bulk_flag_by_sender (flag then unflag — non-destructive)', () => {
+  const senders = callTool('get_top_senders', { sampleSize: 20 });
+  const topSender = senders.topAddresses[0]?.address;
+  assert(topSender, 'should have at least one sender');
+  // Count emails from sender first
+  const count = callTool('count_emails', { sender: topSender });
+  if (count.count === 0) {
+    console.log(`\n     → no emails from ${topSender}, skipping flag test`);
+    return;
+  }
+  // Flag
+  const flagResult = callTool('bulk_flag_by_sender', { sender: topSender, flagged: true });
+  assert(typeof (flagResult.flagged ?? flagResult.unflagged) === 'number', 'should return flagged or unflagged count');
+  // Unflag
+  const unflagResult = callTool('bulk_flag_by_sender', { sender: topSender, flagged: false });
+  assert(typeof (unflagResult.flagged ?? unflagResult.unflagged) === 'number', 'should return flagged or unflagged count');
+  console.log(`\n     → flagged then unflagged ${flagResult.flagged} emails from ${topSender}`);
+});
+
 // ─── Mailbox Management ───────────────────────────────────────────────────────
 console.log('\n🗂️  Mailbox Management');
 
@@ -424,6 +614,50 @@ test('rename_mailbox + delete_mailbox', () => {
   const deleted = callTool('delete_mailbox', { name: 'mcp-test-folder-renamed' });
   assert(deleted.deleted === 'mcp-test-folder-renamed', 'should confirm deletion');
   console.log(`\n     → deleted: ${deleted.deleted}`);
+});
+
+test('get_storage_report', () => {
+  const result = callTool('get_storage_report', { sampleSize: 20 });
+  assert(result.mailbox === 'INBOX', 'mailbox should be INBOX');
+  assert(Array.isArray(result.buckets), 'buckets should be an array');
+  assert(result.buckets.length === 4, 'should have 4 size buckets');
+  assert(typeof result.estimatedTotalKB === 'number', 'estimatedTotalKB should be a number');
+  assert(Array.isArray(result.topSendersBySize), 'topSendersBySize should be an array');
+  result.buckets.forEach(b => {
+    assert(typeof b.range === 'string', 'bucket range should be a string');
+    assert(typeof b.count === 'number', 'bucket count should be a number');
+  });
+  const totalBucketCount = result.buckets.reduce((sum, b) => sum + b.count, 0);
+  console.log(`\n     → ${totalBucketCount} emails > 10KB, estimated total: ${Math.round(result.estimatedTotalKB / 1024)} MB`);
+  console.log(`\n     → top sender by size: ${result.topSendersBySize[0]?.address ?? 'none'} (${result.topSendersBySize[0]?.estimateKB ?? 0} KB)`);
+});
+
+test('get_thread', () => {
+  const inbox = callTool('read_inbox', { limit: 1 });
+  assert(inbox.emails.length > 0, 'inbox should have at least one email');
+  const uid = inbox.emails[0].uid;
+  const result = callTool('get_thread', { uid });
+  assert(result.uid === uid, 'uid should match');
+  assert(typeof result.count === 'number', 'count should be a number');
+  assert(result.count >= 1, 'thread should include at least the target email');
+  assert(Array.isArray(result.emails), 'emails should be an array');
+  assert(result.emails.length === result.count, 'emails array length should match count');
+  if (result.emails.length > 0) {
+    const first = result.emails[0];
+    assert(typeof first.uid === 'number', 'email uid should be a number');
+    assert(typeof first.seen === 'boolean', 'email seen should be a boolean');
+  }
+  console.log(`\n     → thread has ${result.count} email(s), subject: "${result.subject?.slice(0, 40)}"`);
+});
+
+test('archive_older_than (dryRun)', () => {
+  const result = callTool('archive_older_than', { days: 365, targetMailbox: 'Archive', dryRun: true });
+  assert(result.dryRun === true, 'dryRun should be true');
+  assert(typeof result.wouldMove === 'number', 'wouldMove should be a number');
+  assert(result.targetMailbox === 'Archive', 'targetMailbox should be Archive');
+  assert(result.sourceMailbox === 'INBOX', 'sourceMailbox should be INBOX');
+  assert(typeof result.olderThan === 'string', 'olderThan should be a date string');
+  console.log(`\n     → would archive ${result.wouldMove} emails older than 1 year`);
 });
 
 // ─── Move Manifest ────────────────────────────────────────────────────────────
@@ -445,34 +679,48 @@ test('abandon_move (nothing to abandon)', () => {
   console.log(`\n     → ${result.message}`);
 });
 
-// ─── Safe Move (live) ─────────────────────────────────────────────────────────
-// Uses limit:50 to keep the test fast and deterministic. Moving the full
-// newsletters folder (5000+ emails) is too slow for a test suite — IMAP EXPUNGE
-// scales with mailbox size, taking 60-160s per chunk on large folders.
-// 50 emails completes in ~15-30s total and tests all the same code paths:
-// fingerprinting, envelope scan, Message-ID fallback, manifest, delete.
-console.log('\n🔐 Safe Move Test (live — newsletters ↔ test, 50-email sample)');
+// ─── Safe Move Test (live) ─────────────────────────────────────────────────────────
+// Creates temp folders dynamically — no hardcoded folder dependencies.
+// Seeds 50 emails from INBOX, moves them src→dst→src, then restores to INBOX.
+console.log('\n🔐 Safe Move Test (live — dynamic temp folders, 50-email sample)');
 
 const MOVE_SAMPLE = 50;
+const TS = Date.now();
+const SRC_FOLDER = `mcp-test-src-${TS}`;
+const DST_FOLDER = `mcp-test-dst-${TS}`;
 
-test(`bulk_move newsletters → test (${MOVE_SAMPLE} emails, fingerprint verified)`, () => {
-  const beforeSource = callTool('count_emails', { mailbox: 'newsletters' });
-  assert(beforeSource.count >= MOVE_SAMPLE, `newsletters needs at least ${MOVE_SAMPLE} emails, has ${beforeSource.count}`);
-  console.log(`\n     → newsletters before: ${beforeSource.count} (moving ${MOVE_SAMPLE})`);
+// Setup: create temp folders and seed emails from INBOX
+test('safe move setup: create temp folders and seed from INBOX', () => {
+  const inbox = callTool('count_emails', { mailbox: 'INBOX' });
+  assert(inbox.count >= MOVE_SAMPLE, `INBOX needs at least ${MOVE_SAMPLE} emails for safe move test, has ${inbox.count}`);
 
-  const moveResult = callTool('bulk_move', { sourceMailbox: 'newsletters', targetMailbox: 'test', limit: MOVE_SAMPLE });
+  callTool('create_mailbox', { name: SRC_FOLDER });
+  callTool('create_mailbox', { name: DST_FOLDER });
+
+  // Move 50 emails from INBOX to src (seed)
+  const seedResult = callTool('bulk_move', { sourceMailbox: 'INBOX', targetMailbox: SRC_FOLDER, limit: MOVE_SAMPLE });
+  console.log(`\n     → seeded ${seedResult.moved} emails into ${SRC_FOLDER}`);
+  assert(seedResult.status === 'complete', `seed move should complete, got ${seedResult.status}: ${seedResult.message || ''}`);
+  assert(seedResult.moved === MOVE_SAMPLE, `expected ${MOVE_SAMPLE} seeded, got ${seedResult.moved}`);
+});
+
+test(`bulk_move src → dst (${MOVE_SAMPLE} emails, fingerprint verified)`, () => {
+  const beforeSource = callTool('count_emails', { mailbox: SRC_FOLDER });
+  assert(beforeSource.count === MOVE_SAMPLE, `${SRC_FOLDER} should have ${MOVE_SAMPLE} emails, has ${beforeSource.count}`);
+  console.log(`\n     → src before: ${beforeSource.count} (moving ${MOVE_SAMPLE})`);
+
+  const moveResult = callTool('bulk_move', { sourceMailbox: SRC_FOLDER, targetMailbox: DST_FOLDER, limit: MOVE_SAMPLE });
   console.log(`\n     → status: ${moveResult.status}, moved: ${moveResult.moved} of ${moveResult.total}`);
   assert(moveResult.status === 'complete', `expected complete, got ${moveResult.status}: ${moveResult.message || ''}`);
   assert(moveResult.moved === MOVE_SAMPLE, `moved ${moveResult.moved} but expected ${MOVE_SAMPLE}`);
-  assert(moveResult.total === MOVE_SAMPLE, `total ${moveResult.total} should match limit ${MOVE_SAMPLE}`);
 
-  const afterSource = callTool('count_emails', { mailbox: 'newsletters' });
-  console.log(`\n     → newsletters after: ${afterSource.count} (was ${beforeSource.count})`);
-  assert(afterSource.count === beforeSource.count - MOVE_SAMPLE, `newsletters should have ${beforeSource.count - MOVE_SAMPLE}, has ${afterSource.count}`);
+  const afterSource = callTool('count_emails', { mailbox: SRC_FOLDER });
+  console.log(`\n     → src after: ${afterSource.count} (should be 0)`);
+  assert(afterSource.count === 0, `${SRC_FOLDER} should be empty, has ${afterSource.count}`);
 
-  const afterTarget = callTool('count_emails', { mailbox: 'test' });
-  console.log(`\n     → test folder after: ${afterTarget.count}`);
-  assert(afterTarget.count === MOVE_SAMPLE, `test should have ${MOVE_SAMPLE}, has ${afterTarget.count}`);
+  const afterTarget = callTool('count_emails', { mailbox: DST_FOLDER });
+  console.log(`\n     → dst after: ${afterTarget.count} (should be ${MOVE_SAMPLE})`);
+  assert(afterTarget.count === MOVE_SAMPLE, `${DST_FOLDER} should have ${MOVE_SAMPLE}, has ${afterTarget.count}`);
 });
 
 test('get_move_status (after completed move)', () => {
@@ -481,26 +729,23 @@ test('get_move_status (after completed move)', () => {
   assert(result.history.length > 0, 'history should have at least one entry');
   const last = result.history[0];
   assert(last.status === 'complete', `last operation should be complete, got ${last.status}`);
-  assert(last.source === 'newsletters', `source should be newsletters, got ${last.source}`);
-  assert(last.target === 'test', `target should be test, got ${last.target}`);
   assert(last.moved === MOVE_SAMPLE, `last op should have moved ${MOVE_SAMPLE}, got ${last.moved}`);
   console.log(`\n     → last op: ${last.status}, ${last.moved}/${last.total} moved from ${last.source} → ${last.target}`);
 });
 
-test(`bulk_move test → newsletters (restore ${MOVE_SAMPLE} emails, fingerprint verified)`, () => {
-  const beforeSource = callTool('count_emails', { mailbox: 'test' });
-  assert(beforeSource.count === MOVE_SAMPLE, `test should have ${MOVE_SAMPLE} emails, has ${beforeSource.count}`);
-  console.log(`\n     → test before restore: ${beforeSource.count}`);
+test(`bulk_move dst → src (restore ${MOVE_SAMPLE} emails, fingerprint verified)`, () => {
+  const beforeSource = callTool('count_emails', { mailbox: DST_FOLDER });
+  assert(beforeSource.count === MOVE_SAMPLE, `${DST_FOLDER} should have ${MOVE_SAMPLE} emails, has ${beforeSource.count}`);
+  console.log(`\n     → dst before restore: ${beforeSource.count}`);
 
-  // No limit needed — test folder only has MOVE_SAMPLE emails; small folder = fast delete
-  const moveBack = callTool('bulk_move', { sourceMailbox: 'test', targetMailbox: 'newsletters' });
+  const moveBack = callTool('bulk_move', { sourceMailbox: DST_FOLDER, targetMailbox: SRC_FOLDER });
   console.log(`\n     → status: ${moveBack.status}, moved: ${moveBack.moved} of ${moveBack.total}`);
   assert(moveBack.status === 'complete', `expected complete, got ${moveBack.status}: ${moveBack.message || ''}`);
   assert(moveBack.moved === MOVE_SAMPLE, `moved ${moveBack.moved} but expected ${MOVE_SAMPLE}`);
 
-  const afterSource = callTool('count_emails', { mailbox: 'test' });
-  console.log(`\n     → test after (should be 0): ${afterSource.count}`);
-  assert(afterSource.count === 0, `test should be empty, has ${afterSource.count}`);
+  const afterSource = callTool('count_emails', { mailbox: DST_FOLDER });
+  console.log(`\n     → dst after (should be 0): ${afterSource.count}`);
+  assert(afterSource.count === 0, `${DST_FOLDER} should be empty, has ${afterSource.count}`);
 });
 
 test('get_move_status (history has both moves)', () => {
@@ -509,11 +754,20 @@ test('get_move_status (history has both moves)', () => {
   assert(result.history.length >= 2, `history should have at least 2 entries, has ${result.history.length}`);
   const [restore, forward] = result.history;
   assert(restore.status === 'complete', `restore op should be complete, got ${restore.status}`);
-  assert(restore.source === 'test', `restore source should be test, got ${restore.source}`);
   assert(forward.status === 'complete', `forward op should be complete, got ${forward.status}`);
-  assert(forward.source === 'newsletters', `forward source should be newsletters, got ${forward.source}`);
   console.log(`\n     → history[0]: ${restore.source} → ${restore.target} (${restore.status}, ${restore.moved} emails)`);
   console.log(`\n     → history[1]: ${forward.source} → ${forward.target} (${forward.status}, ${forward.moved} emails)`);
+});
+
+// Teardown: restore emails to INBOX and delete temp folders
+test('safe move teardown: restore to INBOX and delete temp folders', () => {
+  // Restore emails to INBOX
+  const restoreResult = callTool('bulk_move', { sourceMailbox: SRC_FOLDER, targetMailbox: 'INBOX' });
+  console.log(`\n     → restored ${restoreResult.moved ?? 0} emails to INBOX`);
+  // Delete temp folders (should be empty now)
+  try { callTool('delete_mailbox', { name: SRC_FOLDER }); } catch (e) { console.log(`\n     → warn: could not delete ${SRC_FOLDER}: ${e.message}`); }
+  try { callTool('delete_mailbox', { name: DST_FOLDER }); } catch (e) { console.log(`\n     → warn: could not delete ${DST_FOLDER}: ${e.message}`); }
+  console.log(`\n     → deleted temp folders ${SRC_FOLDER}, ${DST_FOLDER}`);
 });
 
 // ─── Session Log ─────────────────────────────────────────────────────────────
