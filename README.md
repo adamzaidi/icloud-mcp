@@ -1,12 +1,14 @@
 # icloud-mcp
 
-A Model Context Protocol (MCP) server that connects Claude Desktop to your iCloud Mail account. Manage, search, organize, and analyze your inbox directly through Claude.
+A Model Context Protocol (MCP) server that connects Claude to your iCloud Mail account. Read, search, organize, send, and automate your inbox directly through Claude.
 
 ## Features
 
 - 📬 Read and paginate through any mailbox
 - 🔍 Search emails by keyword, sender, subject, body, date range, and more
 - 🧵 Find email threads by References/In-Reply-To chain
+- ✉️ Send emails, reply, forward, and save drafts via iCloud SMTP
+- 📋 Create saved rules to auto-route emails on demand
 - 🗑️ Bulk delete emails by any combination of filters
 - 📁 Bulk move emails between folders with safe copy-verify-delete
 - 📦 Archive emails older than N days to any folder
@@ -22,7 +24,7 @@ A Model Context Protocol (MCP) server that connects Claude Desktop to your iClou
 
 ## Prerequisites
 
-- [Claude Desktop](https://claude.ai/download)
+- [Claude Desktop](https://claude.ai/download) or Claude Code
 - Node.js v20 or higher
 - An iCloud account with an app-specific password
 
@@ -137,9 +139,7 @@ Verify it registered correctly:
 claude mcp list
 ```
 
-The tools will be available in any Claude Code session. To check they're live, run `claude` and ask: *"What iCloud mail tools do you have?"*
-
-> **Running from source?** Copy `.mcp.json.example` to `.mcp.json`, set `ICLOUD_EMAIL` and `ICLOUD_APP_PASSWORD` in your shell, then run `claude` from the repo directory. Claude Code will pick up the config automatically.
+> **Running from source?** Copy `.mcp.json.example` to `.mcp.json`, set your credentials in your shell, then run `claude` from the repo directory. Claude Code will pick up the config automatically.
 
 ### 5. Add Custom Instructions (Recommended)
 
@@ -161,7 +161,7 @@ You're all set. Try asking Claude:
 - *"Show me the top senders in my iCloud inbox"*
 - *"How many unread emails do I have?"*
 
-## Available Tools (46)
+## Available Tools (55)
 
 ### Read & Search
 
@@ -184,6 +184,15 @@ You're all set. Try asking Claude:
 | `get_unsubscribe_info` | Extract List-Unsubscribe links (email + URL) from an email |
 | `list_attachments` | List all attachments in an email (filename, MIME type, size, partId) |
 | `get_attachment` | Download an attachment as base64 (max 20 MB); supports `offset`/`length` for paginated byte-range fetching |
+
+### Send & Draft
+
+| Tool | Description |
+|------|-------------|
+| `compose_email` | Send a new email via iCloud SMTP; supports plain text, HTML, cc, bcc, replyTo |
+| `reply_to_email` | Reply to an email with correct In-Reply-To + References threading; supports `replyAll` |
+| `forward_email` | Forward an email with an optional prepended note |
+| `save_draft` | Save a draft to your Drafts folder without sending; supports plain text and HTML |
 
 ### Write
 
@@ -228,6 +237,16 @@ You're all set. Try asking Claude:
 | `get_move_status` | Check the status of the current or most recent bulk move; includes stale warning for operations >24h old |
 | `abandon_move` | Abandon an in-progress move so a new one can start |
 
+### Saved Rules
+
+| Tool | Description |
+|------|-------------|
+| `create_rule` | Create a named rule with filters + action (move/delete/mark_read/mark_unread/flag/unflag) |
+| `list_rules` | List all saved rules with last-run time and run count |
+| `run_rule` | Run a specific rule by name; supports `dryRun` |
+| `run_all_rules` | Run all saved rules in sequence; supports `dryRun` |
+| `delete_rule` | Delete a saved rule by name |
+
 ### Session Log
 
 | Tool | Description |
@@ -238,7 +257,7 @@ You're all set. Try asking Claude:
 
 ## Filters
 
-`bulk_move`, `bulk_delete`, `bulk_flag`, `search_emails`, and `count_emails` all accept any combination of these filters:
+`bulk_move`, `bulk_delete`, `bulk_flag`, `search_emails`, `count_emails`, and rules all accept any combination of these filters:
 
 | Filter | Type | Description |
 |--------|------|-------------|
@@ -277,7 +296,9 @@ Once configured, you can ask Claude things like:
 - *"What's the unsubscribe link for this newsletter?"*
 - *"Show me the 3 largest attachments in my inbox this month"*
 - *"Flag all unread emails from my bank"*
-- *"How many emails would be moved if I archived everything older than 6 months?"*
+- *"Create a rule that moves all emails from spotify.com to bulk-mail/services"*
+- *"Reply to the last email from John and cc Sarah"*
+- *"Draft a follow-up email to the team about the Q1 report"*
 
 ## Security
 
