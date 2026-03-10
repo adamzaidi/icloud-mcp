@@ -6,9 +6,11 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { composeEmail, replyToEmail, forwardEmail, saveDraft } from './lib/smtp.js';
 
 const LOG_FILE = join(homedir(), '.icloud-mcp-session.json');
 const MANIFEST_FILE = join(homedir(), '.icloud-mcp-move-manifest.json');
+const RULES_FILE = join(homedir(), '.icloud-mcp-rules.json');
 const MAX_HISTORY = 5;
 
 const IMAP_USER = process.env.IMAP_USER;
@@ -1946,6 +1948,144 @@ async function countEmails(filters, mailbox = 'INBOX') {
   return { count: uids.length, mailbox, filters };
 }
 
+// ─── Saved Rules ─────────────────────────────────────────────────────────────
+
+function readRules() {
+  if (!existsSync(RULES_FILE)) return { rules: [] };
+  try { return JSON.parse(readFileSync(RULES_FILE, 'utf8')); }
+  catch { return { rules: [] }; }
+}
+
+function writeRules(data) {
+  writeFileSync(RULES_FILE, JSON.stringify(data, null, 2));
+}
+
+function createRule(name, filters, action, description = '') {
+  const data = readRules();
+  if (data.rules.find(r => r.name === name)) {
+    throw new Error(`Rule '${name}' already exists. Delete it first to update it.`);
+  }
+  const validActions = ['move', 'delete', 'mark_read', 'mark_unread', 'flag', 'unflag'];
+  if (!validActions.includes(action.type)) {
+    throw new Error(`Invalid action type '${action.type}'. Must be one of: ${validActions.join(', ')}`);
+  }
+  if (action.type === 'move' && !action.targetMailbox) {
+    throw new Error(`Action type 'move' requires targetMailbox`);
+  }
+  const rule = {
+    name,
+    description,
+    filters,
+    action,
+    createdAt: new Date().toISOString(),
+    lastRun: null,
+    runCount: 0,
+  };
+  data.rules.push(rule);
+  writeRules(data);
+  return rule;
+}
+
+function listRules() {
+  return { rules: readRules().rules };
+}
+
+function deleteRule(name) {
+  const data = readRules();
+  const idx = data.rules.findIndex(r => r.name === name);
+  if (idx === -1) throw new Error(`Rule '${name}' not found.`);
+  data.rules.splice(idx, 1);
+  writeRules(data);
+  return { deleted: true, name };
+}
+
+async function bulkMarkByFilters(filters, read, mailbox = 'INBOX') {
+  const client = createRateLimitedClient();
+  await client.connect();
+  await client.mailboxOpen(mailbox);
+  const base = buildQuery(filters);
+  const query = { ...base, ...(read ? { seen: false } : { seen: true }) };
+  const uids = (await client.search(query, { uid: true })) ?? [];
+  if (uids.length === 0) { await client.logout(); return { marked: 0 }; }
+  if (read) {
+    await client.messageFlagsAdd(uids, ['\\Seen'], { uid: true });
+  } else {
+    await client.messageFlagsRemove(uids, ['\\Seen'], { uid: true });
+  }
+  await client.logout();
+  return { marked: uids.length };
+}
+
+async function executeRule(rule, dryRun = false) {
+  const { filters, action } = rule;
+  const sourceMailbox = action.sourceMailbox || 'INBOX';
+  switch (action.type) {
+    case 'move':
+      return bulkMove(filters, action.targetMailbox, sourceMailbox, dryRun);
+    case 'delete':
+      return bulkDelete(filters, sourceMailbox, dryRun);
+    case 'mark_read': {
+      if (dryRun) {
+        const { count } = await countEmails(filters, sourceMailbox);
+        return { dryRun: true, wouldAffect: count ?? 0 };
+      }
+      return bulkMarkByFilters(filters, true, sourceMailbox);
+    }
+    case 'mark_unread': {
+      if (dryRun) {
+        const { count } = await countEmails(filters, sourceMailbox);
+        return { dryRun: true, wouldAffect: count ?? 0 };
+      }
+      return bulkMarkByFilters(filters, false, sourceMailbox);
+    }
+    case 'flag': {
+      if (dryRun) {
+        const { count } = await countEmails(filters, sourceMailbox);
+        return { dryRun: true, wouldAffect: count ?? 0 };
+      }
+      return bulkFlag(filters, true, sourceMailbox);
+    }
+    case 'unflag': {
+      if (dryRun) {
+        const { count } = await countEmails(filters, sourceMailbox);
+        return { dryRun: true, wouldAffect: count ?? 0 };
+      }
+      return bulkFlag(filters, false, sourceMailbox);
+    }
+    default:
+      throw new Error(`Unknown action type: ${action.type}`);
+  }
+}
+
+async function runRule(name, dryRun = false) {
+  const data = readRules();
+  const rule = data.rules.find(r => r.name === name);
+  if (!rule) throw new Error(`Rule '${name}' not found.`);
+  const result = await executeRule(rule, dryRun);
+  if (!dryRun) {
+    rule.lastRun = new Date().toISOString();
+    rule.runCount = (rule.runCount || 0) + 1;
+    writeRules(data);
+  }
+  return { rule: name, action: rule.action.type, ...result };
+}
+
+async function runAllRules(dryRun = false) {
+  const data = readRules();
+  if (data.rules.length === 0) return { results: [], ran: 0 };
+  const results = [];
+  for (const rule of data.rules) {
+    const result = await executeRule(rule, dryRun);
+    if (!dryRun) {
+      rule.lastRun = new Date().toISOString();
+      rule.runCount = (rule.runCount || 0) + 1;
+    }
+    results.push({ rule: rule.name, action: rule.action.type, ...result });
+  }
+  if (!dryRun) writeRules(data);
+  return { results, ran: data.rules.length };
+}
+
 // ─── Session Log ──────────────────────────────────────────────────────────────
 
 function logRead() {
@@ -1974,7 +2114,7 @@ function logClear() {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '2.0.0' },
+    { name: 'icloud-mail', version: '2.1.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -2479,6 +2619,138 @@ async function main() {
           },
           required: ['uid']
         }
+      },
+      // ── Saved Rules ──
+      {
+        name: 'create_rule',
+        description: 'Create a saved rule that applies a specific action to emails matching a set of filters. Rules are stored persistently and can be run on demand or all at once with run_all_rules.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Unique rule name (used to run or delete the rule)' },
+            description: { type: 'string', description: 'Optional human-readable description of what the rule does' },
+            filters: {
+              type: 'object',
+              description: 'Email filters (same as bulk_move/bulk_delete filters: sender, domain, subject, before, since, unread, flagged, larger, smaller)',
+              properties: filtersSchema
+            },
+            action: {
+              type: 'object',
+              description: 'Action to apply to matching emails',
+              properties: {
+                type: { type: 'string', enum: ['move', 'delete', 'mark_read', 'mark_unread', 'flag', 'unflag'], description: 'Action type' },
+                targetMailbox: { type: 'string', description: 'Destination folder (required for move)' },
+                sourceMailbox: { type: 'string', description: 'Source mailbox (default INBOX)' }
+              },
+              required: ['type']
+            }
+          },
+          required: ['name', 'filters', 'action']
+        }
+      },
+      {
+        name: 'list_rules',
+        description: 'List all saved rules with their filters, actions, and run history.',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'run_rule',
+        description: 'Run a specific saved rule by name. Use dryRun: true to preview what would be affected without making changes.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Rule name to run' },
+            dryRun: { type: 'boolean', description: 'If true, preview what would be affected without making changes' }
+          },
+          required: ['name']
+        }
+      },
+      {
+        name: 'delete_rule',
+        description: 'Delete a saved rule by name.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Rule name to delete' }
+          },
+          required: ['name']
+        }
+      },
+      {
+        name: 'run_all_rules',
+        description: 'Run all saved rules in sequence. Use dryRun: true to preview all rules without making changes.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            dryRun: { type: 'boolean', description: 'If true, preview all rules without making changes' }
+          }
+        }
+      },
+      // ── SMTP / Email sending ──
+      {
+        name: 'compose_email',
+        description: 'Compose and send a new email via iCloud SMTP. The From address is always your iCloud account. Supports plain text, HTML, or both (multipart/alternative).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            to: { type: 'string', description: 'Recipient email address(es), comma-separated or array' },
+            subject: { type: 'string', description: 'Email subject' },
+            body: { type: 'string', description: 'Plain text body (used as fallback when html is also provided)' },
+            html: { type: 'string', description: 'HTML body. If provided without body, plain text is auto-generated. If provided with body, sends multipart/alternative.' },
+            cc: { type: 'string', description: 'CC recipient(s), comma-separated or array' },
+            bcc: { type: 'string', description: 'BCC recipient(s), comma-separated or array' },
+            replyTo: { type: 'string', description: 'Reply-To address override' }
+          },
+          required: ['to', 'subject']
+        }
+      },
+      {
+        name: 'reply_to_email',
+        description: 'Reply to an existing email. Automatically sets correct threading headers (In-Reply-To, References) and prefixes the subject with Re:. Supports plain text and/or HTML body.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            uid: { type: 'number', description: 'UID of the email to reply to' },
+            body: { type: 'string', description: 'Plain text reply body' },
+            html: { type: 'string', description: 'HTML reply body (auto-generates plain text fallback if body not provided)' },
+            mailbox: { type: 'string', description: 'Mailbox containing the original email (default INBOX)' },
+            replyAll: { type: 'boolean', description: 'If true, reply to all recipients (To + Cc). Default false.' },
+            cc: { type: 'string', description: 'Additional CC recipients for this reply' }
+          },
+          required: ['uid']
+        }
+      },
+      {
+        name: 'forward_email',
+        description: 'Forward an existing email to one or more recipients. Fetches the original email body and includes it as a forwarded message block. Supports plain text and/or HTML note.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            uid: { type: 'number', description: 'UID of the email to forward' },
+            to: { type: 'string', description: 'Recipient(s) to forward to, comma-separated or array' },
+            note: { type: 'string', description: 'Optional plain text note to prepend before the forwarded message' },
+            html: { type: 'string', description: 'Optional HTML note to prepend (overrides plain text note for HTML rendering)' },
+            mailbox: { type: 'string', description: 'Mailbox containing the original email (default INBOX)' },
+            cc: { type: 'string', description: 'CC recipients' }
+          },
+          required: ['uid', 'to']
+        }
+      },
+      {
+        name: 'save_draft',
+        description: 'Save a draft email to your iCloud Drafts folder without sending it. Supports plain text, HTML, or both. The draft can be edited and sent later from Mail.app or iCloud.com.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            to: { type: 'string', description: 'Intended recipient(s), comma-separated or array' },
+            subject: { type: 'string', description: 'Email subject' },
+            body: { type: 'string', description: 'Plain text body (used as fallback when html is also provided)' },
+            html: { type: 'string', description: 'HTML body. If provided without body, plain text is auto-generated. If provided with body, saves multipart/alternative.' },
+            cc: { type: 'string', description: 'CC recipient(s)' },
+            bcc: { type: 'string', description: 'BCC recipient(s)' }
+          },
+          required: ['to', 'subject']
+        }
       }
     ]
   }));
@@ -2587,6 +2859,40 @@ async function main() {
         result = logRead();
       } else if (name === 'log_clear') {
         result = logClear();
+      // ── Saved rules (synchronous CRUD; run_rule/run_all_rules use internal chunk timeouts) ──
+      } else if (name === 'create_rule') {
+        result = createRule(args.name, args.filters || {}, args.action, args.description || '');
+      } else if (name === 'list_rules') {
+        result = listRules();
+      } else if (name === 'delete_rule') {
+        result = deleteRule(args.name);
+      } else if (name === 'run_rule') {
+        result = await runRule(args.name, args.dryRun || false);
+      } else if (name === 'run_all_rules') {
+        result = await runAllRules(args.dryRun || false);
+      // ── SMTP (email sending — uses SCAN tier 60s for two-phase fetch+send) ──
+      } else if (name === 'compose_email') {
+        result = await withTimeout('compose_email', TIMEOUT.SCAN, () =>
+          composeEmail(args.to, args.subject, args.body, { html: args.html, cc: args.cc, bcc: args.bcc, replyTo: args.replyTo })
+        );
+      } else if (name === 'reply_to_email') {
+        const origEmail = await withTimeout('get_email_for_reply', TIMEOUT.FETCH, () =>
+          getEmailContent(args.uid, args.mailbox || 'INBOX', 5000, true)
+        );
+        result = await withTimeout('reply_to_email', TIMEOUT.FETCH, () =>
+          replyToEmail(origEmail, args.body, { html: args.html, replyAll: args.replyAll || false, cc: args.cc })
+        );
+      } else if (name === 'forward_email') {
+        const origEmail = await withTimeout('get_email_for_forward', TIMEOUT.FETCH, () =>
+          getEmailContent(args.uid, args.mailbox || 'INBOX', 5000, false)
+        );
+        result = await withTimeout('forward_email', TIMEOUT.FETCH, () =>
+          forwardEmail(origEmail, args.to, args.note || '', { html: args.html, cc: args.cc })
+        );
+      } else if (name === 'save_draft') {
+        result = await withTimeout('save_draft', TIMEOUT.FETCH, () =>
+          saveDraft(args.to, args.subject, args.body, { html: args.html, cc: args.cc, bcc: args.bcc })
+        );
       } else {
         throw new Error(`Unknown tool: ${name}`);
       }

@@ -159,6 +159,20 @@ try {
 try { callTool('delete_mailbox', { name: 'mcp-test-folder-renamed' }); } catch {}
 try { callTool('delete_mailbox', { name: 'mcp-test-folder' }); } catch {}
 
+// Clean up any leftover mcp-test-rule-* rules from previous crashed runs
+try {
+  const rulesResult = callTool('list_rules');
+  const leftoverRules = rulesResult.rules.filter(r => r.name.startsWith('mcp-test-rule-'));
+  if (leftoverRules.length > 0) {
+    console.log(`  ⚠️  found ${leftoverRules.length} leftover mcp-test-rule-* rules — cleaning up`);
+    for (const r of leftoverRules) {
+      try { callTool('delete_rule', { name: r.name }); } catch {}
+    }
+  }
+} catch (err) {
+  console.log(`  ⚠️  rule cleanup failed: ${err.message} — proceeding anyway`);
+}
+
 // Clean up any leftover mcp-test-* temp folders from previous crashed runs
 try {
   const allMailboxes = callTool('list_mailboxes');
@@ -814,6 +828,424 @@ test('log_clear (cleanup)', () => {
   assert(log.steps.length === 0, 'log should be empty after clear');
   assert(log.startedAt === null, 'startedAt should be null after clear');
   console.log(`\n     → log cleared and verified empty`);
+});
+
+// ─── Saved Rules ─────────────────────────────────────────────────────────────
+console.log('\n📜 Saved Rules');
+
+// Pick a real domain from the inbox to use in filter tests
+const ruleTestDomain = (() => {
+  try {
+    const senders = callTool('get_top_senders', { sampleSize: 20 });
+    return senders.topDomains[0]?.domain || 'example.com';
+  } catch { return 'example.com'; }
+})();
+
+test('list_rules (initial state)', () => {
+  const result = callTool('list_rules');
+  assert(result.rules !== undefined, 'result should have rules key');
+  assert(Array.isArray(result.rules), 'rules should be an array');
+  console.log(`\n     → ${result.rules.length} existing rules`);
+});
+
+test('create_rule (move action)', () => {
+  const result = callTool('create_rule', {
+    name: 'mcp-test-rule-move',
+    description: 'Test: move emails from domain to Archive',
+    filters: { domain: ruleTestDomain },
+    action: { type: 'move', targetMailbox: 'Archive', sourceMailbox: 'INBOX' }
+  });
+  assert(result.name === 'mcp-test-rule-move', 'name should match');
+  assert(result.action.type === 'move', 'action type should be move');
+  assert(result.action.targetMailbox === 'Archive', 'targetMailbox should be Archive');
+  assert(typeof result.createdAt === 'string', 'createdAt should be a string');
+  assert(result.lastRun === null, 'lastRun should be null');
+  assert(result.runCount === 0, 'runCount should be 0');
+  console.log(`\n     → created: ${result.name} (${result.action.type}, domain: ${ruleTestDomain})`);
+});
+
+test('create_rule (delete action)', () => {
+  const result = callTool('create_rule', {
+    name: 'mcp-test-rule-delete',
+    filters: { before: '2010-01-01' },
+    action: { type: 'delete', sourceMailbox: 'INBOX' }
+  });
+  assert(result.name === 'mcp-test-rule-delete', 'name should match');
+  assert(result.action.type === 'delete', 'action type should be delete');
+  assert(result.runCount === 0, 'runCount should be 0');
+  console.log(`\n     → created: ${result.name} (${result.action.type})`);
+});
+
+test('create_rule (mark_read action)', () => {
+  const result = callTool('create_rule', {
+    name: 'mcp-test-rule-markread',
+    filters: { domain: ruleTestDomain },
+    action: { type: 'mark_read', sourceMailbox: 'INBOX' }
+  });
+  assert(result.name === 'mcp-test-rule-markread', 'name should match');
+  assert(result.action.type === 'mark_read', 'action type should be mark_read');
+  assert(result.runCount === 0, 'runCount should be 0');
+  console.log(`\n     → created: ${result.name} (${result.action.type})`);
+});
+
+test('create_rule (flag action)', () => {
+  const result = callTool('create_rule', {
+    name: 'mcp-test-rule-flag',
+    filters: { domain: ruleTestDomain },
+    action: { type: 'flag', sourceMailbox: 'INBOX' }
+  });
+  assert(result.name === 'mcp-test-rule-flag', 'name should match');
+  assert(result.action.type === 'flag', 'action type should be flag');
+  console.log(`\n     → created: ${result.name} (${result.action.type})`);
+});
+
+test('list_rules (4 test rules exist)', () => {
+  const result = callTool('list_rules');
+  assert(Array.isArray(result.rules), 'rules should be an array');
+  const testRules = result.rules.filter(r => r.name.startsWith('mcp-test-rule-'));
+  assert(testRules.length === 4, `should have 4 test rules, found ${testRules.length}`);
+  for (const r of testRules) {
+    assert(typeof r.name === 'string', 'rule.name should be a string');
+    assert(typeof r.action === 'object', 'rule.action should be an object');
+    assert(typeof r.action.type === 'string', 'rule.action.type should be a string');
+    assert(typeof r.createdAt === 'string', 'rule.createdAt should be a string');
+    assert('lastRun' in r, 'rule should have lastRun field');
+    assert(typeof r.runCount === 'number', 'rule.runCount should be a number');
+  }
+  console.log(`\n     → ${testRules.length} test rules, ${result.rules.length} total`);
+});
+
+test('create_rule (duplicate name error)', () => {
+  let threw = false;
+  try {
+    callTool('create_rule', {
+      name: 'mcp-test-rule-move',
+      filters: {},
+      action: { type: 'delete' }
+    });
+  } catch (err) {
+    threw = true;
+    assert(err.message.toLowerCase().includes('already exists'), `error should mention 'already exists': ${err.message}`);
+  }
+  assert(threw, 'should throw on duplicate rule name');
+  console.log(`\n     → correctly rejected duplicate rule name`);
+});
+
+test('create_rule (invalid action type error)', () => {
+  let threw = false;
+  try {
+    callTool('create_rule', {
+      name: 'mcp-test-rule-bad-action',
+      filters: {},
+      action: { type: 'teleport' }
+    });
+  } catch (err) {
+    threw = true;
+    assert(err.message.toLowerCase().includes('invalid action type'), `error should mention invalid action type: ${err.message}`);
+  }
+  assert(threw, 'should throw on invalid action type');
+  console.log(`\n     → correctly rejected invalid action type`);
+});
+
+test('create_rule (move without targetMailbox error)', () => {
+  let threw = false;
+  try {
+    callTool('create_rule', {
+      name: 'mcp-test-rule-bad-move',
+      filters: {},
+      action: { type: 'move' }  // missing targetMailbox
+    });
+  } catch (err) {
+    threw = true;
+    assert(err.message.toLowerCase().includes('targetmailbox'), `error should mention targetMailbox: ${err.message}`);
+  }
+  assert(threw, 'should throw on move rule missing targetMailbox');
+  console.log(`\n     → correctly rejected move rule missing targetMailbox`);
+});
+
+test('run_rule (move, dryRun)', () => {
+  const result = callTool('run_rule', { name: 'mcp-test-rule-move', dryRun: true });
+  assert(result.rule === 'mcp-test-rule-move', 'rule name should match');
+  assert(result.action === 'move', 'action should be move');
+  assert(result.dryRun === true, 'dryRun should be true');
+  assert(typeof result.wouldMove === 'number', 'wouldMove should be a number');
+  // runCount should NOT increment on dryRun
+  const rules = callTool('list_rules');
+  const rule = rules.rules.find(r => r.name === 'mcp-test-rule-move');
+  assert(rule.runCount === 0, `runCount should still be 0 after dryRun, got ${rule.runCount}`);
+  console.log(`\n     → dryRun: would move ${result.wouldMove} emails`);
+});
+
+test('run_rule (delete, dryRun)', () => {
+  const result = callTool('run_rule', { name: 'mcp-test-rule-delete', dryRun: true });
+  assert(result.rule === 'mcp-test-rule-delete', 'rule name should match');
+  assert(result.action === 'delete', 'action should be delete');
+  assert(result.dryRun === true, 'dryRun should be true');
+  assert(typeof result.wouldDelete === 'number', 'wouldDelete should be a number');
+  console.log(`\n     → dryRun: would delete ${result.wouldDelete} emails`);
+});
+
+test('run_rule (mark_read, dryRun)', () => {
+  const result = callTool('run_rule', { name: 'mcp-test-rule-markread', dryRun: true });
+  assert(result.rule === 'mcp-test-rule-markread', 'rule name should match');
+  assert(result.action === 'mark_read', 'action should be mark_read');
+  assert(result.dryRun === true, 'dryRun should be true');
+  assert(typeof result.wouldAffect === 'number', 'wouldAffect should be a number');
+  console.log(`\n     → dryRun: would mark ${result.wouldAffect} emails as read`);
+});
+
+test('run_rule (no dryRun — increments runCount, safe no-op filter)', () => {
+  // Use before:'1900-01-01' so no emails match — safe full execution path
+  callTool('create_rule', {
+    name: 'mcp-test-rule-noop',
+    filters: { before: '1900-01-01' },
+    action: { type: 'delete' }
+  });
+  const result = callTool('run_rule', { name: 'mcp-test-rule-noop' });
+  assert(result.rule === 'mcp-test-rule-noop', 'rule name should match');
+  assert(result.action === 'delete', 'action should be delete');
+  assert(!result.dryRun, 'dryRun should be false/undefined');
+  // Verify runCount was incremented
+  const rules = callTool('list_rules');
+  const rule = rules.rules.find(r => r.name === 'mcp-test-rule-noop');
+  assert(rule.runCount === 1, `runCount should be 1, got ${rule.runCount}`);
+  assert(rule.lastRun !== null, 'lastRun should be set after execution');
+  callTool('delete_rule', { name: 'mcp-test-rule-noop' });
+  console.log(`\n     → runCount: ${rule.runCount}, lastRun: ${rule.lastRun?.slice(0, 19)}`);
+});
+
+test('run_all_rules (dryRun)', () => {
+  const result = callTool('run_all_rules', { dryRun: true });
+  assert(typeof result.ran === 'number', 'ran should be a number');
+  assert(result.ran >= 4, `should run at least 4 test rules, got ${result.ran}`);
+  assert(Array.isArray(result.results), 'results should be an array');
+  assert(result.results.length === result.ran, 'results length should match ran count');
+  for (const r of result.results) {
+    assert(typeof r.rule === 'string', 'each result should have rule name');
+    assert(typeof r.action === 'string', 'each result should have action type');
+  }
+  console.log(`\n     → dryRun ran ${result.ran} rules: ${result.results.map(r => r.rule).join(', ')}`);
+});
+
+test('delete_rule', () => {
+  const result = callTool('delete_rule', { name: 'mcp-test-rule-move' });
+  assert(result.deleted === true, 'deleted should be true');
+  assert(result.name === 'mcp-test-rule-move', 'name should match');
+  // Verify it no longer appears in list
+  const rules = callTool('list_rules');
+  const found = rules.rules.find(r => r.name === 'mcp-test-rule-move');
+  assert(!found, 'deleted rule should not appear in list_rules');
+  console.log(`\n     → deleted rule: ${result.name}`);
+});
+
+test('delete_rule (not found error)', () => {
+  let threw = false;
+  try {
+    callTool('delete_rule', { name: 'mcp-test-rule-does-not-exist' });
+  } catch (err) {
+    threw = true;
+    assert(err.message.toLowerCase().includes('not found'), `error should say not found: ${err.message}`);
+  }
+  assert(threw, 'should throw on unknown rule name');
+  console.log(`\n     → correctly rejected delete of nonexistent rule`);
+});
+
+test('rules cleanup (delete all remaining test rules)', () => {
+  const rules = callTool('list_rules');
+  const testRules = rules.rules.filter(r => r.name.startsWith('mcp-test-rule-'));
+  for (const r of testRules) {
+    callTool('delete_rule', { name: r.name });
+  }
+  const after = callTool('list_rules');
+  const remaining = after.rules.filter(r => r.name.startsWith('mcp-test-rule-'));
+  assert(remaining.length === 0, `should have 0 test rules remaining, found ${remaining.length}`);
+  console.log(`\n     → cleaned up ${testRules.length} test rules`);
+});
+
+// ─── Email Sending (SMTP) ─────────────────────────────────────────────────────
+console.log('\n📤 Email Sending (SMTP)');
+
+const SMTP_TS = Date.now();
+
+test('compose_email (send to self)', () => {
+  const result = callTool('compose_email', {
+    to: IMAP_USER,
+    subject: `[mcp-test-compose-${SMTP_TS}]`,
+    body: 'Automated test email from the iCloud MCP server test suite.'
+  });
+  assert(result.sent === true, 'sent should be true');
+  assert(typeof result.messageId === 'string', 'messageId should be a string');
+  assert(result.messageId.length > 0, 'messageId should not be empty');
+  assert(Array.isArray(result.accepted), 'accepted should be an array');
+  assert(result.accepted.length > 0, 'accepted should have at least one recipient');
+  assert(Array.isArray(result.rejected), 'rejected should be an array');
+  assert(result.rejected.length === 0, 'rejected should be empty');
+  console.log(`\n     → sent to ${result.accepted[0]}, messageId: ${result.messageId?.slice(0, 40)}...`);
+});
+
+test('compose_email (with cc)', () => {
+  const result = callTool('compose_email', {
+    to: IMAP_USER,
+    subject: `[mcp-test-compose-cc-${SMTP_TS}]`,
+    body: 'Test email with cc field.',
+    cc: IMAP_USER
+  });
+  assert(result.sent === true, 'sent should be true');
+  assert(typeof result.messageId === 'string', 'messageId should be a string');
+  console.log(`\n     → sent with cc, messageId: ${result.messageId?.slice(0, 40)}...`);
+});
+
+test('reply_to_email', () => {
+  const inbox = callTool('read_inbox', { limit: 1 });
+  assert(inbox.emails.length > 0, 'inbox should have at least one email to reply to');
+  const uid = inbox.emails[0].uid;
+  const result = callTool('reply_to_email', {
+    uid,
+    body: 'Automated test reply from the iCloud MCP server test suite.',
+    mailbox: 'INBOX'
+  });
+  assert(result.sent === true, 'sent should be true');
+  assert(typeof result.messageId === 'string', 'messageId should be a string');
+  assert(result.messageId.length > 0, 'messageId should not be empty');
+  assert(Array.isArray(result.accepted), 'accepted should be an array');
+  assert(result.accepted.length > 0, 'should have at least one accepted recipient');
+  assert('inReplyTo' in result, 'result should have inReplyTo field');
+  console.log(`\n     → reply sent, inReplyTo: ${result.inReplyTo?.slice(0, 40) ?? '(none)'}`);
+});
+
+test('reply_to_email (replyAll: true)', () => {
+  // Fetch several emails and skip system/bounce addresses (mailer-daemon, postmaster)
+  // which iCloud SMTP rejects when used as reply-all recipients
+  const inbox = callTool('read_inbox', { limit: 10 });
+  assert(inbox.emails.length > 0, 'inbox should have at least one email');
+  // Also skip self-sent emails — reply-all filters out IMAP_USER from recipients → empty list
+  const suitable = inbox.emails.find(e =>
+    e.from &&
+    !/mailer-daemon|postmaster/i.test(e.from) &&
+    !e.from.includes(IMAP_USER)
+  );
+  if (!suitable) {
+    console.log(`\n     → no suitable (non-system) email found in first 10 — skipping`);
+    return;
+  }
+  const result = callTool('reply_to_email', {
+    uid: suitable.uid,
+    body: 'Automated test reply-all from the iCloud MCP server test suite.',
+    replyAll: true
+  });
+  assert(result.sent === true, 'sent should be true');
+  assert(typeof result.messageId === 'string', 'messageId should be a string');
+  assert('inReplyTo' in result, 'result should have inReplyTo field');
+  console.log(`\n     → reply-all sent to uid ${suitable.uid}, messageId: ${result.messageId?.slice(0, 40)}...`);
+});
+
+test('forward_email', () => {
+  const inbox = callTool('read_inbox', { limit: 1 });
+  assert(inbox.emails.length > 0, 'inbox should have at least one email to forward');
+  const uid = inbox.emails[0].uid;
+  const result = callTool('forward_email', {
+    uid,
+    to: IMAP_USER,
+    note: 'Forwarded as part of automated iCloud MCP server test.'
+  });
+  assert(result.sent === true, 'sent should be true');
+  assert(typeof result.messageId === 'string', 'messageId should be a string');
+  assert(result.messageId.length > 0, 'messageId should not be empty');
+  assert(Array.isArray(result.accepted), 'accepted should be an array');
+  assert(result.accepted.length > 0, 'should have at least one accepted recipient');
+  console.log(`\n     → forwarded to ${result.accepted[0]}, messageId: ${result.messageId?.slice(0, 40)}...`);
+});
+
+test('save_draft (plain text)', () => {
+  const subject = `[mcp-test-draft-${SMTP_TS}]`;
+  const summaryBefore = callTool('get_mailbox_summary', { mailbox: 'Drafts' });
+
+  const result = callTool('save_draft', {
+    to: IMAP_USER,
+    subject,
+    body: 'Automated test draft from the iCloud MCP server test suite.'
+  });
+  assert(result.saved === true, 'saved should be true');
+  assert(typeof result.mailbox === 'string', 'mailbox should be a string');
+  assert(result.mailbox.length > 0, 'mailbox should not be empty');
+  assert(result.subject === subject, `subject should match: ${result.subject}`);
+  assert(typeof result.to === 'string', 'to should be a string');
+
+  // Verify Drafts count increased by 1
+  const summaryAfter = callTool('get_mailbox_summary', { mailbox: result.mailbox });
+  assert(
+    summaryAfter.total === summaryBefore.total + 1,
+    `Drafts count should be ${summaryBefore.total + 1}, got ${summaryAfter.total}`
+  );
+
+  console.log(`\n     → draft saved to ${result.mailbox} — inspect manually in Mail.app`);
+});
+
+test('save_draft (with cc and bcc)', () => {
+  const subject = `[mcp-test-draft-cc-${SMTP_TS}]`;
+  const summaryBefore = callTool('get_mailbox_summary', { mailbox: 'Drafts' });
+
+  const result = callTool('save_draft', {
+    to: IMAP_USER,
+    subject,
+    body: 'Test draft with cc and bcc.',
+    cc: IMAP_USER,
+    bcc: IMAP_USER
+  });
+  assert(result.saved === true, 'saved should be true');
+  assert(typeof result.mailbox === 'string', 'mailbox should be a string');
+
+  // Verify Drafts count increased
+  const summaryAfter = callTool('get_mailbox_summary', { mailbox: result.mailbox });
+  assert(
+    summaryAfter.total === summaryBefore.total + 1,
+    `Drafts count should be ${summaryBefore.total + 1}, got ${summaryAfter.total}`
+  );
+
+  console.log(`\n     → draft with cc/bcc saved to ${result.mailbox} — inspect manually in Mail.app`);
+});
+
+test('save_draft (HTML formatted)', () => {
+  const subject = `[mcp-test-draft-html-${SMTP_TS}] Q1 Summary`;
+  const summaryBefore = callTool('get_mailbox_summary', { mailbox: 'Drafts' });
+
+  const html = `
+<h2>Q1 Summary Report</h2>
+<p>Hello team,</p>
+<p>Here are the highlights from Q1:</p>
+<ul>
+  <li><strong>Revenue:</strong> Up 18% year-over-year</li>
+  <li><strong>New users:</strong> 4,200 signups</li>
+  <li><strong>Churn rate:</strong> Down to 2.1%</li>
+</ul>
+<h3>Key Metrics</h3>
+<table>
+  <tr><th>Metric</th><th>Q4</th><th>Q1</th></tr>
+  <tr><td>MRR</td><td>$82k</td><td>$97k</td></tr>
+  <tr><td>DAU</td><td>12,400</td><td>15,800</td></tr>
+  <tr><td>NPS</td><td>41</td><td>53</td></tr>
+</table>
+<p>Full report attached. Let me know if you have questions.</p>
+<p>Regards,<br>Adam</p>
+`.trim();
+
+  const result = callTool('save_draft', {
+    to: IMAP_USER,
+    subject,
+    html
+  });
+  assert(result.saved === true, 'saved should be true');
+  assert(typeof result.mailbox === 'string', 'mailbox should be a string');
+  assert(result.subject === subject, `subject should match: ${result.subject}`);
+
+  // Verify Drafts count increased
+  const summaryAfter = callTool('get_mailbox_summary', { mailbox: result.mailbox });
+  assert(
+    summaryAfter.total === summaryBefore.total + 1,
+    `Drafts count should be ${summaryBefore.total + 1}, got ${summaryAfter.total}`
+  );
+
+  console.log(`\n     → HTML draft saved to ${result.mailbox} — inspect in Mail.app to verify rich formatting`);
 });
 
 // ─── Destructive (skipped) ────────────────────────────────────────────────────
