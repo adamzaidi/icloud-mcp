@@ -19,6 +19,9 @@ import {
 } from './lib/imap.js';
 import { logRead, logWrite, logClear } from './lib/session.js';
 import { composeEmail, replyToEmail, forwardEmail, saveDraft } from './lib/smtp.js';
+import { listContacts, searchContacts, getContact, createContact, updateContact, deleteContact } from './lib/carddav.js';
+import { formatEmailForExtraction } from './lib/event-extractor.js';
+import { listCalendars, listEvents, getEvent, createEvent, updateEvent, deleteEvent, searchEvents } from './lib/caldav.js';
 
 const IMAP_USER = process.env.IMAP_USER;
 const IMAP_PASSWORD = process.env.IMAP_PASSWORD;
@@ -36,7 +39,7 @@ if (!IMAP_USER || !IMAP_PASSWORD) {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '2.1.0' },
+    { name: 'icloud-mail', version: '2.3.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -673,6 +676,208 @@ async function main() {
           },
           required: ['to', 'subject']
         }
+      },
+      // ── CardDAV / Contacts ──
+      {
+        name: 'list_contacts',
+        description: 'List contacts from iCloud Contacts. Returns names, phones, emails, and other fields.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            limit: { type: 'number', description: 'Max contacts to return (default 50)' },
+            offset: { type: 'number', description: 'Skip this many contacts (default 0, for pagination)' }
+          }
+        }
+      },
+      {
+        name: 'search_contacts',
+        description: 'Search iCloud Contacts by name, email address, or phone number.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Text to search for (matched against name, email, and phone)' }
+          },
+          required: ['query']
+        }
+      },
+      {
+        name: 'get_contact',
+        description: 'Get full details for a specific contact by ID. Use list_contacts or search_contacts to find a contactId.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            contactId: { type: 'string', description: 'Contact ID (UUID from list_contacts or search_contacts)' }
+          },
+          required: ['contactId']
+        }
+      },
+      {
+        name: 'create_contact',
+        description: 'Create a new contact in iCloud Contacts.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            firstName: { type: 'string', description: 'First name' },
+            lastName: { type: 'string', description: 'Last name' },
+            fullName: { type: 'string', description: 'Full display name (overrides firstName + lastName for FN field)' },
+            org: { type: 'string', description: 'Organization / company name' },
+            phone: { type: 'string', description: 'Primary phone number (shorthand for phones array)' },
+            email: { type: 'string', description: 'Primary email address (shorthand for emails array)' },
+            phones: { type: 'array', description: 'Array of phone objects: [{ number, type }] where type is cell/home/work/etc.' },
+            emails: { type: 'array', description: 'Array of email objects: [{ email, type }] where type is home/work/etc.' },
+            addresses: { type: 'array', description: 'Array of address objects: [{ street, city, state, zip, country, type }]' },
+            birthday: { type: 'string', description: 'Birthday in YYYY-MM-DD format' },
+            note: { type: 'string', description: 'Notes / free text' },
+            url: { type: 'string', description: 'Website URL' }
+          }
+        }
+      },
+      {
+        name: 'update_contact',
+        description: 'Update an existing contact in iCloud Contacts. Only provided fields are changed; others are preserved.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            contactId: { type: 'string', description: 'Contact ID to update' },
+            firstName: { type: 'string' },
+            lastName: { type: 'string' },
+            fullName: { type: 'string' },
+            org: { type: 'string' },
+            phone: { type: 'string' },
+            email: { type: 'string' },
+            phones: { type: 'array' },
+            emails: { type: 'array' },
+            addresses: { type: 'array' },
+            birthday: { type: 'string' },
+            note: { type: 'string' },
+            url: { type: 'string' }
+          },
+          required: ['contactId']
+        }
+      },
+      {
+        name: 'delete_contact',
+        description: 'Delete a contact from iCloud Contacts permanently.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            contactId: { type: 'string', description: 'Contact ID to delete' }
+          },
+          required: ['contactId']
+        }
+      },
+      // ── CalDAV / Calendar ──
+      {
+        name: 'list_calendars',
+        description: 'List all calendars in iCloud Calendar (e.g. Personal, Work, LSAT PREP). Returns calendarId, name, and supported event types.',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'list_events',
+        description: 'List events in a specific iCloud calendar within a date range. Use list_calendars first to get a calendarId.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            calendarId: { type: 'string', description: 'Calendar ID from list_calendars' },
+            since: { type: 'string', description: 'Start of range (YYYY-MM-DD, default: 30 days ago)' },
+            before: { type: 'string', description: 'End of range (YYYY-MM-DD, default: 30 days ahead)' },
+            limit: { type: 'number', description: 'Max events to return (default 50)' }
+          },
+          required: ['calendarId']
+        }
+      },
+      {
+        name: 'get_event',
+        description: 'Get full details of a specific calendar event by its ID.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            calendarId: { type: 'string', description: 'Calendar ID containing the event' },
+            eventId: { type: 'string', description: 'Event ID (UUID from list_events or search_events)' }
+          },
+          required: ['calendarId', 'eventId']
+        }
+      },
+      {
+        name: 'create_event',
+        description: 'Create a new event in an iCloud calendar. For all-day events use allDay:true and YYYY-MM-DD for start/end.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            calendarId: { type: 'string', description: 'Calendar ID to add the event to' },
+            summary: { type: 'string', description: 'Event title' },
+            start: { type: 'string', description: 'Start date/time — ISO 8601 (e.g. 2026-03-15T10:00:00) or YYYY-MM-DD for all-day' },
+            end: { type: 'string', description: 'End date/time — ISO 8601 or YYYY-MM-DD. Defaults to 1 hour after start.' },
+            timezone: { type: 'string', description: 'IANA timezone (e.g. America/New_York). Use "UTC" or omit for UTC.' },
+            allDay: { type: 'boolean', description: 'True for all-day event (uses DATE values, no time)' },
+            description: { type: 'string', description: 'Event description / notes' },
+            location: { type: 'string', description: 'Event location' },
+            recurrence: { type: 'string', description: 'iCal RRULE string (e.g. FREQ=WEEKLY;BYDAY=MO,WE,FR)' },
+            status: { type: 'string', description: 'Event status: CONFIRMED, TENTATIVE, or CANCELLED' },
+            reminder: { type: 'number', description: 'Alert this many minutes before the event (default 30, set to 0 to disable)' }
+          },
+          required: ['calendarId', 'summary', 'start']
+        }
+      },
+      {
+        name: 'update_event',
+        description: 'Update an existing calendar event. Only provided fields are changed; others are preserved.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            calendarId: { type: 'string', description: 'Calendar ID containing the event' },
+            eventId: { type: 'string', description: 'Event ID to update' },
+            summary: { type: 'string' },
+            start: { type: 'string' },
+            end: { type: 'string' },
+            timezone: { type: 'string' },
+            allDay: { type: 'boolean' },
+            description: { type: 'string' },
+            location: { type: 'string' },
+            recurrence: { type: 'string' },
+            status: { type: 'string' },
+            reminder: { type: 'number', description: 'Alert minutes before event (0 to disable)' }
+          },
+          required: ['calendarId', 'eventId']
+        }
+      },
+      {
+        name: 'delete_event',
+        description: 'Delete a calendar event permanently from iCloud Calendar.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            calendarId: { type: 'string', description: 'Calendar ID containing the event' },
+            eventId: { type: 'string', description: 'Event ID to delete' }
+          },
+          required: ['calendarId', 'eventId']
+        }
+      },
+      {
+        name: 'search_events',
+        description: 'Search for events by title/summary across all calendars within an optional date range.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Text to search for in event titles' },
+            since: { type: 'string', description: 'Start of search range (YYYY-MM-DD, default: 1 year ago)' },
+            before: { type: 'string', description: 'End of search range (YYYY-MM-DD, default: 1 year ahead)' }
+          },
+          required: ['query']
+        }
+      },
+      // ── Smart extraction ──
+      {
+        name: 'suggest_event_from_email',
+        description: 'Fetch an email and return its content formatted for calendar event extraction. After calling this tool, extract the event fields from the returned content (pay attention to _dateAnchor for resolving relative dates like "Tuesday"), present a summary to the user for confirmation, then call create_event. No API key required.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            uid: { type: 'number', description: 'Email UID to extract event from' },
+            mailbox: { type: 'string', description: 'Mailbox containing the email (default INBOX)' }
+          },
+          required: ['uid']
+        }
       }
     ]
   }));
@@ -815,6 +1020,70 @@ async function main() {
         result = await withTimeout('save_draft', TIMEOUT.FETCH, () =>
           saveDraft(args.to, args.subject, args.body, { html: args.html, cc: args.cc, bcc: args.bcc })
         );
+      // ── CardDAV / Contacts (FETCH tier 30s) ──
+      } else if (name === 'list_contacts') {
+        result = await withTimeout('list_contacts', TIMEOUT.FETCH, () =>
+          listContacts(args.limit || 50, args.offset || 0)
+        );
+      } else if (name === 'search_contacts') {
+        result = await withTimeout('search_contacts', TIMEOUT.FETCH, () =>
+          searchContacts(args.query)
+        );
+      } else if (name === 'get_contact') {
+        result = await withTimeout('get_contact', TIMEOUT.FETCH, () =>
+          getContact(args.contactId)
+        );
+      } else if (name === 'create_contact') {
+        const { contactId: _ignore, ...fields } = args;
+        result = await withTimeout('create_contact', TIMEOUT.FETCH, () =>
+          createContact(fields)
+        );
+      } else if (name === 'update_contact') {
+        const { contactId, ...fields } = args;
+        result = await withTimeout('update_contact', TIMEOUT.FETCH, () =>
+          updateContact(contactId, fields)
+        );
+      } else if (name === 'delete_contact') {
+        result = await withTimeout('delete_contact', TIMEOUT.SINGLE, () =>
+          deleteContact(args.contactId)
+        );
+      // ── CalDAV / Calendar (FETCH tier 30s) ──
+      } else if (name === 'list_calendars') {
+        result = await withTimeout('list_calendars', TIMEOUT.FETCH, () =>
+          listCalendars()
+        );
+      } else if (name === 'list_events') {
+        result = await withTimeout('list_events', TIMEOUT.FETCH, () =>
+          listEvents(args.calendarId, args.since || null, args.before || null, args.limit || 50)
+        );
+      } else if (name === 'get_event') {
+        result = await withTimeout('get_event', TIMEOUT.FETCH, () =>
+          getEvent(args.calendarId, args.eventId)
+        );
+      } else if (name === 'create_event') {
+        const { calendarId, ...fields } = args;
+        result = await withTimeout('create_event', TIMEOUT.FETCH, () =>
+          createEvent(calendarId, fields)
+        );
+      } else if (name === 'update_event') {
+        const { calendarId, eventId, ...fields } = args;
+        result = await withTimeout('update_event', TIMEOUT.FETCH, () =>
+          updateEvent(calendarId, eventId, fields)
+        );
+      } else if (name === 'delete_event') {
+        result = await withTimeout('delete_event', TIMEOUT.SINGLE, () =>
+          deleteEvent(args.calendarId, args.eventId)
+        );
+      } else if (name === 'search_events') {
+        result = await withTimeout('search_events', TIMEOUT.FETCH, () =>
+          searchEvents(args.query, args.since || null, args.before || null)
+        );
+      // ── Smart extraction (SCAN tier 60s — LLM round-trip) ──
+      } else if (name === 'suggest_event_from_email') {
+        const email = await withTimeout('get_email_for_extraction', TIMEOUT.FETCH, () =>
+          getEmailContent(args.uid, args.mailbox || 'INBOX', 10000, false)
+        );
+        result = formatEmailForExtraction(email);
       } else {
         throw new Error(`Unknown tool: ${name}`);
       }

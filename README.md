@@ -1,6 +1,6 @@
 # icloud-mcp
 
-A Model Context Protocol (MCP) server that connects Claude to your iCloud Mail account. Read, search, organize, send, and automate your inbox directly through Claude.
+A Model Context Protocol (MCP) server that connects Claude to your iCloud account — Mail, Contacts, and Calendar. Read, search, organize, send, and automate across the full iCloud suite.
 
 ## Features
 
@@ -21,6 +21,8 @@ A Model Context Protocol (MCP) server that connects Claude to your iCloud Mail a
 - 🔄 Dry run mode for bulk operations — preview before committing
 - 🔐 Safe move — emails are fingerprinted and verified in the destination before removal from source
 - 📝 Session logging — Claude tracks progress across long multi-step operations
+- 👤 Contacts — list, search, create, update, and delete iCloud Contacts via CardDAV
+- 📅 Calendar — list calendars, query events by date, create/update/delete events via CalDAV
 
 ## Prerequisites
 
@@ -161,7 +163,7 @@ You're all set. Try asking Claude:
 - *"Show me the top senders in my iCloud inbox"*
 - *"How many unread emails do I have?"*
 
-## Available Tools (55)
+## Available Tools (65)
 
 ### Read & Search
 
@@ -247,6 +249,29 @@ You're all set. Try asking Claude:
 | `run_all_rules` | Run all saved rules in sequence; supports `dryRun` |
 | `delete_rule` | Delete a saved rule by name |
 
+### Contacts (CardDAV)
+
+| Tool | Description |
+|------|-------------|
+| `list_contacts` | List contacts from iCloud Contacts; supports `limit`, `offset` for pagination |
+| `search_contacts` | Search contacts by name, email, or phone number |
+| `get_contact` | Get full details for a specific contact by ID |
+| `create_contact` | Create a new contact; supports name, phones, emails, address, org, birthday, note |
+| `update_contact` | Update an existing contact; only provided fields are changed |
+| `delete_contact` | Permanently delete a contact |
+
+### Calendar (CalDAV)
+
+| Tool | Description |
+|------|-------------|
+| `list_calendars` | List all iCloud calendars with name, ID, and supported event types |
+| `list_events` | List events in a calendar within a date range; supports `since`, `before`, `limit` |
+| `get_event` | Get full details of a specific event by ID |
+| `create_event` | Create a new event; supports title, start/end, timezone, all-day, description, location, recurrence |
+| `update_event` | Update an existing event; only provided fields are changed |
+| `delete_event` | Permanently delete a calendar event |
+| `search_events` | Search for events by title across all calendars; supports date range |
+
 ### Session Log
 
 | Tool | Description |
@@ -299,6 +324,11 @@ Once configured, you can ask Claude things like:
 - *"Create a rule that moves all emails from spotify.com to bulk-mail/services"*
 - *"Reply to the last email from John and cc Sarah"*
 - *"Draft a follow-up email to the team about the Q1 report"*
+- *"Find John Smith's phone number in my contacts"*
+- *"Add a new contact: Jane Doe, jane@example.com, +1 555 123 4567"*
+- *"What's on my calendar next week?"*
+- *"Create an event: dentist appointment Monday at 10am Eastern"*
+- *"Find all my calendar events about 'team meeting'"*
 
 ## Security
 

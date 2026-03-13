@@ -3,3 +3,7 @@ node_modules/
 CLAUDE.md
 tests/
 .mcp.json
+EMAIL_REORGANIZATION_PLAN.md
+probe-*.js
+csv/
+scripts/
