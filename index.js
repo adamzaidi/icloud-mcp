@@ -20,6 +20,7 @@ import {
 import { logRead, logWrite, logClear } from './lib/session.js';
 import { composeEmail, replyToEmail, forwardEmail, saveDraft } from './lib/smtp.js';
 import { listContacts, searchContacts, getContact, createContact, updateContact, deleteContact } from './lib/carddav.js';
+import { getDigestState, updateDigestState } from './lib/digest.js';
 import { formatEmailForExtraction } from './lib/event-extractor.js';
 import { listCalendars, listEvents, getEvent, createEvent, updateEvent, deleteEvent, searchEvents } from './lib/caldav.js';
 
@@ -39,7 +40,7 @@ if (!IMAP_USER || !IMAP_PASSWORD) {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '2.3.0' },
+    { name: 'icloud-mail', version: '2.4.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -677,6 +678,25 @@ async function main() {
           required: ['to', 'subject']
         }
       },
+      // ── Digest State ──
+      {
+        name: 'get_digest_state',
+        description: 'Get the current inbox digest state — last run timestamp, processed email UIDs (to skip on next run), pending actions, and per-sender skip counts for smart unsubscribe.',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'update_digest_state',
+        description: 'Update the digest state after a run. Merges new processed UIDs into the existing list, updates lastRun, replaces pendingActions, and accumulates per-sender skip counts.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            lastRun: { type: 'string', description: 'ISO timestamp of this run' },
+            processedUids: { type: 'array', items: { type: 'number' }, description: 'Email UIDs processed in this run — merged with existing and capped at 5000' },
+            pendingActions: { type: 'array', description: 'Full replacement list of pending action items to track across runs (deadlines, waiting-for-reply, etc.). Each item: { type, subject, to/from, dueDate?, notes? }' },
+            skipCounts: { type: 'object', description: 'Map of sender address to skip count increment for this run, e.g. { "bestbuy@email.bestbuy.com": 3 }. Accumulated across runs for smart unsubscribe.' }
+          }
+        }
+      },
       // ── CardDAV / Contacts ──
       {
         name: 'list_contacts',
@@ -986,6 +1006,16 @@ async function main() {
         result = logRead();
       } else if (name === 'log_clear') {
         result = logClear();
+      // ── Digest state (synchronous, no timeout needed) ──
+      } else if (name === 'get_digest_state') {
+        result = getDigestState();
+      } else if (name === 'update_digest_state') {
+        result = updateDigestState({
+          lastRun: args.lastRun,
+          processedUids: args.processedUids,
+          pendingActions: args.pendingActions,
+          skipCounts: args.skipCounts
+        });
       // ── Saved rules (synchronous CRUD; run_rule/run_all_rules use internal chunk timeouts) ──
       } else if (name === 'create_rule') {
         result = createRule(args.name, args.filters || {}, args.action, args.description || '');
