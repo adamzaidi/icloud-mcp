@@ -7,3 +7,7 @@ EMAIL_REORGANIZATION_PLAN.md
 probe-*.js
 csv/
 scripts/
+INBOX_INTELLIGENCE.md
+DIGEST_PROMPT.md
+logs/
+*.plist
