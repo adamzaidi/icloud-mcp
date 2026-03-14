@@ -36,11 +36,59 @@ if (!IMAP_USER || !IMAP_PASSWORD) {
   }
 }
 
+// ─── Multi-account support ────────────────────────────────────────────────────
+// Configure additional accounts via numbered env vars:
+//   IMAP_ACCOUNT_1_USER, IMAP_ACCOUNT_1_PASSWORD, IMAP_ACCOUNT_1_HOST,
+//   IMAP_ACCOUNT_1_SMTP_HOST, IMAP_ACCOUNT_1_NAME
+// Falls back to IMAP_USER / IMAP_PASSWORD (iCloud) when no numbered accounts set.
+
+function parseAccounts() {
+  const accounts = {};
+  for (let i = 1; i <= 10; i++) {
+    const user = process.env[`IMAP_ACCOUNT_${i}_USER`];
+    const pass = process.env[`IMAP_ACCOUNT_${i}_PASSWORD`];
+    if (!user || !pass) continue;
+    const host     = process.env[`IMAP_ACCOUNT_${i}_HOST`]      || 'imap.mail.me.com';
+    const smtpHost = process.env[`IMAP_ACCOUNT_${i}_SMTP_HOST`] || 'smtp.mail.me.com';
+    const name     = process.env[`IMAP_ACCOUNT_${i}_NAME`]      || `account${i}`;
+    accounts[name] = { user, pass, host, smtpHost };
+  }
+  // Legacy fallback — single iCloud account via IMAP_USER / IMAP_PASSWORD
+  if (Object.keys(accounts).length === 0 && IMAP_USER) {
+    accounts['icloud'] = { user: IMAP_USER, pass: IMAP_PASSWORD, host: 'imap.mail.me.com', smtpHost: 'smtp.mail.me.com' };
+  }
+  return accounts;
+}
+
+const ACCOUNTS = parseAccounts();
+const DEFAULT_ACCOUNT = Object.keys(ACCOUNTS)[0] || 'icloud';
+
+function resolveCreds(account) {
+  const name = account || DEFAULT_ACCOUNT;
+  const creds = ACCOUNTS[name];
+  if (!creds) throw new Error(`Account '${name}' not configured. Available: ${Object.keys(ACCOUNTS).join(', ') || 'none'}`);
+  return creds;
+}
+
+// Gmail uses different folder names than iCloud for system folders.
+const GMAIL_MAILBOX_MAP = {
+  'Sent Messages':   '[Gmail]/Sent Mail',
+  'Archive':         '[Gmail]/All Mail',
+  'Deleted Messages':'[Gmail]/Trash',
+  'Junk':            '[Gmail]/Spam',
+  'Drafts':          '[Gmail]/Drafts',
+};
+
+function resolveMailbox(name, creds) {
+  if (!name || creds?.host !== 'imap.gmail.com') return name;
+  return GMAIL_MAILBOX_MAP[name] || name;
+}
+
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '2.4.0' },
+    { name: 'icloud-mail', version: '2.5.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -54,15 +102,22 @@ async function main() {
     flagged: { type: 'boolean', description: 'True for flagged only, false for unflagged only' },
     larger: { type: 'number', description: 'Only emails larger than this size in KB' },
     smaller: { type: 'number', description: 'Only emails smaller than this size in KB' },
-    hasAttachment: { type: 'boolean', description: 'Only emails with attachments (client-side BODYSTRUCTURE scan — must be combined with other filters that narrow results to under 500 emails first)' }
+    hasAttachment: { type: 'boolean', description: 'Only emails with attachments (client-side BODYSTRUCTURE scan — must be combined with other filters that narrow results to under 500 emails first)' },
+    account: { type: 'string', description: "Account name to use (e.g. 'icloud', 'gmail'). Defaults to first configured account. Use list_accounts to see available accounts." }
   };
+  const accountSchema = filtersSchema.account;
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       {
+        name: 'list_accounts',
+        description: 'List all configured email accounts (names and IMAP hosts). Use the account name in any mail tool\'s account parameter.',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
         name: 'get_inbox_summary',
         description: 'Get a summary of a mailbox including total, unread, and recent email counts',
-        inputSchema: { type: 'object', properties: { mailbox: { type: 'string', description: 'Mailbox name (default INBOX)' } } }
+        inputSchema: { type: 'object', properties: { mailbox: { type: 'string', description: 'Mailbox name (default INBOX)' }, account: accountSchema } }
       },
       {
         name: 'get_mailbox_summary',
@@ -906,94 +961,134 @@ async function main() {
     const { name, arguments: args } = request.params;
     try {
       let result;
+      // ── Account listing (no creds needed) ──
+      if (name === 'list_accounts') {
+        result = Object.entries(ACCOUNTS).map(([n, c]) => ({ name: n, host: c.host, smtpHost: c.smtpHost }));
       // ── Metadata tier (15s) ──
-      if (name === 'get_inbox_summary') {
-        result = await withTimeout('get_inbox_summary', TIMEOUT.METADATA, () => getInboxSummary(args.mailbox || 'INBOX'));
+      } else if (name === 'get_inbox_summary') {
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('get_inbox_summary', TIMEOUT.METADATA, () => getInboxSummary(args.mailbox || 'INBOX', creds));
       } else if (name === 'get_mailbox_summary') {
-        result = await withTimeout('get_mailbox_summary', TIMEOUT.METADATA, () => getMailboxSummary(args.mailbox));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('get_mailbox_summary', TIMEOUT.METADATA, () => getMailboxSummary(resolveMailbox(args.mailbox, creds), creds));
       } else if (name === 'count_emails') {
-        const { mailbox, ...filters } = args;
-        result = await withTimeout('count_emails', TIMEOUT.METADATA, () => countEmails(filters, mailbox || 'INBOX'));
+        const { mailbox, account, ...filters } = args;
+        const creds = resolveCreds(account);
+        result = await withTimeout('count_emails', TIMEOUT.METADATA, () => countEmails(filters, mailbox || 'INBOX', creds));
       } else if (name === 'list_mailboxes') {
-        result = await withTimeout('list_mailboxes', TIMEOUT.METADATA, () => listMailboxes());
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('list_mailboxes', TIMEOUT.METADATA, () => listMailboxes(creds));
       } else if (name === 'create_mailbox') {
-        result = await withTimeout('create_mailbox', TIMEOUT.METADATA, () => createMailbox(args.name));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('create_mailbox', TIMEOUT.METADATA, () => createMailbox(args.name, creds));
       } else if (name === 'rename_mailbox') {
-        result = await renameMailbox(args.oldName, args.newName); // already has its own 15s timeout
+        const creds = resolveCreds(args.account);
+        result = await renameMailbox(args.oldName, args.newName, creds); // already has its own 15s timeout
       } else if (name === 'delete_mailbox') {
-        result = await deleteMailbox(args.name); // already has its own 15s timeout
+        const creds = resolveCreds(args.account);
+        result = await deleteMailbox(args.name, creds); // already has its own 15s timeout
       // ── Fetch tier (30s) ──
       } else if (name === 'read_inbox') {
-        result = await withTimeout('read_inbox', TIMEOUT.FETCH, () => fetchEmails(args.mailbox || 'INBOX', args.limit || 10, args.onlyUnread || false, args.page || 1));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('read_inbox', TIMEOUT.FETCH, () => fetchEmails(args.mailbox || 'INBOX', args.limit || 10, args.onlyUnread || false, args.page || 1, creds));
       } else if (name === 'get_email') {
-        result = await withTimeout('get_email', TIMEOUT.FETCH, () => getEmailContent(args.uid, args.mailbox || 'INBOX', args.maxChars || 8000, args.includeHeaders || false));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('get_email', TIMEOUT.FETCH, () => getEmailContent(args.uid, args.mailbox || 'INBOX', args.maxChars || 8000, args.includeHeaders || false, creds));
       } else if (name === 'list_attachments') {
-        result = await withTimeout('list_attachments', TIMEOUT.FETCH, () => listAttachments(args.uid, args.mailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('list_attachments', TIMEOUT.FETCH, () => listAttachments(args.uid, args.mailbox || 'INBOX', creds));
       } else if (name === 'get_attachment') {
-        result = await withTimeout('get_attachment', TIMEOUT.FETCH, () => getAttachment(args.uid, args.partId, args.mailbox || 'INBOX', args.offset ?? null, args.length ?? null));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('get_attachment', TIMEOUT.FETCH, () => getAttachment(args.uid, args.partId, args.mailbox || 'INBOX', args.offset ?? null, args.length ?? null, creds));
       } else if (name === 'get_unsubscribe_info') {
-        result = await withTimeout('get_unsubscribe_info', TIMEOUT.FETCH, () => getUnsubscribeInfo(args.uid, args.mailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('get_unsubscribe_info', TIMEOUT.FETCH, () => getUnsubscribeInfo(args.uid, args.mailbox || 'INBOX', creds));
       } else if (name === 'get_email_raw') {
-        result = await withTimeout('get_email_raw', TIMEOUT.FETCH, () => getEmailRaw(args.uid, args.mailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('get_email_raw', TIMEOUT.FETCH, () => getEmailRaw(args.uid, args.mailbox || 'INBOX', creds));
       } else if (name === 'get_thread') {
-        result = await withTimeout('get_thread', TIMEOUT.FETCH, () => getThread(args.uid, args.mailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('get_thread', TIMEOUT.FETCH, () => getThread(args.uid, args.mailbox || 'INBOX', creds));
       } else if (name === 'search_emails') {
-        const { query, mailbox, limit, queryMode, subjectQuery, bodyQuery, fromQuery, includeSnippet, ...filters } = args;
-        result = await withTimeout('search_emails', TIMEOUT.FETCH, () => searchEmails(query, mailbox || 'INBOX', limit || 10, filters, { queryMode, subjectQuery, bodyQuery, fromQuery, includeSnippet }));
+        const { query, mailbox, limit, queryMode, subjectQuery, bodyQuery, fromQuery, includeSnippet, account, ...filters } = args;
+        const creds = resolveCreds(account);
+        result = await withTimeout('search_emails', TIMEOUT.FETCH, () => searchEmails(query, mailbox || 'INBOX', limit || 10, filters, { queryMode, subjectQuery, bodyQuery, fromQuery, includeSnippet }, creds));
       } else if (name === 'get_emails_by_sender') {
-        result = await withTimeout('get_emails_by_sender', TIMEOUT.FETCH, () => getEmailsBySender(args.sender, args.mailbox || 'INBOX', args.limit || 10));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('get_emails_by_sender', TIMEOUT.FETCH, () => getEmailsBySender(args.sender, args.mailbox || 'INBOX', args.limit || 10, creds));
       } else if (name === 'get_emails_by_date_range') {
-        result = await withTimeout('get_emails_by_date_range', TIMEOUT.FETCH, () => getEmailsByDateRange(args.startDate, args.endDate, args.mailbox || 'INBOX', args.limit || 10));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('get_emails_by_date_range', TIMEOUT.FETCH, () => getEmailsByDateRange(args.startDate, args.endDate, args.mailbox || 'INBOX', args.limit || 10, creds));
       // ── Scan tier (60s) ──
       } else if (name === 'get_top_senders') {
-        result = await withTimeout('get_top_senders', TIMEOUT.SCAN, () => getTopSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('get_top_senders', TIMEOUT.SCAN, () => getTopSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20, creds));
       } else if (name === 'get_unread_senders') {
-        result = await withTimeout('get_unread_senders', TIMEOUT.SCAN, () => getUnreadSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('get_unread_senders', TIMEOUT.SCAN, () => getUnreadSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20, creds));
       } else if (name === 'get_storage_report') {
-        result = await withTimeout('get_storage_report', TIMEOUT.SCAN, () => getStorageReport(args.mailbox || 'INBOX', args.sampleSize || 100));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('get_storage_report', TIMEOUT.SCAN, () => getStorageReport(args.mailbox || 'INBOX', args.sampleSize || 100, creds));
       // ── Bulk operation tier (60s) ──
       } else if (name === 'bulk_delete_by_sender') {
-        result = await withTimeout('bulk_delete_by_sender', TIMEOUT.BULK_OP, () => bulkDeleteBySender(args.sender, args.mailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('bulk_delete_by_sender', TIMEOUT.BULK_OP, () => bulkDeleteBySender(args.sender, args.mailbox || 'INBOX', creds));
       } else if (name === 'bulk_delete_by_subject') {
-        result = await withTimeout('bulk_delete_by_subject', TIMEOUT.BULK_OP, () => bulkDeleteBySubject(args.subject, args.mailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('bulk_delete_by_subject', TIMEOUT.BULK_OP, () => bulkDeleteBySubject(args.subject, args.mailbox || 'INBOX', creds));
       } else if (name === 'bulk_mark_read') {
-        result = await withTimeout('bulk_mark_read', TIMEOUT.BULK_OP, () => bulkMarkRead(args.mailbox || 'INBOX', args.sender || null));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('bulk_mark_read', TIMEOUT.BULK_OP, () => bulkMarkRead(args.mailbox || 'INBOX', args.sender || null, creds));
       } else if (name === 'bulk_mark_unread') {
-        result = await withTimeout('bulk_mark_unread', TIMEOUT.BULK_OP, () => bulkMarkUnread(args.mailbox || 'INBOX', args.sender || null));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('bulk_mark_unread', TIMEOUT.BULK_OP, () => bulkMarkUnread(args.mailbox || 'INBOX', args.sender || null, creds));
       } else if (name === 'bulk_flag') {
-        const { flagged, mailbox, ...filters } = args;
-        result = await withTimeout('bulk_flag', TIMEOUT.BULK_OP, () => bulkFlag(filters, flagged, mailbox || 'INBOX'));
+        const { flagged, mailbox, account, ...filters } = args;
+        const creds = resolveCreds(account);
+        result = await withTimeout('bulk_flag', TIMEOUT.BULK_OP, () => bulkFlag(filters, flagged, mailbox || 'INBOX', creds));
       } else if (name === 'mark_older_than_read') {
-        result = await withTimeout('mark_older_than_read', TIMEOUT.BULK_OP, () => markOlderThanRead(args.days, args.mailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('mark_older_than_read', TIMEOUT.BULK_OP, () => markOlderThanRead(args.days, args.mailbox || 'INBOX', creds));
       } else if (name === 'bulk_flag_by_sender') {
-        result = await withTimeout('bulk_flag_by_sender', TIMEOUT.BULK_OP, () => bulkFlagBySender(args.sender, args.flagged, args.mailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('bulk_flag_by_sender', TIMEOUT.BULK_OP, () => bulkFlagBySender(args.sender, args.flagged, args.mailbox || 'INBOX', creds));
       } else if (name === 'delete_older_than') {
-        result = await withTimeout('delete_older_than', TIMEOUT.BULK_OP, () => deleteOlderThan(args.days, args.mailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('delete_older_than', TIMEOUT.BULK_OP, () => deleteOlderThan(args.days, args.mailbox || 'INBOX', creds));
       } else if (name === 'empty_trash') {
-        result = await withTimeout('empty_trash', TIMEOUT.BULK_OP, () => emptyTrash(args.dryRun || false));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('empty_trash', TIMEOUT.BULK_OP, () => emptyTrash(args.dryRun || false, creds));
       // ── No top-level timeout — chunked with internal timeouts ──
       } else if (name === 'bulk_move') {
-        const { targetMailbox, sourceMailbox, dryRun, limit, ...filters } = args;
-        result = await bulkMove(filters, targetMailbox, sourceMailbox || 'INBOX', dryRun || false, limit ?? null);
+        const { targetMailbox, sourceMailbox, dryRun, limit, account, ...filters } = args;
+        const creds = resolveCreds(account);
+        result = await bulkMove(filters, resolveMailbox(targetMailbox, creds), sourceMailbox || 'INBOX', dryRun || false, limit ?? null, creds);
       } else if (name === 'bulk_move_by_sender') {
-        result = await bulkMoveBySender(args.sender, args.targetMailbox, args.sourceMailbox || 'INBOX', args.dryRun || false);
+        const creds = resolveCreds(args.account);
+        result = await bulkMoveBySender(args.sender, resolveMailbox(args.targetMailbox, creds), args.sourceMailbox || 'INBOX', args.dryRun || false, creds);
       } else if (name === 'bulk_move_by_domain') {
-        result = await bulkMoveByDomain(args.domain, args.targetMailbox, args.sourceMailbox || 'INBOX', args.dryRun || false);
+        const creds = resolveCreds(args.account);
+        result = await bulkMoveByDomain(args.domain, resolveMailbox(args.targetMailbox, creds), args.sourceMailbox || 'INBOX', args.dryRun || false, creds);
       } else if (name === 'archive_older_than') {
-        result = await archiveOlderThan(args.days, args.targetMailbox, args.sourceMailbox || 'INBOX', args.dryRun || false);
+        const creds = resolveCreds(args.account);
+        result = await archiveOlderThan(args.days, resolveMailbox(args.targetMailbox, creds), args.sourceMailbox || 'INBOX', args.dryRun || false, creds);
       } else if (name === 'bulk_delete') {
-        // IMPROVEMENT 3: bulk_delete now has per-chunk timeouts internally
-        const { sourceMailbox, dryRun, ...filters } = args;
-        result = await bulkDelete(filters, sourceMailbox || 'INBOX', dryRun || false);
+        const { sourceMailbox, dryRun, account, ...filters } = args;
+        const creds = resolveCreds(account);
+        result = await bulkDelete(filters, sourceMailbox || 'INBOX', dryRun || false, creds);
       // ── Single-email tier (15s) ──
       } else if (name === 'flag_email') {
-        result = await withTimeout('flag_email', TIMEOUT.SINGLE, () => flagEmail(args.uid, args.flagged, args.mailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('flag_email', TIMEOUT.SINGLE, () => flagEmail(args.uid, args.flagged, args.mailbox || 'INBOX', creds));
       } else if (name === 'mark_as_read') {
-        result = await withTimeout('mark_as_read', TIMEOUT.SINGLE, () => markAsRead(args.uid, args.seen, args.mailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('mark_as_read', TIMEOUT.SINGLE, () => markAsRead(args.uid, args.seen, args.mailbox || 'INBOX', creds));
       } else if (name === 'delete_email') {
-        result = await withTimeout('delete_email', TIMEOUT.SINGLE, () => deleteEmail(args.uid, args.mailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('delete_email', TIMEOUT.SINGLE, () => deleteEmail(args.uid, args.mailbox || 'INBOX', creds));
       } else if (name === 'move_email') {
-        result = await withTimeout('move_email', TIMEOUT.SINGLE, () => moveEmail(args.uid, args.targetMailbox, args.sourceMailbox || 'INBOX'));
+        const creds = resolveCreds(args.account);
+        result = await withTimeout('move_email', TIMEOUT.SINGLE, () => moveEmail(args.uid, resolveMailbox(args.targetMailbox, creds), args.sourceMailbox || 'INBOX', creds));
       // ── Move status (synchronous, no timeout needed) ──
       } else if (name === 'get_move_status') {
         result = getMoveStatus();
@@ -1029,26 +1124,30 @@ async function main() {
         result = await runAllRules(args.dryRun || false);
       // ── SMTP (email sending — uses SCAN tier 60s for two-phase fetch+send) ──
       } else if (name === 'compose_email') {
+        const creds = resolveCreds(args.account);
         result = await withTimeout('compose_email', TIMEOUT.SCAN, () =>
-          composeEmail(args.to, args.subject, args.body, { html: args.html, cc: args.cc, bcc: args.bcc, replyTo: args.replyTo })
+          composeEmail(args.to, args.subject, args.body, { html: args.html, cc: args.cc, bcc: args.bcc, replyTo: args.replyTo }, creds)
         );
       } else if (name === 'reply_to_email') {
+        const creds = resolveCreds(args.account);
         const origEmail = await withTimeout('get_email_for_reply', TIMEOUT.FETCH, () =>
-          getEmailContent(args.uid, args.mailbox || 'INBOX', 5000, true)
+          getEmailContent(args.uid, args.mailbox || 'INBOX', 5000, true, creds)
         );
         result = await withTimeout('reply_to_email', TIMEOUT.FETCH, () =>
-          replyToEmail(origEmail, args.body, { html: args.html, replyAll: args.replyAll || false, cc: args.cc })
+          replyToEmail(origEmail, args.body, { html: args.html, replyAll: args.replyAll || false, cc: args.cc }, creds)
         );
       } else if (name === 'forward_email') {
+        const creds = resolveCreds(args.account);
         const origEmail = await withTimeout('get_email_for_forward', TIMEOUT.FETCH, () =>
-          getEmailContent(args.uid, args.mailbox || 'INBOX', 5000, false)
+          getEmailContent(args.uid, args.mailbox || 'INBOX', 5000, false, creds)
         );
         result = await withTimeout('forward_email', TIMEOUT.FETCH, () =>
-          forwardEmail(origEmail, args.to, args.note || '', { html: args.html, cc: args.cc })
+          forwardEmail(origEmail, args.to, args.note || '', { html: args.html, cc: args.cc }, creds)
         );
       } else if (name === 'save_draft') {
+        const creds = resolveCreds(args.account);
         result = await withTimeout('save_draft', TIMEOUT.FETCH, () =>
-          saveDraft(args.to, args.subject, args.body, { html: args.html, cc: args.cc, bcc: args.bcc })
+          saveDraft(args.to, args.subject, args.body, { html: args.html, cc: args.cc, bcc: args.bcc }, creds)
         );
       // ── CardDAV / Contacts (FETCH tier 30s) ──
       } else if (name === 'list_contacts') {
@@ -1110,8 +1209,9 @@ async function main() {
         );
       // ── Smart extraction (SCAN tier 60s — LLM round-trip) ──
       } else if (name === 'suggest_event_from_email') {
+        const creds = resolveCreds(args.account);
         const email = await withTimeout('get_email_for_extraction', TIMEOUT.FETCH, () =>
-          getEmailContent(args.uid, args.mailbox || 'INBOX', 10000, false)
+          getEmailContent(args.uid, resolveMailbox(args.mailbox || 'INBOX', creds), 10000, false, creds)
         );
         result = formatEmailForExtraction(email);
       } else {
