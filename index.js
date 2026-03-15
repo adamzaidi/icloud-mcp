@@ -88,7 +88,7 @@ function resolveMailbox(name, creds) {
 
 async function main() {
   const server = new Server(
-    { name: 'icloud-mail', version: '2.5.0' },
+    { name: 'icloud-mail', version: '2.5.1' },
     { capabilities: { tools: {} } }
   );
 
