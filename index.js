@@ -728,7 +728,8 @@ async function main() {
             body: { type: 'string', description: 'Plain text body (used as fallback when html is also provided)' },
             html: { type: 'string', description: 'HTML body. If provided without body, plain text is auto-generated. If provided with body, saves multipart/alternative.' },
             cc: { type: 'string', description: 'CC recipient(s)' },
-            bcc: { type: 'string', description: 'BCC recipient(s)' }
+            bcc: { type: 'string', description: 'BCC recipient(s)' },
+            account: { type: 'string', description: 'Account whose Drafts folder to save into (e.g. "umd", "personal", "alt"). Defaults to iCloud.' }
           },
           required: ['to', 'subject']
         }
@@ -1219,6 +1220,7 @@ async function main() {
       }
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     } catch (error) {
+      process.stderr.write(`[tool-error] ${name}: ${error.responseText ?? error.message}\n`);
       return { content: [{ type: 'text', text: `Error: ${friendlyError(error)}` }], isError: true };
     }
   });
