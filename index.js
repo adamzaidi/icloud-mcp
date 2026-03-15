@@ -729,6 +729,8 @@ async function main() {
             html: { type: 'string', description: 'HTML body. If provided without body, plain text is auto-generated. If provided with body, saves multipart/alternative.' },
             cc: { type: 'string', description: 'CC recipient(s)' },
             bcc: { type: 'string', description: 'BCC recipient(s)' },
+            inReplyTo: { type: 'string', description: 'Message-ID of the email being replied to — sets In-Reply-To header for threading' },
+            references: { type: 'string', description: 'Space-separated Message-IDs for the References header — enables full thread linking' },
             account: { type: 'string', description: 'Account whose Drafts folder to save into (e.g. "umd", "personal", "alt"). Defaults to iCloud.' }
           },
           required: ['to', 'subject']
@@ -1148,7 +1150,7 @@ async function main() {
       } else if (name === 'save_draft') {
         const creds = resolveCreds(args.account);
         result = await withTimeout('save_draft', TIMEOUT.FETCH, () =>
-          saveDraft(args.to, args.subject, args.body, { html: args.html, cc: args.cc, bcc: args.bcc }, creds)
+          saveDraft(args.to, args.subject, args.body, { html: args.html, cc: args.cc, bcc: args.bcc, inReplyTo: args.inReplyTo, references: args.references }, creds)
         );
       // ── CardDAV / Contacts (FETCH tier 30s) ──
       } else if (name === 'list_contacts') {
