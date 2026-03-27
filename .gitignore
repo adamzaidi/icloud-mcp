@@ -11,3 +11,4 @@ INBOX_INTELLIGENCE.md
 DIGEST_PROMPT.md
 logs/
 *.plist
+.CLAUDE/

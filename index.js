@@ -23,6 +23,7 @@ import { listContacts, searchContacts, getContact, createContact, updateContact,
 import { getDigestState, updateDigestState } from './lib/digest.js';
 import { formatEmailForExtraction } from './lib/event-extractor.js';
 import { listCalendars, listEvents, getEvent, createEvent, updateEvent, deleteEvent, searchEvents } from './lib/caldav.js';
+import { listReminderLists, listReminders, getReminder, createReminder, updateReminder, completeReminder, deleteReminder } from './lib/reminders.js';
 
 const IMAP_USER = process.env.IMAP_USER;
 const IMAP_PASSWORD = process.env.IMAP_PASSWORD;
@@ -167,14 +168,15 @@ async function main() {
       },
       {
         name: 'read_inbox',
-        description: 'Read emails from iCloud inbox with pagination',
+        description: 'Read emails from an inbox with pagination. Supports multiple accounts.',
         inputSchema: {
           type: 'object',
           properties: {
             limit: { type: 'number', description: 'Number of emails per page (default 10)' },
             page: { type: 'number', description: 'Page number (default 1)' },
             onlyUnread: { type: 'boolean', description: 'Only fetch unread emails' },
-            mailbox: { type: 'string', description: 'Mailbox to read (default INBOX)' }
+            mailbox: { type: 'string', description: 'Mailbox to read (default INBOX)' },
+            account: { type: 'string', description: 'Account name to read from (e.g. "umd", "personal", "alt", "icloud"). Omit for default iCloud account.' }
           }
         }
       },
@@ -751,7 +753,9 @@ async function main() {
             lastRun: { type: 'string', description: 'ISO timestamp of this run' },
             processedUids: { type: 'array', items: { type: 'number' }, description: 'Email UIDs processed in this run — merged with existing and capped at 5000' },
             pendingActions: { type: 'array', description: 'Full replacement list of pending action items to track across runs (deadlines, waiting-for-reply, etc.). Each item: { type, subject, to/from, dueDate?, notes? }' },
-            skipCounts: { type: 'object', description: 'Map of sender address to skip count increment for this run, e.g. { "bestbuy@email.bestbuy.com": 3 }. Accumulated across runs for smart unsubscribe.' }
+            skipCounts: { type: 'object', description: 'Map of sender address to skip count increment for this run, e.g. { "bestbuy@email.bestbuy.com": 3 }. Accumulated across runs for smart unsubscribe.' },
+            dismissedReminders: { type: 'array', description: 'Full replacement list of reminders Adam has deleted from the "claude" list (treated as "not interested"). Each: { title, notes?, dismissedAt (ISO) }. Entries older than 30 days are pruned automatically. Capped at 500.' },
+            seenReminders: { type: 'array', description: 'Snapshot of all active reminders in the "claude" list at end of this run — used next run to detect which ones Adam deleted. Each: { id, title, notes? }.' }
           }
         }
       },
@@ -944,6 +948,91 @@ async function main() {
           required: ['query']
         }
       },
+      // ── Reminders (JXA — real iCloud Reminders, not legacy CalDAV) ──
+      {
+        name: 'list_reminder_lists',
+        description: 'List all Reminders lists in iCloud Reminders (e.g. "Reminders", "Work", "Shopping"). Returns name, id, and count per list.',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'list_reminders',
+        description: 'List reminders from iCloud Reminders. Omit listName to fetch from all lists.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            listName: { type: 'string', description: 'List name from list_reminder_lists (omit for all lists)' },
+            includeCompleted: { type: 'boolean', description: 'Include completed reminders (default false)' },
+            limit: { type: 'number', description: 'Max reminders to return (default 50)' }
+          }
+        }
+      },
+      {
+        name: 'get_reminder',
+        description: 'Get full details of a specific reminder by ID.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            listName: { type: 'string', description: 'List name containing the reminder' },
+            reminderId: { type: 'string', description: 'Reminder ID from list_reminders' }
+          },
+          required: ['listName', 'reminderId']
+        }
+      },
+      {
+        name: 'create_reminder',
+        description: 'Create a new reminder in iCloud Reminders.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            listName: { type: 'string', description: 'List name to add the reminder to (required)' },
+            title: { type: 'string', description: 'Reminder title' },
+            notes: { type: 'string', description: 'Notes / description' },
+            due: { type: 'string', description: 'Due date/time — ISO 8601 (e.g. 2026-03-20T09:00:00)' },
+            priority: { type: 'string', description: 'Priority: high, medium, low, or none (default none)' }
+          },
+          required: ['listName', 'title']
+        }
+      },
+      {
+        name: 'update_reminder',
+        description: 'Update an existing reminder. Only provided fields are changed; others are preserved.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            listName: { type: 'string', description: 'List name containing the reminder' },
+            reminderId: { type: 'string', description: 'Reminder ID to update' },
+            title: { type: 'string' },
+            notes: { type: 'string' },
+            due: { type: 'string' },
+            priority: { type: 'string', description: 'high, medium, low, or none' }
+          },
+          required: ['listName', 'reminderId']
+        }
+      },
+      {
+        name: 'complete_reminder',
+        description: 'Mark a reminder as completed in iCloud Reminders.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            listName: { type: 'string', description: 'List name containing the reminder' },
+            reminderId: { type: 'string', description: 'Reminder ID to mark as completed' }
+          },
+          required: ['listName', 'reminderId']
+        }
+      },
+      {
+        name: 'delete_reminder',
+        description: 'Delete a reminder from iCloud Reminders permanently.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            listName: { type: 'string', description: 'List name containing the reminder' },
+            reminderId: { type: 'string', description: 'Reminder ID to delete' }
+          },
+          required: ['listName', 'reminderId']
+        }
+      },
       // ── Smart extraction ──
       {
         name: 'suggest_event_from_email',
@@ -1112,7 +1201,9 @@ async function main() {
           lastRun: args.lastRun,
           processedUids: args.processedUids,
           pendingActions: args.pendingActions,
-          skipCounts: args.skipCounts
+          skipCounts: args.skipCounts,
+          dismissedReminders: args.dismissedReminders,
+          seenReminders: args.seenReminders
         });
       // ── Saved rules (synchronous CRUD; run_rule/run_all_rules use internal chunk timeouts) ──
       } else if (name === 'create_rule') {
@@ -1210,6 +1301,23 @@ async function main() {
         result = await withTimeout('search_events', TIMEOUT.FETCH, () =>
           searchEvents(args.query, args.since || null, args.before || null)
         );
+      // ── Reminders / JXA (synchronous osascript — no timeout needed) ──
+      } else if (name === 'list_reminder_lists') {
+        result = listReminderLists();
+      } else if (name === 'list_reminders') {
+        result = listReminders(args.listName || null, args.includeCompleted || false, args.limit || 50);
+      } else if (name === 'get_reminder') {
+        result = getReminder(args.listName, args.reminderId);
+      } else if (name === 'create_reminder') {
+        const { listName, ...fields } = args;
+        result = createReminder(listName, fields);
+      } else if (name === 'update_reminder') {
+        const { listName, reminderId, ...fields } = args;
+        result = updateReminder(listName, reminderId, fields);
+      } else if (name === 'complete_reminder') {
+        result = completeReminder(args.listName, args.reminderId);
+      } else if (name === 'delete_reminder') {
+        result = deleteReminder(args.listName, args.reminderId);
       // ── Smart extraction (SCAN tier 60s — LLM round-trip) ──
       } else if (name === 'suggest_event_from_email') {
         const creds = resolveCreds(args.account);
