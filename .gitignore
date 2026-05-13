@@ -15,3 +15,6 @@ BULK_SWEEP_PROMPT.md
 logs/
 *.plist
 .CLAUDE/
+.DS_Store
+docs/
+lsat/
