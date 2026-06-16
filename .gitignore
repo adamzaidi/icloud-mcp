@@ -13,8 +13,13 @@ ON_DEMAND_DIGEST.md
 CONTACT_INTEL_PLAN.md
 BULK_SWEEP_PROMPT.md
 logs/
+digest-runner.mjs
 *.plist
 .CLAUDE/
 .DS_Store
 docs/
 lsat/
+.node-version
+URGENT_FIXES.md
+mathnasium/
+start.js
