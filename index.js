@@ -22,7 +22,7 @@ import { composeEmail, replyToEmail, forwardEmail, saveDraft } from './lib/smtp.
 import { listContacts, searchContacts, getContact, createContact, updateContact, deleteContact } from './lib/carddav.js';
 import { getDigestState, updateDigestState } from './lib/digest.js';
 import { formatEmailForExtraction } from './lib/event-extractor.js';
-import { listCalendars, listEvents, getEvent, createEvent, updateEvent, deleteEvent, searchEvents } from './lib/caldav.js';
+import { listCalendars, listEvents, getEvent, createEvent, updateEvent, deleteEvent, searchEvents, bulkCreateEvents, bulkDeleteEvents, bulkUpdateEvents, listEventsMulti, detectConflicts } from './lib/caldav.js';
 import { listReminderLists, listReminders, getReminder, createReminder, updateReminder, completeReminder, deleteReminder } from './lib/reminders.js';
 
 const IMAP_USER = process.env.IMAP_USER;
@@ -948,6 +948,121 @@ async function main() {
           required: ['query']
         }
       },
+      {
+        name: 'bulk_update_events',
+        description: 'Update multiple calendar events in one call. Each update object must include eventId and only the fields to change.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            calendarId: { type: 'string', description: 'Calendar ID containing the events' },
+            updates: {
+              type: 'array',
+              description: 'Array of update objects, each with eventId (required) plus any fields to change: summary, start, end, timezone, allDay, description, location, recurrence, status, reminder',
+              items: {
+                type: 'object',
+                properties: {
+                  eventId: { type: 'string' },
+                  summary: { type: 'string' },
+                  start: { type: 'string' },
+                  end: { type: 'string' },
+                  timezone: { type: 'string' },
+                  allDay: { type: 'boolean' },
+                  description: { type: 'string' },
+                  location: { type: 'string' },
+                  recurrence: { type: 'string' },
+                  status: { type: 'string' },
+                  reminder: { type: 'number' }
+                },
+                required: ['eventId']
+              }
+            }
+          },
+          required: ['calendarId', 'updates']
+        }
+      },
+      {
+        name: 'list_events_multi',
+        description: 'List events from multiple calendars in one call. Returns events grouped by calendar ID.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            calendarIds: {
+              type: 'array',
+              description: 'Array of calendar IDs to fetch events from',
+              items: { type: 'string' }
+            },
+            since: { type: 'string', description: 'Start of date range (YYYY-MM-DD, default: 30 days ago)' },
+            before: { type: 'string', description: 'End of date range (YYYY-MM-DD, default: 30 days ahead)' },
+            limit: { type: 'number', description: 'Max events per calendar (default 50)' }
+          },
+          required: ['calendarIds']
+        }
+      },
+      {
+        name: 'bulk_create_events',
+        description: 'Create multiple calendar events in one call. Much more efficient than calling create_event repeatedly. Each event in the array uses the same fields as create_event.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            calendarId: { type: 'string', description: 'Calendar ID to add all events to' },
+            events: {
+              type: 'array',
+              description: 'Array of event objects, each with: summary (required), start (required), end, timezone, allDay, description, location, recurrence, status, reminder',
+              items: {
+                type: 'object',
+                properties: {
+                  summary: { type: 'string' },
+                  start: { type: 'string' },
+                  end: { type: 'string' },
+                  timezone: { type: 'string' },
+                  allDay: { type: 'boolean' },
+                  description: { type: 'string' },
+                  location: { type: 'string' },
+                  recurrence: { type: 'string' },
+                  status: { type: 'string' },
+                  reminder: { type: 'number' }
+                },
+                required: ['summary', 'start']
+              }
+            }
+          },
+          required: ['calendarId', 'events']
+        }
+      },
+      {
+        name: 'bulk_delete_events',
+        description: 'Delete multiple calendar events in one call. Much more efficient than calling delete_event repeatedly.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            calendarId: { type: 'string', description: 'Calendar ID containing the events' },
+            eventIds: {
+              type: 'array',
+              description: 'Array of event IDs to delete',
+              items: { type: 'string' }
+            }
+          },
+          required: ['calendarId', 'eventIds']
+        }
+      },
+      {
+        name: 'detect_conflicts',
+        description: 'Detect scheduling conflicts and tight gaps between events across multiple calendars. Compares all non-all-day events on the same date from different calendars.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            calendarIds: {
+              type: 'array',
+              description: 'Array of calendar IDs to check for conflicts',
+              items: { type: 'string' }
+            },
+            since: { type: 'string', description: 'Start of range (YYYY-MM-DD, default: today)' },
+            before: { type: 'string', description: 'End of range (YYYY-MM-DD, default: 90 days ahead)' },
+            minBuffer: { type: 'number', description: 'Minimum buffer minutes between events to flag tight gaps (default 0 = no gap check)' }
+          },
+          required: ['calendarIds']
+        }
+      },
       // ── Reminders (JXA — real iCloud Reminders, not legacy CalDAV) ──
       {
         name: 'list_reminder_lists',
@@ -1059,14 +1174,14 @@ async function main() {
       // ── Metadata tier (15s) ──
       } else if (name === 'get_inbox_summary') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('get_inbox_summary', TIMEOUT.METADATA, () => getInboxSummary(args.mailbox || 'INBOX', creds));
+        result = await withTimeout('get_inbox_summary', TIMEOUT.METADATA, () => getInboxSummary(resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'get_mailbox_summary') {
         const creds = resolveCreds(args.account);
         result = await withTimeout('get_mailbox_summary', TIMEOUT.METADATA, () => getMailboxSummary(resolveMailbox(args.mailbox, creds), creds));
       } else if (name === 'count_emails') {
         const { mailbox, account, ...filters } = args;
         const creds = resolveCreds(account);
-        result = await withTimeout('count_emails', TIMEOUT.METADATA, () => countEmails(filters, mailbox || 'INBOX', creds));
+        result = await withTimeout('count_emails', TIMEOUT.METADATA, () => countEmails(filters, resolveMailbox(mailbox || 'INBOX', creds), creds));
       } else if (name === 'list_mailboxes') {
         const creds = resolveCreds(args.account);
         result = await withTimeout('list_mailboxes', TIMEOUT.METADATA, () => listMailboxes(creds));
@@ -1082,71 +1197,71 @@ async function main() {
       // ── Fetch tier (30s) ──
       } else if (name === 'read_inbox') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('read_inbox', TIMEOUT.FETCH, () => fetchEmails(args.mailbox || 'INBOX', args.limit || 10, args.onlyUnread || false, args.page || 1, creds));
+        result = await withTimeout('read_inbox', TIMEOUT.FETCH, () => fetchEmails(resolveMailbox(args.mailbox || 'INBOX', creds), args.limit || 10, args.onlyUnread || false, args.page || 1, creds));
       } else if (name === 'get_email') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('get_email', TIMEOUT.FETCH, () => getEmailContent(args.uid, args.mailbox || 'INBOX', args.maxChars || 8000, args.includeHeaders || false, creds));
+        result = await withTimeout('get_email', TIMEOUT.FETCH, () => getEmailContent(args.uid, resolveMailbox(args.mailbox || 'INBOX', creds), args.maxChars || 8000, args.includeHeaders || false, creds));
       } else if (name === 'list_attachments') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('list_attachments', TIMEOUT.FETCH, () => listAttachments(args.uid, args.mailbox || 'INBOX', creds));
+        result = await withTimeout('list_attachments', TIMEOUT.FETCH, () => listAttachments(args.uid, resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'get_attachment') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('get_attachment', TIMEOUT.FETCH, () => getAttachment(args.uid, args.partId, args.mailbox || 'INBOX', args.offset ?? null, args.length ?? null, creds));
+        result = await withTimeout('get_attachment', TIMEOUT.FETCH, () => getAttachment(args.uid, args.partId, resolveMailbox(args.mailbox || 'INBOX', creds), args.offset ?? null, args.length ?? null, creds));
       } else if (name === 'get_unsubscribe_info') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('get_unsubscribe_info', TIMEOUT.FETCH, () => getUnsubscribeInfo(args.uid, args.mailbox || 'INBOX', creds));
+        result = await withTimeout('get_unsubscribe_info', TIMEOUT.FETCH, () => getUnsubscribeInfo(args.uid, resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'get_email_raw') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('get_email_raw', TIMEOUT.FETCH, () => getEmailRaw(args.uid, args.mailbox || 'INBOX', creds));
+        result = await withTimeout('get_email_raw', TIMEOUT.FETCH, () => getEmailRaw(args.uid, resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'get_thread') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('get_thread', TIMEOUT.FETCH, () => getThread(args.uid, args.mailbox || 'INBOX', creds));
+        result = await withTimeout('get_thread', TIMEOUT.FETCH, () => getThread(args.uid, resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'search_emails') {
         const { query, mailbox, limit, queryMode, subjectQuery, bodyQuery, fromQuery, includeSnippet, account, ...filters } = args;
         const creds = resolveCreds(account);
-        result = await withTimeout('search_emails', TIMEOUT.FETCH, () => searchEmails(query, mailbox || 'INBOX', limit || 10, filters, { queryMode, subjectQuery, bodyQuery, fromQuery, includeSnippet }, creds));
+        result = await withTimeout('search_emails', TIMEOUT.FETCH, () => searchEmails(query, resolveMailbox(mailbox || 'INBOX', creds), limit || 10, filters, { queryMode, subjectQuery, bodyQuery, fromQuery, includeSnippet }, creds));
       } else if (name === 'get_emails_by_sender') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('get_emails_by_sender', TIMEOUT.FETCH, () => getEmailsBySender(args.sender, args.mailbox || 'INBOX', args.limit || 10, creds));
+        result = await withTimeout('get_emails_by_sender', TIMEOUT.FETCH, () => getEmailsBySender(args.sender, resolveMailbox(args.mailbox || 'INBOX', creds), args.limit || 10, creds));
       } else if (name === 'get_emails_by_date_range') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('get_emails_by_date_range', TIMEOUT.FETCH, () => getEmailsByDateRange(args.startDate, args.endDate, args.mailbox || 'INBOX', args.limit || 10, creds));
+        result = await withTimeout('get_emails_by_date_range', TIMEOUT.FETCH, () => getEmailsByDateRange(args.startDate, args.endDate, resolveMailbox(args.mailbox || 'INBOX', creds), args.limit || 10, creds));
       // ── Scan tier (60s) ──
       } else if (name === 'get_top_senders') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('get_top_senders', TIMEOUT.SCAN, () => getTopSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20, creds));
+        result = await withTimeout('get_top_senders', TIMEOUT.SCAN, () => getTopSenders(resolveMailbox(args.mailbox || 'INBOX', creds), args.sampleSize || 500, args.maxResults || 20, creds));
       } else if (name === 'get_unread_senders') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('get_unread_senders', TIMEOUT.SCAN, () => getUnreadSenders(args.mailbox || 'INBOX', args.sampleSize || 500, args.maxResults || 20, creds));
+        result = await withTimeout('get_unread_senders', TIMEOUT.SCAN, () => getUnreadSenders(resolveMailbox(args.mailbox || 'INBOX', creds), args.sampleSize || 500, args.maxResults || 20, creds));
       } else if (name === 'get_storage_report') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('get_storage_report', TIMEOUT.SCAN, () => getStorageReport(args.mailbox || 'INBOX', args.sampleSize || 100, creds));
+        result = await withTimeout('get_storage_report', TIMEOUT.SCAN, () => getStorageReport(resolveMailbox(args.mailbox || 'INBOX', creds), args.sampleSize || 100, creds));
       // ── Bulk operation tier (60s) ──
       } else if (name === 'bulk_delete_by_sender') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('bulk_delete_by_sender', TIMEOUT.BULK_OP, () => bulkDeleteBySender(args.sender, args.mailbox || 'INBOX', creds));
+        result = await withTimeout('bulk_delete_by_sender', TIMEOUT.BULK_OP, () => bulkDeleteBySender(args.sender, resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'bulk_delete_by_subject') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('bulk_delete_by_subject', TIMEOUT.BULK_OP, () => bulkDeleteBySubject(args.subject, args.mailbox || 'INBOX', creds));
+        result = await withTimeout('bulk_delete_by_subject', TIMEOUT.BULK_OP, () => bulkDeleteBySubject(args.subject, resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'bulk_mark_read') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('bulk_mark_read', TIMEOUT.BULK_OP, () => bulkMarkRead(args.mailbox || 'INBOX', args.sender || null, creds));
+        result = await withTimeout('bulk_mark_read', TIMEOUT.BULK_OP, () => bulkMarkRead(resolveMailbox(args.mailbox || 'INBOX', creds), args.sender || null, creds));
       } else if (name === 'bulk_mark_unread') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('bulk_mark_unread', TIMEOUT.BULK_OP, () => bulkMarkUnread(args.mailbox || 'INBOX', args.sender || null, creds));
+        result = await withTimeout('bulk_mark_unread', TIMEOUT.BULK_OP, () => bulkMarkUnread(resolveMailbox(args.mailbox || 'INBOX', creds), args.sender || null, creds));
       } else if (name === 'bulk_flag') {
         const { flagged, mailbox, account, ...filters } = args;
         const creds = resolveCreds(account);
-        result = await withTimeout('bulk_flag', TIMEOUT.BULK_OP, () => bulkFlag(filters, flagged, mailbox || 'INBOX', creds));
+        result = await withTimeout('bulk_flag', TIMEOUT.BULK_OP, () => bulkFlag(filters, flagged, resolveMailbox(mailbox || 'INBOX', creds), creds));
       } else if (name === 'mark_older_than_read') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('mark_older_than_read', TIMEOUT.BULK_OP, () => markOlderThanRead(args.days, args.mailbox || 'INBOX', creds));
+        result = await withTimeout('mark_older_than_read', TIMEOUT.BULK_OP, () => markOlderThanRead(args.days, resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'bulk_flag_by_sender') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('bulk_flag_by_sender', TIMEOUT.BULK_OP, () => bulkFlagBySender(args.sender, args.flagged, args.mailbox || 'INBOX', creds));
+        result = await withTimeout('bulk_flag_by_sender', TIMEOUT.BULK_OP, () => bulkFlagBySender(args.sender, args.flagged, resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'delete_older_than') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('delete_older_than', TIMEOUT.BULK_OP, () => deleteOlderThan(args.days, args.mailbox || 'INBOX', creds));
+        result = await withTimeout('delete_older_than', TIMEOUT.BULK_OP, () => deleteOlderThan(args.days, resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'empty_trash') {
         const creds = resolveCreds(args.account);
         result = await withTimeout('empty_trash', TIMEOUT.BULK_OP, () => emptyTrash(args.dryRun || false, creds));
@@ -1154,33 +1269,33 @@ async function main() {
       } else if (name === 'bulk_move') {
         const { targetMailbox, sourceMailbox, dryRun, limit, account, ...filters } = args;
         const creds = resolveCreds(account);
-        result = await bulkMove(filters, resolveMailbox(targetMailbox, creds), sourceMailbox || 'INBOX', dryRun || false, limit ?? null, creds);
+        result = await bulkMove(filters, resolveMailbox(targetMailbox, creds), resolveMailbox(sourceMailbox || 'INBOX', creds), dryRun || false, limit ?? null, creds);
       } else if (name === 'bulk_move_by_sender') {
         const creds = resolveCreds(args.account);
-        result = await bulkMoveBySender(args.sender, resolveMailbox(args.targetMailbox, creds), args.sourceMailbox || 'INBOX', args.dryRun || false, creds);
+        result = await bulkMoveBySender(args.sender, resolveMailbox(args.targetMailbox, creds), resolveMailbox(args.sourceMailbox || 'INBOX', creds), args.dryRun || false, creds);
       } else if (name === 'bulk_move_by_domain') {
         const creds = resolveCreds(args.account);
-        result = await bulkMoveByDomain(args.domain, resolveMailbox(args.targetMailbox, creds), args.sourceMailbox || 'INBOX', args.dryRun || false, creds);
+        result = await bulkMoveByDomain(args.domain, resolveMailbox(args.targetMailbox, creds), resolveMailbox(args.sourceMailbox || 'INBOX', creds), args.dryRun || false, creds);
       } else if (name === 'archive_older_than') {
         const creds = resolveCreds(args.account);
-        result = await archiveOlderThan(args.days, resolveMailbox(args.targetMailbox, creds), args.sourceMailbox || 'INBOX', args.dryRun || false, creds);
+        result = await archiveOlderThan(args.days, resolveMailbox(args.targetMailbox, creds), resolveMailbox(args.sourceMailbox || 'INBOX', creds), args.dryRun || false, creds);
       } else if (name === 'bulk_delete') {
         const { sourceMailbox, dryRun, account, ...filters } = args;
         const creds = resolveCreds(account);
-        result = await bulkDelete(filters, sourceMailbox || 'INBOX', dryRun || false, creds);
+        result = await bulkDelete(filters, resolveMailbox(sourceMailbox || 'INBOX', creds), dryRun || false, creds);
       // ── Single-email tier (15s) ──
       } else if (name === 'flag_email') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('flag_email', TIMEOUT.SINGLE, () => flagEmail(args.uid, args.flagged, args.mailbox || 'INBOX', creds));
+        result = await withTimeout('flag_email', TIMEOUT.SINGLE, () => flagEmail(args.uid, args.flagged, resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'mark_as_read') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('mark_as_read', TIMEOUT.SINGLE, () => markAsRead(args.uid, args.seen, args.mailbox || 'INBOX', creds));
+        result = await withTimeout('mark_as_read', TIMEOUT.SINGLE, () => markAsRead(args.uid, args.seen, resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'delete_email') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('delete_email', TIMEOUT.SINGLE, () => deleteEmail(args.uid, args.mailbox || 'INBOX', creds));
+        result = await withTimeout('delete_email', TIMEOUT.SINGLE, () => deleteEmail(args.uid, resolveMailbox(args.mailbox || 'INBOX', creds), creds));
       } else if (name === 'move_email') {
         const creds = resolveCreds(args.account);
-        result = await withTimeout('move_email', TIMEOUT.SINGLE, () => moveEmail(args.uid, resolveMailbox(args.targetMailbox, creds), args.sourceMailbox || 'INBOX', creds));
+        result = await withTimeout('move_email', TIMEOUT.SINGLE, () => moveEmail(args.uid, resolveMailbox(args.targetMailbox, creds), resolveMailbox(args.sourceMailbox || 'INBOX', creds), creds));
       // ── Move status (synchronous, no timeout needed) ──
       } else if (name === 'get_move_status') {
         result = getMoveStatus();
@@ -1225,7 +1340,7 @@ async function main() {
       } else if (name === 'reply_to_email') {
         const creds = resolveCreds(args.account);
         const origEmail = await withTimeout('get_email_for_reply', TIMEOUT.FETCH, () =>
-          getEmailContent(args.uid, args.mailbox || 'INBOX', 5000, true, creds)
+          getEmailContent(args.uid, resolveMailbox(args.mailbox || 'INBOX', creds), 5000, true, creds)
         );
         result = await withTimeout('reply_to_email', TIMEOUT.FETCH, () =>
           replyToEmail(origEmail, args.body, { html: args.html, replyAll: args.replyAll || false, cc: args.cc }, creds)
@@ -1233,7 +1348,7 @@ async function main() {
       } else if (name === 'forward_email') {
         const creds = resolveCreds(args.account);
         const origEmail = await withTimeout('get_email_for_forward', TIMEOUT.FETCH, () =>
-          getEmailContent(args.uid, args.mailbox || 'INBOX', 5000, false, creds)
+          getEmailContent(args.uid, resolveMailbox(args.mailbox || 'INBOX', creds), 5000, false, creds)
         );
         result = await withTimeout('forward_email', TIMEOUT.FETCH, () =>
           forwardEmail(origEmail, args.to, args.note || '', { html: args.html, cc: args.cc }, creds)
@@ -1301,6 +1416,16 @@ async function main() {
         result = await withTimeout('search_events', TIMEOUT.FETCH, () =>
           searchEvents(args.query, args.since || null, args.before || null)
         );
+      } else if (name === 'bulk_create_events') {
+        result = await bulkCreateEvents(args.calendarId, args.events);
+      } else if (name === 'bulk_delete_events') {
+        result = await bulkDeleteEvents(args.calendarId, args.eventIds);
+      } else if (name === 'bulk_update_events') {
+        result = await bulkUpdateEvents(args.calendarId, args.updates);
+      } else if (name === 'list_events_multi') {
+        result = await listEventsMulti(args.calendarIds, args.since || null, args.before || null, args.limit || 50);
+      } else if (name === 'detect_conflicts') {
+        result = await detectConflicts(args.calendarIds, args.since || null, args.before || null, args.minBuffer || 0);
       // ── Reminders / JXA (synchronous osascript — no timeout needed) ──
       } else if (name === 'list_reminder_lists') {
         result = listReminderLists();
