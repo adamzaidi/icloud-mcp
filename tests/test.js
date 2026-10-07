@@ -8,8 +8,8 @@ const IMAP_USER = process.env.IMAP_USER;
 const IMAP_PASSWORD = process.env.IMAP_PASSWORD;
 
 if (!IMAP_USER || !IMAP_PASSWORD) {
-  console.error('Error: IMAP_USER and IMAP_PASSWORD environment variables are required');
-  process.exit(1);
+  console.log('Skipping live iCloud integration tests (set IMAP_USER and IMAP_PASSWORD to run them).');
+  process.exit(0);
 }
 
 const projectDir = fileURLToPath(new URL('..', import.meta.url));
@@ -1226,7 +1226,7 @@ test('save_draft (HTML formatted)', () => {
   <tr><td>NPS</td><td>41</td><td>53</td></tr>
 </table>
 <p>Full report attached. Let me know if you have questions.</p>
-<p>Regards,<br>Adam</p>
+<p>Regards,<br>Alex</p>
 `.trim();
 
   const result = callTool('save_draft', {
