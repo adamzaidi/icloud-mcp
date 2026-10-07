@@ -95,6 +95,7 @@ const DESTRUCTIVE = [
   'bulk_move_by_domain', 'bulk_flag_by_sender', 'archive_older_than', 'bulk_flag',
   'run_rule', 'delete_rule', 'run_all_rules', 'delete_contact', 'delete_event',
   'bulk_update_events', 'bulk_create_events', 'bulk_delete_events', 'delete_reminder',
+  'delete_reminder_list',
 ];
 
 function listToolsOverStdio() {
@@ -182,7 +183,7 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     assert.equal(init.result.serverInfo.version, version);
     assert.equal(init.result.serverInfo.name, 'icloud-mail');
     const tools = listed.result.tools;
-    assert.equal(tools.length, 81);
+    assert.equal(tools.length, 83);
     assert.equal(tools[0].name, 'list_accounts');
     assert.equal(tools.at(-1).name, 'suggest_event_from_email');
     const readme = readFileSync(join(projectDir, 'README.md'), 'utf8');
@@ -193,7 +194,7 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
         assert.equal(tool.inputSchema.properties.dryRun.type, 'boolean', `${tool.name} dryRun`);
       }
     }
-    assert.equal(mailTools.length + contactTools.length + calendarTools.length + reminderTools.length + suggestEventTools.length, 81);
+    assert.equal(mailTools.length + contactTools.length + calendarTools.length + reminderTools.length + suggestEventTools.length, 83);
   });
 
   await t.test('delete_email dryRun reports the message and does not delete', async () => {
@@ -512,6 +513,23 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     });
     assert.equal(scripts.length, 1);
     assert.ok(!scripts[0].includes('app.delete'));
+    setJxaRunnerForTests(null);
+  });
+
+  await t.test('delete_reminder_list dryRun does not delete the list', async () => {
+    const scripts = [];
+    setJxaRunnerForTests((script) => {
+      scripts.push(script);
+      return JSON.stringify({
+        dryRun: true, wouldDelete: true, reminderCount: 0,
+        changes: [{ action: 'delete_reminder_list', name: 'Example', id: 'list-1', reminderCount: 0 }],
+      });
+    });
+    const result = await handleReminderTool('delete_reminder_list', { name: 'Example', dryRun: true }, ctx);
+    assert.equal(result.dryRun, true);
+    assert.equal(result.changes[0].action, 'delete_reminder_list');
+    assert.equal(scripts.length, 1);
+    assert.ok(scripts[0].includes('const dryRun = true'));
     setJxaRunnerForTests(null);
   });
 });
