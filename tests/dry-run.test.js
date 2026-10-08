@@ -124,7 +124,9 @@ function listToolsOverStdio() {
       reject(new Error(`timed out waiting for tools/list\n${stdout.slice(0, 500)}`));
     }, 8000);
     child.stdout.on('data', () => {
-      const lines = stdout.split('\n').filter((line) => line.trim().startsWith('{'));
+      // The tools/list reply is large and arrives in several chunks; the text after
+      // the last newline may be a partial line, so only parse complete lines.
+      const lines = stdout.split('\n').slice(0, -1).filter((line) => line.trim().startsWith('{'));
       const messages = lines.map((line) => JSON.parse(line));
       const init = messages.find((message) => message.id === 0);
       const listed = messages.find((message) => message.id === 1);
