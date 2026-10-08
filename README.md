@@ -197,13 +197,25 @@ Listing reminders reads each property for the whole list in one batch. A list of
 
 `bulk_move`, `bulk_delete`, `bulk_flag`, `search_emails`, `count_emails`, and rules accept any combination of: `sender`, `domain`, `subject`, `before`, `since`, `unread`, `flagged`, `larger`, `smaller`, `hasAttachment`, and `account`.
 
+A `domain` filter searches both the bare domain and `@domain`. iCloud's FROM search misses some senders when given only the bare domain. Subdomains are not matched: a filter of `example.com` does not find mail from `someone@mail.example.com`. When a keyword and a domain are both set, `search_emails` keeps both conditions.
+
 ## Safe move
 
 `bulk_move`, `bulk_move_by_sender`, `bulk_move_by_domain`, and `archive_older_than` copy, verify fingerprints in the destination, then remove the source. `get_move_status` and `abandon_move` inspect or clear the manifest.
 
+## Connections
+
+An idle iCloud IMAP connection times out after 60 seconds of silence. The server logs the error and that tool call fails. The process stays up. Saving a draft uses its own IMAP connection and attaches the same handler.
+
 ## Tests
 
-`npm test` runs the offline suite (mocked IMAP, CardDAV, CalDAV, and Reminders — no account required). If `IMAP_USER` and `IMAP_PASSWORD` are set, it also runs the live integration suite.
+`npm test` runs the offline suite only. It mocks IMAP, CardDAV, CalDAV, and Reminders, and it does not contact iCloud or send mail.
+
+`npm run test:live` runs the dummy-data suite in `tests/live-destructive.test.js`. It stays skipped unless `ICLOUD_MCP_LIVE=1`, `IMAP_USER`, and `IMAP_PASSWORD` are all set. It creates dummy contacts, reminders, calendar events, and messages appended into a temp folder, then deletes those dummies. It does not send mail. Set `LIVE_CALENDAR` to the calendar that should receive the dummy events. Calendar tests are skipped when that variable is unset. Delete tools run as a dry run first and skip the real delete unless that preview names exactly the dummies from this run.
+
+`npm run test:send` runs `tests/test.js`. It stays skipped unless `ICLOUD_MCP_SEND=1`, `IMAP_USER`, and `IMAP_PASSWORD` are all set. Every message it sends goes only to the account in `IMAP_USER`. Reply, reply-all, and forward act on a seed that account just sent to itself, never on other inbox mail. Before each send, a guard checks every To, Cc, and Bcc recipient (case and surrounding whitespace ignored) and aborts the run if any address is anyone else.
+
+`dryRun: true` on a delete, a move that removes the original, or a bulk change returns `{ dryRun: true, changes: [...] }` and does not write. Omit it, or pass false, to perform the change.
 
 ## Security
 
