@@ -199,6 +199,10 @@ Set `ICLOUD_MCP_DATA_DIR` to store those files somewhere else. Do not point it a
 
 `bulk_move`, `bulk_move_by_sender`, `bulk_move_by_domain`, and `archive_older_than` copy, verify fingerprints in the destination, then remove the source. `get_move_status` and `abandon_move` inspect or clear the manifest.
 
+## Connections
+
+An idle iCloud IMAP connection times out after 60 seconds of silence. The server logs the error and that tool call fails. The process stays up. Saving a draft uses its own IMAP connection and attaches the same handler.
+
 ## Tests
 
 `npm test` runs the offline suite only. It mocks IMAP, CardDAV, CalDAV, and Reminders, and it does not contact iCloud or send mail.
