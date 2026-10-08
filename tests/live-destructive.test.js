@@ -13,11 +13,12 @@
 // - empty_trash is only ever called with dryRun: true.
 // - Rules and the move manifest are written to a temp ICLOUD_MCP_DATA_DIR, so the
 //   real ~/.icloud-mcp-*.json files are never read or changed.
-// - Calendar dummies go on the calendar named by LIVE_CALENDAR (default "claude"),
-//   in January 2030, with alerts off.
+// - Calendar dummies go on the calendar named by LIVE_CALENDAR (required; calendar
+//   tests skip when it is unset), in January 2030, with alerts off.
 //
 // Run with:  ICLOUD_MCP_LIVE=1 IMAP_USER=... IMAP_PASSWORD=... npm run test:live
-// Optional:  MASS_COUNT=600 (dummy emails in the bulk_delete batch; default crosses
+// Optional:  LIVE_CALENDAR=<disposable calendar name> (required for calendar tests),
+//            MASS_COUNT=600 (dummy emails in the bulk_delete batch; default crosses
 //            the 500-message chunk boundary), --verbose for server stderr.
 
 import { spawnSync } from 'child_process';
@@ -51,7 +52,7 @@ const LIST_NAME = `${LIST_PREFIX}${RUN}`;
 const TRASH = 'Deleted Messages';
 const SRC = `${TAG}-src`;                       // move/flag/rule tests
 const DST = `${TAG}-dst`;
-const CALENDAR_NAME = process.env.LIVE_CALENDAR || 'claude';
+const CALENDAR_NAME = (process.env.LIVE_CALENDAR || '').trim();
 const CAL_SINCE = '2030-01-01';
 const CAL_BEFORE = '2030-02-01';
 const DATA_DIR = mkdtempSync(join(tmpdir(), 'icloud-mcp-live-'));
@@ -205,7 +206,22 @@ try {
       console.log(`  ${box.path} holds non-dummy mail; leaving it alone`);
       continue;
     }
-    if (subjects.length) callTool('bulk_delete', { sourceMailbox: box.path });
+    const expected = await uidsIn(box.path, { all: true });
+    if (expected.length) {
+      let dry;
+      try {
+        dry = callTool('bulk_delete', { sourceMailbox: box.path, dryRun: true });
+      } catch (err) {
+        console.log(`  ${box.path} dry run failed (${err.message}); leaving it alone`);
+        continue;
+      }
+      const named = dry?.uids ?? dry?.changes?.map((c) => c.uid) ?? [];
+      if (dry?.dryRun !== true || !sameSet(named, expected)) {
+        console.log(`  ${box.path} dry run did not match the folder UIDs; leaving it alone`);
+        continue;
+      }
+      callTool('bulk_delete', { sourceMailbox: box.path });
+    }
     callTool('delete_mailbox', { name: box.path });
     console.log(`  removed leftover folder ${box.path} (${subjects.length} dummies)`);
   }
@@ -236,19 +252,23 @@ try {
 }
 
 let calendarId = null;
-try {
-  const { calendars } = callTool('list_calendars');
-  calendarId = calendars.find((c) => c.name === CALENDAR_NAME)?.calendarId ?? null;
-  if (calendarId) {
-    const { events } = callTool('list_events', { calendarId, since: CAL_SINCE, before: CAL_BEFORE, limit: 500 });
-    const stale = events.filter((e) => (e.summary || '').includes(TAG_PREFIX));
-    if (stale.length) {
-      callTool('bulk_delete_events', { calendarId, eventIds: stale.map((e) => e.eventId) });
-      console.log(`  removed ${stale.length} leftover dummy events`);
+if (!CALENDAR_NAME) {
+  console.log('  calendar cleanup skipped (set LIVE_CALENDAR to a disposable calendar)');
+} else {
+  try {
+    const { calendars } = callTool('list_calendars');
+    calendarId = calendars.find((c) => c.name === CALENDAR_NAME)?.calendarId ?? null;
+    if (calendarId) {
+      const { events } = callTool('list_events', { calendarId, since: CAL_SINCE, before: CAL_BEFORE, limit: 500 });
+      const stale = events.filter((e) => (e.summary || '').includes(TAG_PREFIX));
+      if (stale.length) {
+        callTool('bulk_delete_events', { calendarId, eventIds: stale.map((e) => e.eventId) });
+        console.log(`  removed ${stale.length} leftover dummy events`);
+      }
     }
+  } catch (err) {
+    console.log(`  calendar cleanup failed: ${err.message}`);
   }
-} catch (err) {
-  console.log(`  calendar cleanup failed: ${err.message}`);
 }
 
 // ─── Contacts ─────────────────────────────────────────────────────────────────
@@ -406,12 +426,16 @@ await test('rename_reminder_list dryRun leaves the name alone', () => {
 
 await test('rename_reminder_list rejects a name already in use', () => {
   if (!listCreated) throw new Skip('no dummy list');
-  const taken = callTool('list_reminder_lists').lists.find((l) => l.name !== LIST_NAME)?.name;
-  if (!taken) throw new Skip('no other list to collide with');
-  let rejected = false;
-  try { callTool('rename_reminder_list', { oldName: LIST_NAME, newName: taken }); } catch (err) { rejected = /already exists/.test(err.message); }
-  assert(rejected, 'rename onto an existing name was allowed');
-  assert(callTool('list_reminder_lists').lists.some((l) => l.name === LIST_NAME), 'list name changed anyway');
+  const other = `${LIST_NAME}-other`;
+  callTool('create_reminder_list', { name: other });
+  try {
+    let rejected = false;
+    try { callTool('rename_reminder_list', { oldName: LIST_NAME, newName: other }); } catch (err) { rejected = /already exists/.test(err.message); }
+    assert(rejected, 'rename onto an existing name was allowed');
+    assert(callTool('list_reminder_lists').lists.some((l) => l.name === LIST_NAME), 'list name changed anyway');
+  } finally {
+    callTool('delete_reminder_list', { name: other });
+  }
 });
 
 await test('rename_reminder_list renames the dummy list', () => {
@@ -753,14 +777,19 @@ await test('wipe and delete both temp folders', async () => {
 
 // ─── Calendar ─────────────────────────────────────────────────────────────────
 
-console.log(`\nCalendar (dummy events on "${CALENDAR_NAME}", Jan 2030, no alerts)`);
+console.log(CALENDAR_NAME
+  ? `\nCalendar (dummy events on "${CALENDAR_NAME}", Jan 2030, no alerts)`
+  : '\nCalendar (skipped: set LIVE_CALENDAR to a disposable calendar name)');
 let eventIds = [];
 
 function taggedEvents() {
   const { events } = callTool('list_events', { calendarId, since: CAL_SINCE, before: CAL_BEFORE, limit: 500 });
   return events.filter((e) => (e.summary || '').includes(TAG));
 }
-function needCal() { if (!calendarId) throw new Skip(`no calendar named "${CALENDAR_NAME}"`); }
+function needCal() {
+  if (!CALENDAR_NAME) throw new Skip('LIVE_CALENDAR is not set');
+  if (!calendarId) throw new Skip(`no calendar named "${CALENDAR_NAME}"`);
+}
 
 const dummyEvents = Array.from({ length: 5 }, (_, i) => ({
   summary: `[${TAG}] event ${i + 1}`,
