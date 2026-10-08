@@ -49,6 +49,7 @@ function mockClient(state) {
     async messageFlagsRemove() { state.calls.push('flagsRemove'); },
     async fetchOne(uid) {
       state.calls.push(['fetchOne', uid]);
+      if (state.noEnvelope) return { flags: new Set() };
       return {
         envelope: { subject: 'Fixture note', from: [{ address: 'sender@example.com' }] },
         flags: new Set(),
@@ -318,6 +319,20 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     // iCloud misses some senders with the bare domain alone, so both forms are searched.
     assert.deepEqual(state.lastSearch, { or: [{ from: 'example.com' }, { from: '@example.com' }] });
     assertUidChanges(result, 'move', { sourceMailbox: 'INBOX', targetMailbox: 'Newsletters' });
+  });
+
+  await t.test('search_emails survives a fetch reply with no envelope', async () => {
+    // Seen live: a message that changed mid-search came back without its envelope,
+    // and reading envelope.subject crashed the whole tool call.
+    resetImap();
+    state.noEnvelope = true;
+    try {
+      const result = await handleMailTool('search_emails', { domain: 'example.com', mailbox: 'INBOX' }, ctx);
+      assert.equal(result.emails.length, FIXTURE_UIDS.length);
+      assert.equal(result.emails[0].subject, undefined);
+    } finally {
+      state.noEnvelope = false;
+    }
   });
 
   await t.test('archive_older_than dryRun', async () => {
