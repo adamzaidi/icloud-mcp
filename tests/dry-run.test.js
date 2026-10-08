@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'child_process';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, readFileSync, rmSync, existsSync } from 'fs';
 import { tmpdir, homedir } from 'os';
 import { join } from 'path';
@@ -11,14 +12,15 @@ const dataRoot = mkdtempSync(join(tmpdir(), 'icloud-mcp-test-'));
 process.env.ICLOUD_MCP_DATA_DIR = dataRoot;
 
 const { dataDir, dataFile } = await import('../lib/data-paths.js');
-const { setImapClientFactory } = await import('../lib/imap.js');
+const { setImapClientFactory, createRateLimitedClient } = await import('../lib/imap.js');
 const { handleMailTool, mailTools } = await import('../lib/tools/mail.js');
 const { handleContactTool, contactTools } = await import('../lib/tools/contacts.js');
 const { handleCalendarTool, calendarTools, suggestEventTools } = await import('../lib/tools/calendar.js');
 const { handleReminderTool, reminderTools } = await import('../lib/tools/reminders.js');
 const { setCardDavRequestForTests, setCardDavDiscoveryForTests } = await import('../lib/carddav.js');
 const { setCalDavRequestForTests, setCalDavDiscoveryForTests } = await import('../lib/caldav.js');
-const { setJxaRunnerForTests } = await import('../lib/reminders.js');
+const { setJxaRunnerForTests, asArray } = await import('../lib/reminders.js');
+const { attachImapErrorHandler } = await import('../lib/smtp.js');
 
 const FIXTURE_UIDS = [101, 202];
 const MUTATIONS = new Set(['messageDelete', 'messageMove', 'flagsAdd', 'flagsRemove', 'mailboxDelete', 'mailboxCreate', 'mailboxRename']);
@@ -36,8 +38,9 @@ function mockClient(state) {
       state.calls.push(['status', name]);
       return { messages: 2, unseen: 1, recent: 0 };
     },
-    async search() {
+    async search(query) {
       state.calls.push('search');
+      state.lastSearch = query;
       return [...FIXTURE_UIDS];
     },
     async messageDelete(uids) { state.calls.push(['messageDelete', uids]); },
@@ -124,7 +127,9 @@ function listToolsOverStdio() {
       reject(new Error(`timed out waiting for tools/list\n${stdout.slice(0, 500)}`));
     }, 8000);
     child.stdout.on('data', () => {
-      const lines = stdout.split('\n').filter((line) => line.trim().startsWith('{'));
+      // The tools/list reply is large and arrives in several chunks; the text after
+      // the last newline may be a partial line, so only parse complete lines.
+      const lines = stdout.split('\n').slice(0, -1).filter((line) => line.trim().startsWith('{'));
       const messages = lines.map((line) => JSON.parse(line));
       const init = messages.find((message) => message.id === 0);
       const listed = messages.find((message) => message.id === 1);
@@ -195,6 +200,35 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
       }
     }
     assert.equal(mailTools.length + contactTools.length + calendarTools.length + reminderTools.length + suggestEventTools.length, 84);
+  });
+
+  await t.test('IMAP client errors are handled, not thrown', () => {
+    // A socket timeout emits 'error' on the client; with no listener Node throws
+    // it and the server process exits mid-operation.
+    setImapClientFactory(null);
+    const client = createRateLimitedClient({ user: 'nobody@example.invalid', pass: 'x' });
+    assert.ok(client.listenerCount('error') > 0);
+    assert.doesNotThrow(() => client.emit('error', new Error('Socket timeout')));
+  });
+
+  await t.test('save_draft IMAP errors are handled, not thrown', () => {
+    const smtp = readFileSync(join(projectDir, 'lib/smtp.js'), 'utf8');
+    assert.match(smtp, /attachImapErrorHandler\(client\)/);
+    const client = new EventEmitter();
+    attachImapErrorHandler(client);
+    assert.equal(client.listenerCount('error'), 1);
+    const lines = [];
+    const write = process.stderr.write;
+    process.stderr.write = (chunk) => {
+      lines.push(String(chunk));
+      return true;
+    };
+    try {
+      assert.doesNotThrow(() => client.emit('error', new Error('Socket timeout')));
+    } finally {
+      process.stderr.write = write;
+    }
+    assert.match(lines.join(''), /\[imap\] connection error: Socket timeout/);
   });
 
   await t.test('delete_email dryRun reports the message and does not delete', async () => {
@@ -281,6 +315,8 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     }, ctx);
     assert.equal(result.wouldMove, 2);
     assert.equal(result.domain, 'example.com');
+    // iCloud misses some senders with the bare domain alone, so both forms are searched.
+    assert.deepEqual(state.lastSearch, { or: [{ from: 'example.com' }, { from: '@example.com' }] });
     assertUidChanges(result, 'move', { sourceMailbox: 'INBOX', targetMailbox: 'Newsletters' });
   });
 
@@ -516,6 +552,19 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     setJxaRunnerForTests(null);
   });
 
+  await t.test('rename_reminder_list dryRun does not rename', async () => {
+    const scripts = [];
+    setJxaRunnerForTests((script) => {
+      scripts.push(script);
+      return JSON.stringify({ dryRun: true, changes: [{ action: 'rename_reminder_list', id: 'list-1', from: 'Old', to: 'New' }] });
+    });
+    const result = await handleReminderTool('rename_reminder_list', { oldName: 'Old', newName: 'New', dryRun: true }, ctx);
+    assert.equal(result.changes[0].to, 'New');
+    assert.equal(scripts.length, 1);
+    assert.ok(scripts[0].includes('const dryRun = true'));
+    setJxaRunnerForTests(null);
+  });
+
   await t.test('delete_reminder_list dryRun does not delete the list', async () => {
     const scripts = [];
     setJxaRunnerForTests((script) => {
@@ -533,19 +582,6 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     setJxaRunnerForTests(null);
   });
 
-  await t.test('rename_reminder_list dryRun does not rename', async () => {
-    const scripts = [];
-    setJxaRunnerForTests((script) => {
-      scripts.push(script);
-      return JSON.stringify({ dryRun: true, changes: [{ action: 'rename_reminder_list', id: 'list-1', from: 'Old', to: 'New' }] });
-    });
-    const result = await handleReminderTool('rename_reminder_list', { oldName: 'Old', newName: 'New', dryRun: true }, ctx);
-    assert.equal(result.changes[0].to, 'New');
-    assert.equal(scripts.length, 1);
-    assert.ok(scripts[0].includes('const dryRun = true'));
-    setJxaRunnerForTests(null);
-  });
-
   await t.test('reminder lookups and listings batch their Apple Events', async () => {
     const scripts = [];
     setJxaRunnerForTests((script) => {
@@ -554,9 +590,15 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     });
     await handleReminderTool('list_reminders', { listName: 'Example' }, ctx);
     await handleReminderTool('complete_reminder', { listName: 'Example', reminderId: 'r' }, ctx);
-    assert.ok(scripts[0].includes('spec.name()'), 'list_reminders should read names in one batch');
+    assert.ok(scripts[0].includes('asArray(spec.name())'), 'list_reminders should read names in one batch');
     assert.ok(!scripts[0].includes('r.name()'), 'list_reminders should not read per reminder');
-    assert.ok(scripts[1].includes('whose({ id: id })'), 'findReminder should use a whose() query');
+    assert.ok(scripts[1].includes('asArray(list.reminders.whose({ id: id })())'), 'findReminder should coerce whose()');
+    assert.ok(scripts[0].includes(asArray.toString()));
+    assert.ok(scripts[1].includes(asArray.toString()));
+    assert.deepEqual(asArray(undefined), []);
+    assert.deepEqual(asArray(null), []);
+    assert.deepEqual(asArray('only-id'), ['only-id']);
+    assert.deepEqual(asArray(['a', 'b']), ['a', 'b']);
     setJxaRunnerForTests(null);
   });
 });
