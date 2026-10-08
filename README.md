@@ -1,6 +1,6 @@
 # icloud-mcp
 
-Maintained Model Context Protocol (MCP) server for iCloud Mail, Contacts, Calendar, and Reminders. Version **2.7.0** (84 tools).
+Maintained Model Context Protocol (MCP) server for iCloud Mail, Contacts, Calendar, and Reminders. Version **2.7.0** (86 tools).
 
 ## Features
 
@@ -79,7 +79,7 @@ Rules, the move manifest, digest state, and the session log are written outside 
 
 Set `ICLOUD_MCP_DATA_DIR` to store those files somewhere else. Do not point it at the git checkout. Contact exports, CRM notes, `.env`, and digest output belong outside the repo; `.gitignore` already excludes the usual local folders.
 
-## Available tools (84)
+## Available tools (86)
 
 `dryRun: true` returns `{ dryRun: true, changes: [...] }` plus the existing count fields (`wouldDelete`, `wouldMove`, and so on). Omitted or false performs the change.
 
@@ -159,6 +159,8 @@ Set `ICLOUD_MCP_DATA_DIR` to store those files somewhere else. Do not point it a
 | Tool | Description | dryRun |
 |------|-------------|--------|
 | `list_calendars` | List all calendars in iCloud Calendar (e.g. Personal, Work, School). Returns calendarId, name, and supported event types. |  |
+| `create_calendar` | Create a new event calendar in iCloud Calendar. Fails if a calendar with that name already exists. |  |
+| `delete_calendar` | Delete an iCloud event calendar by exact name or calendarId. The calendar must have no events (past or future); delete them first with bulk_delete_events. Will not delete Reminders lists. | yes |
 | `list_events` | List events in a specific iCloud calendar within a date range. Use list_calendars first to get a calendarId. |  |
 | `get_event` | Get full details of a specific calendar event by its ID. |  |
 | `create_event` | Create a new event in an iCloud calendar. For all-day events use allDay:true and YYYY-MM-DD for start/end. |  |

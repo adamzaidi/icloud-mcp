@@ -98,7 +98,7 @@ const DESTRUCTIVE = [
   'bulk_move_by_domain', 'bulk_flag_by_sender', 'archive_older_than', 'bulk_flag',
   'run_rule', 'delete_rule', 'run_all_rules', 'delete_contact', 'delete_event',
   'bulk_update_events', 'bulk_create_events', 'bulk_delete_events', 'delete_reminder',
-  'delete_reminder_list', 'rename_reminder_list',
+  'delete_reminder_list', 'rename_reminder_list', 'delete_calendar',
 ];
 
 function listToolsOverStdio() {
@@ -188,7 +188,7 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     assert.equal(init.result.serverInfo.version, version);
     assert.equal(init.result.serverInfo.name, 'icloud-mail');
     const tools = listed.result.tools;
-    assert.equal(tools.length, 84);
+    assert.equal(tools.length, 86);
     assert.equal(tools[0].name, 'list_accounts');
     assert.equal(tools.at(-1).name, 'suggest_event_from_email');
     const readme = readFileSync(join(projectDir, 'README.md'), 'utf8');
@@ -199,7 +199,7 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
         assert.equal(tool.inputSchema.properties.dryRun.type, 'boolean', `${tool.name} dryRun`);
       }
     }
-    assert.equal(mailTools.length + contactTools.length + calendarTools.length + reminderTools.length + suggestEventTools.length, 84);
+    assert.equal(mailTools.length + contactTools.length + calendarTools.length + reminderTools.length + suggestEventTools.length, 86);
   });
 
   await t.test('IMAP client errors are handled, not thrown', () => {
@@ -467,6 +467,66 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
       summary: 'Fixture meeting', start: '2026-01-02T15:00:00Z', end: '2026-01-02T16:00:00Z',
     });
     assert.deepEqual(methods, ['GET']);
+  });
+
+  const calendarHome = (cals) => `<?xml version="1.0"?><multistatus xmlns="DAV:">${cals.map(([id, name, comp]) =>
+    `<response><href>/calendars/${id}/</href><propstat><prop><resourcetype><collection/><calendar xmlns="urn:ietf:params:xml:ns:caldav"/></resourcetype>` +
+    `<displayname>${name}</displayname><supported-calendar-component-set xmlns="urn:ietf:params:xml:ns:caldav"><comp name="${comp}"/></supported-calendar-component-set></prop></propstat></response>`).join('')}</multistatus>`;
+  const calendarItems = (n) => `<?xml version="1.0"?><multistatus xmlns="DAV:"><response><href>/calendars/cal-1/</href></response>${
+    Array.from({ length: n }, (_, i) => `<response><href>/calendars/cal-1/evt-${i}.ics</href></response>`).join('')}</multistatus>`;
+  function mockCalendars(cals, items) {
+    const calls = [];
+    setCalDavRequestForTests(async (method, url, opts = {}) => {
+      calls.push([method, url, opts.body]);
+      if (method === 'PROPFIND' && url.endsWith('/calendars/')) return { status: 207, body: calendarHome(cals) };
+      if (method === 'PROPFIND') return { status: 207, body: calendarItems(items) };
+      if (method === 'MKCALENDAR') return { status: 201, body: '' };
+      if (method === 'DELETE') return { status: 204, body: '' };
+      throw new Error(`unexpected CalDAV ${method}`);
+    });
+    setCalDavDiscoveryForTests({ dataHost: 'https://cal.example.test', calendarsPath: '/calendars/' });
+    return calls;
+  }
+
+  await t.test('delete_calendar dryRun reports events and deletes nothing', async () => {
+    const calls = mockCalendars([['cal-1', 'Scratch', 'VEVENT']], 2);
+    const result = await handleCalendarTool('delete_calendar', { name: 'Scratch', dryRun: true }, ctx);
+    assert.equal(result.dryRun, true);
+    assert.equal(result.wouldDelete, false);
+    assert.deepEqual(result.changes, [{ action: 'delete_calendar', calendarId: 'cal-1', name: 'Scratch', eventCount: 2 }]);
+    assert.ok(calls.every(([method]) => method === 'PROPFIND'));
+  });
+
+  await t.test('delete_calendar refuses a calendar that still has events', async () => {
+    const calls = mockCalendars([['cal-1', 'Scratch', 'VEVENT']], 1);
+    await assert.rejects(handleCalendarTool('delete_calendar', { name: 'Scratch' }, ctx), /still has 1 event/);
+    assert.ok(!calls.some(([method]) => method === 'DELETE'));
+  });
+
+  await t.test('delete_calendar refuses Reminders lists and ambiguous names', async () => {
+    let calls = mockCalendars([['todo-1', 'Groceries', 'VTODO']], 0);
+    await assert.rejects(handleCalendarTool('delete_calendar', { name: 'Groceries' }, ctx), /not an event calendar/);
+    calls = calls.concat(mockCalendars([['a', 'Dup', 'VEVENT'], ['b', 'Dup', 'VEVENT']], 0));
+    await assert.rejects(handleCalendarTool('delete_calendar', { name: 'Dup' }, ctx), /More than one calendar/);
+    assert.ok(!calls.some(([method]) => method === 'DELETE'));
+  });
+
+  await t.test('delete_calendar deletes an empty calendar by id', async () => {
+    const calls = mockCalendars([['cal-1', 'Scratch', 'VEVENT']], 0);
+    const result = await handleCalendarTool('delete_calendar', { calendarId: 'cal-1' }, ctx);
+    assert.deepEqual(result, { deleted: true, calendarId: 'cal-1', name: 'Scratch' });
+    assert.deepEqual(calls.filter(([m]) => m === 'DELETE').map(([, url]) => url), ['https://cal.example.test/calendars/cal-1/']);
+  });
+
+  await t.test('create_calendar rejects duplicates and escapes the name', async () => {
+    let calls = mockCalendars([['cal-1', 'Scratch', 'VEVENT']], 0);
+    await assert.rejects(handleCalendarTool('create_calendar', { name: 'Scratch' }, ctx), /already exists/);
+    assert.ok(!calls.some(([method]) => method === 'MKCALENDAR'));
+    calls = mockCalendars([['cal-1', 'Scratch', 'VEVENT']], 0);
+    const result = await handleCalendarTool('create_calendar', { name: 'Trips & <Plans>' }, ctx);
+    assert.equal(result.created, true);
+    const mk = calls.find(([method]) => method === 'MKCALENDAR');
+    assert.ok(mk[2].includes('<A:displayname>Trips &amp; &lt;Plans&gt;</A:displayname>'));
   });
 
   await t.test('bulk_delete_events dryRun', async () => {
