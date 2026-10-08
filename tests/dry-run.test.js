@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'child_process';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, readFileSync, rmSync, existsSync } from 'fs';
 import { tmpdir, homedir } from 'os';
 import { join } from 'path';
@@ -19,6 +20,7 @@ const { handleReminderTool, reminderTools } = await import('../lib/tools/reminde
 const { setCardDavRequestForTests, setCardDavDiscoveryForTests } = await import('../lib/carddav.js');
 const { setCalDavRequestForTests, setCalDavDiscoveryForTests } = await import('../lib/caldav.js');
 const { setJxaRunnerForTests } = await import('../lib/reminders.js');
+const { attachImapErrorHandler } = await import('../lib/smtp.js');
 
 const FIXTURE_UIDS = [101, 202];
 const MUTATIONS = new Set(['messageDelete', 'messageMove', 'flagsAdd', 'flagsRemove', 'mailboxDelete', 'mailboxCreate', 'mailboxRename']);
@@ -204,6 +206,26 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     const client = createRateLimitedClient({ user: 'nobody@example.invalid', pass: 'x' });
     assert.ok(client.listenerCount('error') > 0);
     assert.doesNotThrow(() => client.emit('error', new Error('Socket timeout')));
+  });
+
+  await t.test('save_draft IMAP errors are handled, not thrown', () => {
+    const smtp = readFileSync(join(projectDir, 'lib/smtp.js'), 'utf8');
+    assert.match(smtp, /attachImapErrorHandler\(client\)/);
+    const client = new EventEmitter();
+    attachImapErrorHandler(client);
+    assert.equal(client.listenerCount('error'), 1);
+    const lines = [];
+    const write = process.stderr.write;
+    process.stderr.write = (chunk) => {
+      lines.push(String(chunk));
+      return true;
+    };
+    try {
+      assert.doesNotThrow(() => client.emit('error', new Error('Socket timeout')));
+    } finally {
+      process.stderr.write = write;
+    }
+    assert.match(lines.join(''), /\[imap\] connection error: Socket timeout/);
   });
 
   await t.test('delete_email dryRun reports the message and does not delete', async () => {
