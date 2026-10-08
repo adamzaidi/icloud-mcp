@@ -201,7 +201,13 @@ Set `ICLOUD_MCP_DATA_DIR` to store those files somewhere else. Do not point it a
 
 ## Tests
 
-`npm test` runs the offline suite (mocked IMAP, CardDAV, CalDAV, and Reminders — no account required). If `IMAP_USER` and `IMAP_PASSWORD` are set, it also runs the live integration suite.
+`npm test` runs the offline suite only. It mocks IMAP, CardDAV, CalDAV, and Reminders, and it does not contact iCloud or send mail.
+
+`npm run test:live` runs the dummy-data suite in `tests/live-destructive.test.js`. It stays skipped unless `ICLOUD_MCP_LIVE=1`, `IMAP_USER`, and `IMAP_PASSWORD` are all set. It creates dummy contacts, reminders, calendar events, and messages appended into a temp folder, then deletes those dummies. It does not send mail. Set `LIVE_CALENDAR` to the calendar that should receive the dummy events. Calendar tests are skipped when that variable is unset. Delete tools run as a dry run first and skip the real delete unless that preview names exactly the dummies from this run.
+
+`npm run test:send` runs `tests/test.js`. It stays skipped unless `ICLOUD_MCP_SEND=1`, `IMAP_USER`, and `IMAP_PASSWORD` are all set. Every message it sends goes only to the account in `IMAP_USER`. Reply, reply-all, and forward act on a seed that account just sent to itself, never on other inbox mail. Before each send, a guard checks every To, Cc, and Bcc recipient (case and surrounding whitespace ignored) and aborts the run if any address is anyone else.
+
+`dryRun: true` on a delete, a move that removes the original, or a bulk change returns `{ dryRun: true, changes: [...] }` and does not write. Omit it, or pass false, to perform the change.
 
 ## Security
 

@@ -3,12 +3,14 @@ import { writeFileSync, unlinkSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
+import { assertReplyStaysWithAccount, assertSelfOnlyRecipients } from './send-guard.js';
 
 const IMAP_USER = process.env.IMAP_USER;
 const IMAP_PASSWORD = process.env.IMAP_PASSWORD;
 
-if (!IMAP_USER || !IMAP_PASSWORD) {
-  console.log('Skipping live iCloud integration tests (set IMAP_USER and IMAP_PASSWORD to run them).');
+// Opt-in. Credentials alone must not send mail. Every recipient is checked against IMAP_USER.
+if (process.env.ICLOUD_MCP_SEND !== '1' || !IMAP_USER || !IMAP_PASSWORD) {
+  console.log('Skipping send tests (set ICLOUD_MCP_SEND=1, IMAP_USER, and IMAP_PASSWORD). This suite emails only the tested account.');
   process.exit(0);
 }
 
@@ -136,6 +138,20 @@ function test(name, fn) {
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+// A guard failure aborts the process. test() would otherwise catch it and keep sending.
+function guardOrAbort(check) {
+  try {
+    return check();
+  } catch (err) {
+    console.error(`\n${err.message}\nAborting: send tests may only email the tested account.`);
+    process.exit(1);
+  }
+}
+
+function guardSend(recipients) {
+  guardOrAbort(() => assertSelfOnlyRecipients(recipients, IMAP_USER));
 }
 
 console.log(`\n🧪 iCloud MCP Server Tests v${version}\n`);
@@ -1063,27 +1079,61 @@ test('rules cleanup (delete all remaining test rules)', () => {
 });
 
 // ─── Email Sending (SMTP) ─────────────────────────────────────────────────────
+// Only the tested account is ever addressed. Reply, reply-all, and forward act on
+// a seed this run sent to itself, never on mail that was already in the inbox.
 console.log('\n📤 Email Sending (SMTP)');
 
 const SMTP_TS = Date.now();
+const SEED_SUBJECT = `[mcp-test-seed-${SMTP_TS}]`;
+let seedEmail = null;
 
-test('compose_email (send to self)', () => {
+function requireSeed() {
+  if (!seedEmail?.uid) {
+    console.error('\nNo self-seed message. Aborting before reply or forward.');
+    process.exit(1);
+  }
+  return seedEmail;
+}
+
+function waitForSeed() {
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    const found = callTool('search_emails', { query: SEED_SUBJECT, limit: 10 });
+    const hit = (found.emails || []).find((email) => email.subject === SEED_SUBJECT);
+    if (hit) {
+      const full = callTool('get_email', { uid: hit.uid, mailbox: 'INBOX', includeHeaders: true });
+      if (full?.subject !== SEED_SUBJECT) throw new Error('seed lookup returned a different subject');
+      return full;
+    }
+    if (attempt < 6) spawnSync('sleep', ['5']);
+  }
+  throw new Error('self-seed did not arrive in the inbox');
+}
+
+function assertAccepted(result) {
+  guardSend(result.accepted);
+}
+
+test('compose_email (seed to self)', () => {
+  guardSend({ to: IMAP_USER });
   const result = callTool('compose_email', {
     to: IMAP_USER,
-    subject: `[mcp-test-compose-${SMTP_TS}]`,
-    body: 'Automated test email from the iCloud MCP server test suite.'
+    subject: SEED_SUBJECT,
+    body: 'Seed message from the tested account to itself. Safe to delete.'
   });
   assert(result.sent === true, 'sent should be true');
   assert(typeof result.messageId === 'string', 'messageId should be a string');
   assert(result.messageId.length > 0, 'messageId should not be empty');
-  assert(Array.isArray(result.accepted), 'accepted should be an array');
-  assert(result.accepted.length > 0, 'accepted should have at least one recipient');
   assert(Array.isArray(result.rejected), 'rejected should be an array');
   assert(result.rejected.length === 0, 'rejected should be empty');
-  console.log(`\n     → sent to ${result.accepted[0]}, messageId: ${result.messageId?.slice(0, 40)}...`);
+  assertAccepted(result);
+  seedEmail = waitForSeed();
+  guardOrAbort(() => assertReplyStaysWithAccount(seedEmail, IMAP_USER, { replyAll: false }));
+  guardOrAbort(() => assertReplyStaysWithAccount(seedEmail, IMAP_USER, { replyAll: true }));
+  console.log(`\n     → seed stored as uid ${seedEmail.uid}`);
 });
 
-test('compose_email (with cc)', () => {
+test('compose_email (with cc to self)', () => {
+  guardSend({ to: IMAP_USER, cc: IMAP_USER });
   const result = callTool('compose_email', {
     to: IMAP_USER,
     subject: `[mcp-test-compose-cc-${SMTP_TS}]`,
@@ -1092,74 +1142,63 @@ test('compose_email (with cc)', () => {
   });
   assert(result.sent === true, 'sent should be true');
   assert(typeof result.messageId === 'string', 'messageId should be a string');
-  console.log(`\n     → sent with cc, messageId: ${result.messageId?.slice(0, 40)}...`);
+  assertAccepted(result);
+  console.log('\n     → sent with cc to the tested account');
 });
 
-test('reply_to_email', () => {
-  const inbox = callTool('read_inbox', { limit: 1 });
-  assert(inbox.emails.length > 0, 'inbox should have at least one email to reply to');
-  const uid = inbox.emails[0].uid;
+test('reply_to_email (seed only)', () => {
+  const seed = requireSeed();
+  guardOrAbort(() => assertReplyStaysWithAccount(seed, IMAP_USER, { replyAll: false }));
   const result = callTool('reply_to_email', {
-    uid,
-    body: 'Automated test reply from the iCloud MCP server test suite.',
+    uid: seed.uid,
+    body: 'Automated test reply to the self-seed.',
     mailbox: 'INBOX'
   });
   assert(result.sent === true, 'sent should be true');
   assert(typeof result.messageId === 'string', 'messageId should be a string');
   assert(result.messageId.length > 0, 'messageId should not be empty');
-  assert(Array.isArray(result.accepted), 'accepted should be an array');
-  assert(result.accepted.length > 0, 'should have at least one accepted recipient');
   assert('inReplyTo' in result, 'result should have inReplyTo field');
-  console.log(`\n     → reply sent, inReplyTo: ${result.inReplyTo?.slice(0, 40) ?? '(none)'}`);
+  assertAccepted(result);
+  console.log('\n     → reply sent to the tested account');
 });
 
-test('reply_to_email (replyAll: true)', () => {
-  // Fetch several emails and skip system/bounce addresses (mailer-daemon, postmaster)
-  // which iCloud SMTP rejects when used as reply-all recipients
-  const inbox = callTool('read_inbox', { limit: 10 });
-  assert(inbox.emails.length > 0, 'inbox should have at least one email');
-  // Also skip self-sent emails — reply-all filters out IMAP_USER from recipients → empty list
-  const suitable = inbox.emails.find(e =>
-    e.from &&
-    !/mailer-daemon|postmaster/i.test(e.from) &&
-    !e.from.includes(IMAP_USER)
-  );
-  if (!suitable) {
-    console.log(`\n     → no suitable (non-system) email found in first 10 — skipping`);
-    return;
-  }
+test('reply_to_email (replyAll on the seed only)', () => {
+  const seed = requireSeed();
+  guardOrAbort(() => assertReplyStaysWithAccount(seed, IMAP_USER, { replyAll: true }));
   const result = callTool('reply_to_email', {
-    uid: suitable.uid,
-    body: 'Automated test reply-all from the iCloud MCP server test suite.',
-    replyAll: true
+    uid: seed.uid,
+    body: 'Automated test reply-all to the self-seed.',
+    replyAll: true,
+    mailbox: 'INBOX'
   });
   assert(result.sent === true, 'sent should be true');
   assert(typeof result.messageId === 'string', 'messageId should be a string');
   assert('inReplyTo' in result, 'result should have inReplyTo field');
-  console.log(`\n     → reply-all sent to uid ${suitable.uid}, messageId: ${result.messageId?.slice(0, 40)}...`);
+  assertAccepted(result);
+  console.log('\n     → reply-all sent to the tested account');
 });
 
-test('forward_email', () => {
-  const inbox = callTool('read_inbox', { limit: 1 });
-  assert(inbox.emails.length > 0, 'inbox should have at least one email to forward');
-  const uid = inbox.emails[0].uid;
+test('forward_email (seed only)', () => {
+  const seed = requireSeed();
+  guardSend({ to: IMAP_USER });
   const result = callTool('forward_email', {
-    uid,
+    uid: seed.uid,
     to: IMAP_USER,
-    note: 'Forwarded as part of automated iCloud MCP server test.'
+    note: 'Forwarded to the tested account by the send suite.',
+    mailbox: 'INBOX'
   });
   assert(result.sent === true, 'sent should be true');
   assert(typeof result.messageId === 'string', 'messageId should be a string');
   assert(result.messageId.length > 0, 'messageId should not be empty');
-  assert(Array.isArray(result.accepted), 'accepted should be an array');
-  assert(result.accepted.length > 0, 'should have at least one accepted recipient');
-  console.log(`\n     → forwarded to ${result.accepted[0]}, messageId: ${result.messageId?.slice(0, 40)}...`);
+  assertAccepted(result);
+  console.log('\n     → forward sent to the tested account');
 });
 
 test('save_draft (plain text)', () => {
   const subject = `[mcp-test-draft-${SMTP_TS}]`;
   const summaryBefore = callTool('get_mailbox_summary', { mailbox: 'Drafts' });
 
+  guardSend({ to: IMAP_USER });
   const result = callTool('save_draft', {
     to: IMAP_USER,
     subject,
@@ -1185,6 +1224,7 @@ test('save_draft (with cc and bcc)', () => {
   const subject = `[mcp-test-draft-cc-${SMTP_TS}]`;
   const summaryBefore = callTool('get_mailbox_summary', { mailbox: 'Drafts' });
 
+  guardSend({ to: IMAP_USER, cc: IMAP_USER, bcc: IMAP_USER });
   const result = callTool('save_draft', {
     to: IMAP_USER,
     subject,
@@ -1229,6 +1269,7 @@ test('save_draft (HTML formatted)', () => {
 <p>Regards,<br>Alex</p>
 `.trim();
 
+  guardSend({ to: IMAP_USER });
   const result = callTool('save_draft', {
     to: IMAP_USER,
     subject,
