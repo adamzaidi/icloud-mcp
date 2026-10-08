@@ -98,7 +98,7 @@ const DESTRUCTIVE = [
   'bulk_move_by_domain', 'bulk_flag_by_sender', 'archive_older_than', 'bulk_flag',
   'run_rule', 'delete_rule', 'run_all_rules', 'delete_contact', 'delete_event',
   'bulk_update_events', 'bulk_create_events', 'bulk_delete_events', 'delete_reminder',
-  'delete_reminder_list',
+  'delete_reminder_list', 'rename_reminder_list',
 ];
 
 function listToolsOverStdio() {
@@ -188,7 +188,7 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     assert.equal(init.result.serverInfo.version, version);
     assert.equal(init.result.serverInfo.name, 'icloud-mail');
     const tools = listed.result.tools;
-    assert.equal(tools.length, 83);
+    assert.equal(tools.length, 84);
     assert.equal(tools[0].name, 'list_accounts');
     assert.equal(tools.at(-1).name, 'suggest_event_from_email');
     const readme = readFileSync(join(projectDir, 'README.md'), 'utf8');
@@ -199,7 +199,7 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
         assert.equal(tool.inputSchema.properties.dryRun.type, 'boolean', `${tool.name} dryRun`);
       }
     }
-    assert.equal(mailTools.length + contactTools.length + calendarTools.length + reminderTools.length + suggestEventTools.length, 83);
+    assert.equal(mailTools.length + contactTools.length + calendarTools.length + reminderTools.length + suggestEventTools.length, 84);
   });
 
   await t.test('IMAP client errors are handled, not thrown', () => {
@@ -549,6 +549,19 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     });
     assert.equal(scripts.length, 1);
     assert.ok(!scripts[0].includes('app.delete'));
+    setJxaRunnerForTests(null);
+  });
+
+  await t.test('rename_reminder_list dryRun does not rename', async () => {
+    const scripts = [];
+    setJxaRunnerForTests((script) => {
+      scripts.push(script);
+      return JSON.stringify({ dryRun: true, changes: [{ action: 'rename_reminder_list', id: 'list-1', from: 'Old', to: 'New' }] });
+    });
+    const result = await handleReminderTool('rename_reminder_list', { oldName: 'Old', newName: 'New', dryRun: true }, ctx);
+    assert.equal(result.changes[0].to, 'New');
+    assert.equal(scripts.length, 1);
+    assert.ok(scripts[0].includes('const dryRun = true'));
     setJxaRunnerForTests(null);
   });
 
