@@ -19,7 +19,7 @@ const { handleCalendarTool, calendarTools, suggestEventTools } = await import('.
 const { handleReminderTool, reminderTools } = await import('../lib/tools/reminders.js');
 const { setCardDavRequestForTests, setCardDavDiscoveryForTests } = await import('../lib/carddav.js');
 const { setCalDavRequestForTests, setCalDavDiscoveryForTests } = await import('../lib/caldav.js');
-const { setJxaRunnerForTests } = await import('../lib/reminders.js');
+const { setJxaRunnerForTests, asArray } = await import('../lib/reminders.js');
 const { attachImapErrorHandler } = await import('../lib/smtp.js');
 
 const FIXTURE_UIDS = [101, 202];
@@ -579,6 +579,26 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     assert.equal(result.changes[0].action, 'delete_reminder_list');
     assert.equal(scripts.length, 1);
     assert.ok(scripts[0].includes('const dryRun = true'));
+    setJxaRunnerForTests(null);
+  });
+
+  await t.test('reminder lookups and listings batch their Apple Events', async () => {
+    const scripts = [];
+    setJxaRunnerForTests((script) => {
+      scripts.push(script);
+      return JSON.stringify({ reminders: [], count: 0, listName: 'Example', includeCompleted: false, updated: true, id: 'r' });
+    });
+    await handleReminderTool('list_reminders', { listName: 'Example' }, ctx);
+    await handleReminderTool('complete_reminder', { listName: 'Example', reminderId: 'r' }, ctx);
+    assert.ok(scripts[0].includes('asArray(spec.name())'), 'list_reminders should read names in one batch');
+    assert.ok(!scripts[0].includes('r.name()'), 'list_reminders should not read per reminder');
+    assert.ok(scripts[1].includes('asArray(list.reminders.whose({ id: id })())'), 'findReminder should coerce whose()');
+    assert.ok(scripts[0].includes(asArray.toString()));
+    assert.ok(scripts[1].includes(asArray.toString()));
+    assert.deepEqual(asArray(undefined), []);
+    assert.deepEqual(asArray(null), []);
+    assert.deepEqual(asArray('only-id'), ['only-id']);
+    assert.deepEqual(asArray(['a', 'b']), ['a', 'b']);
     setJxaRunnerForTests(null);
   });
 });
