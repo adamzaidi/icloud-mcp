@@ -1,6 +1,6 @@
 # icloud-mcp
 
-Maintained Model Context Protocol (MCP) server for iCloud Mail, Contacts, Calendar, and Reminders. Version **2.7.0** (83 tools).
+Maintained Model Context Protocol (MCP) server for iCloud Mail, Contacts, Calendar, and Reminders. Version **2.7.0** (84 tools).
 
 ## Features
 
@@ -79,7 +79,7 @@ Rules, the move manifest, digest state, and the session log are written outside 
 
 Set `ICLOUD_MCP_DATA_DIR` to store those files somewhere else. Do not point it at the git checkout. Contact exports, CRM notes, `.env`, and digest output belong outside the repo; `.gitignore` already excludes the usual local folders.
 
-## Available tools (83)
+## Available tools (84)
 
 `dryRun: true` returns `{ dryRun: true, changes: [...] }` plus the existing count fields (`wouldDelete`, `wouldMove`, and so on). Omitted or false performs the change.
 
@@ -177,6 +177,7 @@ Set `ICLOUD_MCP_DATA_DIR` to store those files somewhere else. Do not point it a
 |------|-------------|--------|
 | `list_reminder_lists` | List all Reminders lists in iCloud Reminders (e.g. "Reminders", "Work", "Shopping"). Returns name, id, and count per list. |  |
 | `create_reminder_list` | Create a new Reminders list in iCloud Reminders. Fails if a list with that name already exists. |  |
+| `rename_reminder_list` | Rename a Reminders list. The old name must match exactly one list, and the new name must not already be in use. | yes |
 | `delete_reminder_list` | Delete a Reminders list. The list must be empty first, and the name must match exactly one list. | yes |
 | `list_reminders` | List reminders from iCloud Reminders. Omit listName to fetch from all lists. |  |
 | `get_reminder` | Get full details of a specific reminder by ID. |  |
