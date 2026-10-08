@@ -11,13 +11,19 @@
 // - Every delete runs as a dryRun first. If the dry run would touch anything other
 //   than the exact dummy UIDs/IDs this run created, the real delete is skipped.
 // - empty_trash is only ever called with dryRun: true.
+// - Rules and the move manifest are written to a temp ICLOUD_MCP_DATA_DIR, so the
+//   real ~/.icloud-mcp-*.json files are never read or changed.
+// - Calendar dummies go on the calendar named by LIVE_CALENDAR (required; calendar
+//   tests skip when it is unset), in January 2030, with alerts off.
 //
 // Run with:  ICLOUD_MCP_LIVE=1 IMAP_USER=... IMAP_PASSWORD=... npm run test:live
-// Optional:  MASS_COUNT=600 (dummy emails in the bulk_delete batch; default crosses
+// Optional:  LIVE_CALENDAR=<disposable calendar name> (required for calendar tests),
+//            MASS_COUNT=600 (dummy emails in the bulk_delete batch; default crosses
 //            the 500-message chunk boundary), --verbose for server stderr.
 
 import { spawnSync } from 'child_process';
-import { readFileSync } from 'fs';
+import { readFileSync, readdirSync, existsSync, mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
 import { ImapFlow } from 'imapflow';
@@ -44,6 +50,14 @@ const CONTACT_PREFIX = 'MCP Test Dummy';
 const LIST_PREFIX = 'mcp-test-list-';
 const LIST_NAME = `${LIST_PREFIX}${RUN}`;
 const TRASH = 'Deleted Messages';
+const SRC = `${TAG}-src`;                       // move/flag/rule tests
+const DST = `${TAG}-dst`;
+const CALENDAR_NAME = (process.env.LIVE_CALENDAR || '').trim();
+const CAL_SINCE = '2030-01-01';
+const CAL_BEFORE = '2030-02-01';
+const DATA_DIR = mkdtempSync(join(tmpdir(), 'icloud-mcp-live-'));
+const STATE_FILES = ['.icloud-mcp-rules.json', '.icloud-mcp-move-manifest.json'];
+const repoStateBefore = STATE_FILES.filter((f) => existsSync(join(projectDir, f)));
 
 // ─── Harness ──────────────────────────────────────────────────────────────────
 
@@ -55,7 +69,7 @@ function callTool(name, args = {}, timeout = 600000) {
   ].map((m) => JSON.stringify(m)).join('\n') + '\n';
 
   const result = spawnSync(process.execPath, ['index.js'], {
-    cwd: projectDir, input, encoding: 'utf8', timeout, env: process.env,
+    cwd: projectDir, input, encoding: 'utf8', timeout, env: { ...process.env, ICLOUD_MCP_DATA_DIR: DATA_DIR },
   });
   if (VERBOSE && result.stderr?.trim()) console.log(result.stderr.trim().replace(/^/gm, '     '));
   if (result.error) throw new Error(`Spawn error: ${result.error.message}`);
@@ -118,6 +132,7 @@ async function withImap(fn) {
     host: 'imap.mail.me.com', port: 993, secure: true,
     auth: { user: IMAP_USER, pass: IMAP_PASSWORD }, logger: false,
   });
+  client.on('error', () => {}); // a dropped socket rejects the pending command; don't crash the run
   await client.connect();
   try { return await fn(client); } finally { await client.logout().catch(() => client.close()); }
 }
@@ -137,17 +152,29 @@ function rawMessage({ subject, from = DUMMY_SENDER, date = new Date() }) {
   ].join('\r\n');
 }
 
-// Appends `count` dummy messages and returns their UIDs.
-async function seed(count, { label, from, date } = {}) {
+// Appends `count` dummy messages and returns their UIDs. Reconnects and resumes
+// if iCloud drops the connection partway through a large batch.
+async function seed(count, { label, from, date, mailbox = FOLDER, flags = ['\\Seen'] } = {}) {
+  const uids = [];
+  for (let attempt = 1; uids.length < count; attempt++) {
+    try {
+      await seedFrom(uids, count, { label, from, date, mailbox, flags });
+    } catch (err) {
+      if (attempt >= 3) throw err;
+      process.stdout.write(`[reconnect after ${err.message}] `);
+    }
+  }
+  return uids;
+}
+
+async function seedFrom(uids, count, { label, from, date, mailbox, flags }) {
   return withImap(async (client) => {
-    const uids = [];
-    for (let i = 0; i < count; i++) {
+    for (let i = uids.length; i < count; i++) {
       const subject = `[${TAG}] ${label} ${i + 1}`;
-      const res = await client.append(FOLDER, rawMessage({ subject, from, date }), ['\\Seen'], date || new Date());
+      const res = await client.append(mailbox, rawMessage({ subject, from, date }), flags, date || new Date());
       if (!res?.uid) throw new Error('APPEND did not return a UID (server lacks UIDPLUS?)');
       uids.push(res.uid);
     }
-    return uids;
   });
 }
 
@@ -179,7 +206,22 @@ try {
       console.log(`  ${box.path} holds non-dummy mail; leaving it alone`);
       continue;
     }
-    if (subjects.length) callTool('bulk_delete', { sourceMailbox: box.path });
+    const expected = await uidsIn(box.path, { all: true });
+    if (expected.length) {
+      let dry;
+      try {
+        dry = callTool('bulk_delete', { sourceMailbox: box.path, dryRun: true });
+      } catch (err) {
+        console.log(`  ${box.path} dry run failed (${err.message}); leaving it alone`);
+        continue;
+      }
+      const named = dry?.uids ?? dry?.changes?.map((c) => c.uid) ?? [];
+      if (dry?.dryRun !== true || !sameSet(named, expected)) {
+        console.log(`  ${box.path} dry run did not match the folder UIDs; leaving it alone`);
+        continue;
+      }
+      callTool('bulk_delete', { sourceMailbox: box.path });
+    }
     callTool('delete_mailbox', { name: box.path });
     console.log(`  removed leftover folder ${box.path} (${subjects.length} dummies)`);
   }
@@ -207,6 +249,26 @@ try {
   }
 } catch (err) {
   console.log(`  reminder cleanup failed: ${err.message}`);
+}
+
+let calendarId = null;
+if (!CALENDAR_NAME) {
+  console.log('  calendar cleanup skipped (set LIVE_CALENDAR to a disposable calendar)');
+} else {
+  try {
+    const { calendars } = callTool('list_calendars');
+    calendarId = calendars.find((c) => c.name === CALENDAR_NAME)?.calendarId ?? null;
+    if (calendarId) {
+      const { events } = callTool('list_events', { calendarId, since: CAL_SINCE, before: CAL_BEFORE, limit: 500 });
+      const stale = events.filter((e) => (e.summary || '').includes(TAG_PREFIX));
+      if (stale.length) {
+        callTool('bulk_delete_events', { calendarId, eventIds: stale.map((e) => e.eventId) });
+        console.log(`  removed ${stale.length} leftover dummy events`);
+      }
+    }
+  } catch (err) {
+    console.log(`  calendar cleanup failed: ${err.message}`);
+  }
 }
 
 // ─── Contacts ─────────────────────────────────────────────────────────────────
@@ -294,18 +356,38 @@ await test('create_reminder x5 in the dummy list', () => {
   assert(reminders.length === 5, `list has ${reminders.length} reminders, expected 5`);
 });
 
+await test('create 20 more and list all 25 well under the 30s script limit', () => {
+  if (reminderIds.length < 5) throw new Skip('reminders not created');
+  for (let i = 6; i <= 25; i++) {
+    const res = callTool('create_reminder', { listName: LIST_NAME, title: `[${TAG}] reminder ${i}` });
+    reminderIds.push(res.id);
+  }
+  const t0 = Date.now();
+  const { reminders } = callTool('list_reminders', { listName: LIST_NAME, includeCompleted: true, limit: 100 });
+  const secs = (Date.now() - t0) / 1000;
+  assert(reminders.length === 25, `listed ${reminders.length}, expected 25`);
+  assert(secs < 20, `listing took ${secs}s`);
+  const first = reminders.find((r) => r.id === reminderIds[0]);
+  assert(first?.priority === 'high', `priority came back as ${first?.priority}`);
+  assert(first?.due?.startsWith('2030-01-01'), `due came back as ${first?.due}`);
+  assert(first?.notes?.includes('live test suite'), 'notes missing from batched read');
+  return `${secs.toFixed(1)}s`;
+});
+
 await test('complete_reminder hides it from the default listing', () => {
   if (reminderIds.length < 5) throw new Skip('reminders not created');
   callTool('complete_reminder', { listName: LIST_NAME, reminderId: reminderIds[0] });
-  const open = callTool('list_reminders', { listName: LIST_NAME });
-  const all = callTool('list_reminders', { listName: LIST_NAME, includeCompleted: true });
-  assert(open.count === 4 && all.count === 5, `open ${open.count}, all ${all.count}`);
+  const open = callTool('list_reminders', { listName: LIST_NAME, limit: 100 });
+  const all = callTool('list_reminders', { listName: LIST_NAME, includeCompleted: true, limit: 100 });
+  const n = reminderIds.length;
+  assert(open.count === n - 1 && all.count === n, `open ${open.count}, all ${all.count}, expected ${n - 1}/${n}`);
+  assert(!open.reminders.some((r) => r.id === reminderIds[0]), 'completed reminder still in open listing');
 });
 
 await test('delete_reminder_list refuses a non-empty list', () => {
   if (!listCreated) throw new Skip('no dummy list');
   const dry = callTool('delete_reminder_list', { name: LIST_NAME, dryRun: true });
-  assert(dry.wouldDelete === false && dry.reminderCount === 5, `dry run said wouldDelete=${dry.wouldDelete}, count=${dry.reminderCount}`);
+  assert(dry.wouldDelete === false && dry.reminderCount === reminderIds.length, `dry run said wouldDelete=${dry.wouldDelete}, count=${dry.reminderCount}`);
   let refused = false;
   try { callTool('delete_reminder_list', { name: LIST_NAME }); } catch (err) { refused = /still has/.test(err.message); }
   assert(refused, 'non-empty list was deleted');
@@ -318,32 +400,73 @@ await test('delete_reminder dryRun leaves the reminder in place', () => {
   callTool('get_reminder', { listName: LIST_NAME, reminderId: reminderIds[1] });
 });
 
-await test('delete_reminder removes all 5 dummies (incl. completed)', () => {
+await test('delete_reminder removes every dummy (incl. completed)', () => {
   if (!reminderIds.length) throw new Skip('no reminders');
   while (reminderIds.length) {
     const id = reminderIds[0];
     const res = callTool('delete_reminder', { listName: LIST_NAME, reminderId: id });
+    process.stdout.write('.');
     assert(res.deleted === true, `reminder ${id} not deleted`);
     reminderIds.shift();
   }
-  const { count } = callTool('list_reminders', { listName: LIST_NAME, includeCompleted: true });
+  const { count } = callTool('list_reminders', { listName: LIST_NAME, includeCompleted: true, limit: 100 });
   assert(count === 0, `${count} reminders left in the list`);
+});
+
+const RENAMED = `${LIST_NAME}-renamed`;
+let currentList = LIST_NAME;
+
+await test('rename_reminder_list dryRun leaves the name alone', () => {
+  if (!listCreated) throw new Skip('no dummy list');
+  const dry = callTool('rename_reminder_list', { oldName: LIST_NAME, newName: RENAMED, dryRun: true });
+  assert(dry.dryRun === true && dry.changes[0].to === RENAMED, 'bad dry run');
+  const names = callTool('list_reminder_lists').lists.map((l) => l.name);
+  assert(names.includes(LIST_NAME) && !names.includes(RENAMED), 'dry run renamed the list');
+});
+
+await test('rename_reminder_list rejects a name already in use', () => {
+  if (!listCreated) throw new Skip('no dummy list');
+  const other = `${LIST_NAME}-other`;
+  callTool('create_reminder_list', { name: other });
+  try {
+    let rejected = false;
+    try { callTool('rename_reminder_list', { oldName: LIST_NAME, newName: other }); } catch (err) { rejected = /already exists/.test(err.message); }
+    assert(rejected, 'rename onto an existing name was allowed');
+    assert(callTool('list_reminder_lists').lists.some((l) => l.name === LIST_NAME), 'list name changed anyway');
+  } finally {
+    callTool('delete_reminder_list', { name: other });
+  }
+});
+
+await test('rename_reminder_list renames the dummy list', () => {
+  if (!listCreated) throw new Skip('no dummy list');
+  let res;
+  try {
+    res = callTool('rename_reminder_list', { oldName: LIST_NAME, newName: RENAMED });
+  } finally {
+    // A Reminders timeout can land after the rename was applied; track the real name.
+    const names = callTool('list_reminder_lists').lists.map((l) => l.name);
+    if (names.includes(RENAMED)) currentList = RENAMED;
+  }
+  assert(res.renamed === true && res.to === RENAMED, 'rename not reported');
+  const names = callTool('list_reminder_lists').lists.map((l) => l.name);
+  assert(names.includes(RENAMED) && !names.includes(LIST_NAME), `lists now: ${names.filter((n) => n.startsWith(LIST_PREFIX)).join(', ')}`);
 });
 
 await test('delete_reminder_list removes the empty dummy list', () => {
   if (!listCreated) throw new Skip('no dummy list');
-  const dry = callTool('delete_reminder_list', { name: LIST_NAME, dryRun: true });
+  const dry = callTool('delete_reminder_list', { name: currentList, dryRun: true });
   assert(dry.wouldDelete === true, 'dry run says it would not delete');
-  callTool('delete_reminder_list', { name: LIST_NAME });
+  callTool('delete_reminder_list', { name: currentList });
   const { lists } = callTool('list_reminder_lists');
-  assert(!lists.some((l) => l.name === LIST_NAME), 'list still exists');
+  assert(!lists.some((l) => l.name === currentList), 'list still exists');
   listCreated = false;
 });
 
 if (listCreated) {
   try {
-    for (const id of reminderIds) callTool('delete_reminder', { listName: LIST_NAME, reminderId: id });
-    callTool('delete_reminder_list', { name: LIST_NAME });
+    for (const id of reminderIds) callTool('delete_reminder', { listName: currentList, reminderId: id });
+    callTool('delete_reminder_list', { name: currentList });
     console.log('  (cleanup) removed dummy reminder list');
   } catch (err) {
     console.log(`  (cleanup) could not remove ${LIST_NAME}: ${err.message}`);
@@ -464,6 +587,280 @@ await test('delete_mailbox removes the empty temp folder', () => {
 });
 
 if (folderReady) console.log(`  (cleanup) ${FOLDER} was left behind; the next run's pre-flight removes it`);
+
+// ─── Mail: moves, flags, read state, rules ───────────────────────────────────
+// Two temp folders. Each tool runs dryRun first (must touch exactly the batch and
+// change nothing), then for real. Keeper dummies in SRC must stay put throughout.
+
+console.log('\nMail moves, flags, and rules (temp folders only)');
+let movesReady = false;
+let srcKeepers = [];
+
+async function flaggedIn(mailbox, uids) {
+  return withImap(async (client) => {
+    await client.mailboxOpen(mailbox);
+    const flagged = (await client.search({ flagged: true }, { uid: true })) || [];
+    const seen = (await client.search({ seen: true }, { uid: true })) || [];
+    return {
+      flagged: uids.filter((u) => flagged.includes(u)).length,
+      seen: uids.filter((u) => seen.includes(u)).length,
+    };
+  });
+}
+
+async function srcKeepersIntact() {
+  const left = await uidsIn(SRC, { subject: 'src-keeper' });
+  assert(sameSet(left, srcKeepers), `SRC keepers changed: ${left.length}/${srcKeepers.length}`);
+}
+
+await test(`create ${SRC} and ${DST}, seed 3 keepers`, async () => {
+  callTool('create_mailbox', { name: SRC });
+  callTool('create_mailbox', { name: DST });
+  movesReady = true;
+  srcKeepers = await seed(3, { label: 'src-keeper', mailbox: SRC, from: `keeper-${TAG}@example.invalid` });
+});
+
+function needMoves() { if (!movesReady) throw new Skip('no temp folders'); }
+
+await test('move_email: dryRun leaves it, real move lands it in DST', async () => {
+  needMoves();
+  const [uid] = await seed(1, { label: 'move-one', mailbox: SRC });
+  const dry = callTool('move_email', { uid, sourceMailbox: SRC, targetMailbox: DST, dryRun: true });
+  assert(dry.changes[0].uid === uid && dry.changes[0].subject.includes('move-one'), 'dry run named the wrong message');
+  assert((await uidsIn(SRC, { subject: 'move-one' })).length === 1, 'dry run moved it');
+  callTool('move_email', { uid, sourceMailbox: SRC, targetMailbox: DST });
+  assert((await uidsIn(SRC, { subject: 'move-one' })).length === 0, 'still in SRC');
+  assert((await uidsIn(DST, { subject: 'move-one' })).length === 1, 'not in DST');
+  await srcKeepersIntact();
+});
+
+await test('bulk_move (30): dryRun, then safe move with fingerprint verify', async () => {
+  needMoves();
+  const uids = await seed(30, { label: 'bulk-move', mailbox: SRC });
+  guardDryRun(callTool('bulk_move', { sourceMailbox: SRC, targetMailbox: DST, subject: 'bulk-move', dryRun: true }), uids, 'bulk_move');
+  assert((await uidsIn(DST, { subject: 'bulk-move' })).length === 0, 'dry run copied to DST');
+  const res = callTool('bulk_move', { sourceMailbox: SRC, targetMailbox: DST, subject: 'bulk-move' });
+  assert(res.status === 'complete' && res.moved === 30, `status ${res.status}, moved ${res.moved}`);
+  assert((await uidsIn(SRC, { subject: 'bulk-move' })).length === 0, 'left in SRC');
+  assert((await uidsIn(DST, { subject: 'bulk-move' })).length === 30, 'not all in DST');
+  const status = callTool('get_move_status');
+  assert(!status.current || status.current.status !== 'in_progress', 'manifest still in progress');
+  await srcKeepersIntact();
+});
+
+await test('bulk_move_by_sender (15)', async () => {
+  needMoves();
+  const sender = `mover-${TAG}@example.invalid`;
+  const uids = await seed(15, { label: 'sender-move', mailbox: SRC, from: sender });
+  guardDryRun(callTool('bulk_move_by_sender', { sender, sourceMailbox: SRC, targetMailbox: DST, dryRun: true }), uids, 'bulk_move_by_sender');
+  const res = callTool('bulk_move_by_sender', { sender, sourceMailbox: SRC, targetMailbox: DST });
+  assert(res.moved === 15, `moved ${res.moved}`);
+  assert((await uidsIn(DST, { from: sender })).length === 15, 'not all in DST');
+  await srcKeepersIntact();
+});
+
+await test('bulk_move_by_domain (12)', async () => {
+  needMoves();
+  // iCloud's FROM search misses this sender with the bare domain alone; the
+  // server's domain filter also searches "@domain" (#9), and the check below
+  // has to do the same.
+  const domain = `mcpdom${RUN}.invalid`;
+  const uids = await seed(12, { label: 'domain-move', mailbox: SRC, from: `someone@${domain}` });
+  guardDryRun(callTool('bulk_move_by_domain', { domain, sourceMailbox: SRC, targetMailbox: DST, dryRun: true }), uids, 'bulk_move_by_domain');
+  const res = callTool('bulk_move_by_domain', { domain, sourceMailbox: SRC, targetMailbox: DST });
+  assert(res.moved === 12, `moved ${res.moved}`);
+  assert((await uidsIn(DST, { from: `@${domain}` })).length === 12, 'not all in DST');
+  await srcKeepersIntact();
+});
+
+await test('archive_older_than (8 back-dated)', async () => {
+  needMoves();
+  const uids = await seed(8, { label: 'archive-old', mailbox: SRC, date: new Date(Date.now() - 400 * 86400000) });
+  guardDryRun(callTool('archive_older_than', { days: 365, sourceMailbox: SRC, targetMailbox: DST, dryRun: true }), uids, 'archive_older_than');
+  const res = callTool('archive_older_than', { days: 365, sourceMailbox: SRC, targetMailbox: DST });
+  assert(res.moved === 8, `moved ${res.moved}`);
+  assert((await uidsIn(DST, { subject: 'archive-old' })).length === 8, 'not all in DST');
+  await srcKeepersIntact();
+});
+
+const flagSender = `flagger-${TAG}@example.invalid`;
+let flagUids = [];
+
+await test('bulk_flag: dryRun changes nothing, real flags then unflags 10', async () => {
+  needMoves();
+  flagUids = await seed(10, { label: 'flag-batch', mailbox: SRC, from: flagSender });
+  guardDryRun(callTool('bulk_flag', { flagged: true, mailbox: SRC, subject: 'flag-batch', dryRun: true }), flagUids, 'bulk_flag');
+  assert((await flaggedIn(SRC, flagUids)).flagged === 0, 'dry run flagged messages');
+  callTool('bulk_flag', { flagged: true, mailbox: SRC, subject: 'flag-batch' });
+  assert((await flaggedIn(SRC, flagUids)).flagged === 10, 'not all flagged');
+  callTool('bulk_flag', { flagged: false, mailbox: SRC, subject: 'flag-batch' });
+  assert((await flaggedIn(SRC, flagUids)).flagged === 0, 'not all unflagged');
+  assert((await flaggedIn(SRC, srcKeepers)).flagged === 0, 'keepers got flagged');
+});
+
+await test('bulk_flag_by_sender: dryRun changes nothing, real flags 10', async () => {
+  needMoves();
+  guardDryRun(callTool('bulk_flag_by_sender', { sender: flagSender, flagged: true, mailbox: SRC, dryRun: true }), flagUids, 'bulk_flag_by_sender');
+  assert((await flaggedIn(SRC, flagUids)).flagged === 0, 'dry run flagged messages');
+  callTool('bulk_flag_by_sender', { sender: flagSender, flagged: true, mailbox: SRC });
+  assert((await flaggedIn(SRC, flagUids)).flagged === 10, 'not all flagged');
+});
+
+await test('bulk_mark_unread / bulk_mark_read by sender', async () => {
+  needMoves();
+  guardDryRun(callTool('bulk_mark_unread', { sender: flagSender, mailbox: SRC, dryRun: true }), flagUids, 'bulk_mark_unread');
+  assert((await flaggedIn(SRC, flagUids)).seen === 10, 'dry run changed read state');
+  callTool('bulk_mark_unread', { sender: flagSender, mailbox: SRC });
+  assert((await flaggedIn(SRC, flagUids)).seen === 0, 'not all unread');
+  guardDryRun(callTool('bulk_mark_read', { sender: flagSender, mailbox: SRC, dryRun: true }), flagUids, 'bulk_mark_read');
+  assert((await flaggedIn(SRC, flagUids)).seen === 0, 'dry run changed read state');
+  callTool('bulk_mark_read', { sender: flagSender, mailbox: SRC });
+  assert((await flaggedIn(SRC, flagUids)).seen === 10, 'not all read');
+  assert((await flaggedIn(SRC, srcKeepers)).seen === srcKeepers.length, 'keepers read state changed');
+});
+
+await test('mark_older_than_read (5 back-dated unread)', async () => {
+  needMoves();
+  const uids = await seed(5, { label: 'old-unread', mailbox: SRC, flags: [], date: new Date(Date.now() - 400 * 86400000) });
+  guardDryRun(callTool('mark_older_than_read', { days: 365, mailbox: SRC, dryRun: true }), uids, 'mark_older_than_read');
+  assert((await flaggedIn(SRC, uids)).seen === 0, 'dry run marked them read');
+  const res = callTool('mark_older_than_read', { days: 365, mailbox: SRC });
+  assert(res.marked === 5, `marked ${res.marked}`);
+  assert((await flaggedIn(SRC, uids)).seen === 5, 'not all read');
+});
+
+const RULE = `${TAG}-rule`;
+await test('rules: create, run_rule/run_all_rules dryRun, run for real, delete_rule', async () => {
+  needMoves();
+  const uids = await seed(7, { label: 'rule-batch', mailbox: SRC });
+  callTool('create_rule', { name: RULE, filters: { subject: 'rule-batch' }, action: { type: 'delete', sourceMailbox: SRC } });
+  guardDryRun(callTool('run_rule', { name: RULE, dryRun: true }), uids, 'run_rule');
+  const all = callTool('run_all_rules', { dryRun: true });
+  assert(all.ran === 1 && all.results[0].rule === RULE, `run_all_rules saw ${all.ran} rule(s); expected only the temp one`);
+  assert((await uidsIn(SRC, { subject: 'rule-batch' })).length === 7, 'dry runs deleted messages');
+  const res = callTool('run_rule', { name: RULE });
+  assert(res.deleted === 7, `rule deleted ${res.deleted}`);
+  assert((await uidsIn(SRC, { subject: 'rule-batch' })).length === 0, 'batch still present');
+  await srcKeepersIntact();
+  const listed = callTool('list_rules').rules.find((r) => r.name === RULE);
+  assert(listed?.runCount === 1, `runCount ${listed?.runCount}`);
+  const dry = callTool('delete_rule', { name: RULE, dryRun: true });
+  assert(dry.dryRun === true && callTool('list_rules').rules.some((r) => r.name === RULE), 'dry run removed the rule');
+  callTool('delete_rule', { name: RULE });
+  assert(!callTool('list_rules').rules.some((r) => r.name === RULE), 'rule still listed');
+});
+
+await test('state files went to ICLOUD_MCP_DATA_DIR, not the repo', () => {
+  const written = readdirSync(DATA_DIR);
+  assert(written.includes('.icloud-mcp-move-manifest.json'), `move manifest not in data dir (found: ${written.join(', ') || 'nothing'})`);
+  assert(written.includes('.icloud-mcp-rules.json'), 'rules file not in data dir');
+  const inRepo = STATE_FILES.filter((f) => existsSync(join(projectDir, f)) && !repoStateBefore.includes(f));
+  assert(inRepo.length === 0, `new state files in repo: ${inRepo.join(', ')}`);
+});
+
+await test('wipe and delete both temp folders', async () => {
+  needMoves();
+  for (const box of [SRC, DST]) {
+    const all = await uidsIn(box, { all: true });
+    const tagged = await uidsIn(box, { subject: TAG });
+    assert(sameSet(all, tagged), `${box} holds non-dummy mail; not wiping`);
+    if (all.length) {
+      guardDryRun(callTool('bulk_delete', { sourceMailbox: box, dryRun: true }), all, `wipe ${box}`);
+      callTool('bulk_delete', { sourceMailbox: box });
+    }
+    callTool('delete_mailbox', { name: box });
+  }
+  const boxes = callTool('list_mailboxes').map((b) => b.path);
+  assert(!boxes.includes(SRC) && !boxes.includes(DST), 'temp folders still listed');
+  movesReady = false;
+});
+
+// ─── Calendar ─────────────────────────────────────────────────────────────────
+
+console.log(CALENDAR_NAME
+  ? `\nCalendar (dummy events on "${CALENDAR_NAME}", Jan 2030, no alerts)`
+  : '\nCalendar (skipped: set LIVE_CALENDAR to a disposable calendar name)');
+let eventIds = [];
+
+function taggedEvents() {
+  const { events } = callTool('list_events', { calendarId, since: CAL_SINCE, before: CAL_BEFORE, limit: 500 });
+  return events.filter((e) => (e.summary || '').includes(TAG));
+}
+function needCal() {
+  if (!CALENDAR_NAME) throw new Skip('LIVE_CALENDAR is not set');
+  if (!calendarId) throw new Skip(`no calendar named "${CALENDAR_NAME}"`);
+}
+
+const dummyEvents = Array.from({ length: 5 }, (_, i) => ({
+  summary: `[${TAG}] event ${i + 1}`,
+  start: `2030-01-${String(10 + i).padStart(2, '0')}T15:00:00`,
+  end: `2030-01-${String(10 + i).padStart(2, '0')}T16:00:00`,
+  timezone: 'America/New_York',
+  reminder: 0,
+}));
+
+await test('bulk_create_events dryRun creates nothing', () => {
+  needCal();
+  const dry = callTool('bulk_create_events', { calendarId, events: dummyEvents, dryRun: true });
+  assert(dry.wouldCreate === 5 && dry.changes.length === 5, 'bad dry run');
+  assert(taggedEvents().length === 0, 'dry run created events');
+});
+
+await test('bulk_create_events creates 5 dummies', () => {
+  needCal();
+  const res = callTool('bulk_create_events', { calendarId, events: dummyEvents });
+  assert(res.created === 5 && res.failed === 0, `created ${res.created}, failed ${res.failed}`);
+  eventIds = taggedEvents().map((e) => e.eventId);
+  assert(eventIds.length === 5, `found ${eventIds.length} dummies`);
+});
+
+await test('update_event changes one dummy', () => {
+  needCal();
+  callTool('update_event', { calendarId, eventId: eventIds[0], location: 'MCP Test Room' });
+  const ev = callTool('get_event', { calendarId, eventId: eventIds[0] });
+  assert(ev.location === 'MCP Test Room', `location ${ev.location}`);
+  assert(ev.summary.includes(TAG), 'update lost the summary');
+});
+
+await test('bulk_update_events: dryRun changes nothing, real renames 2', () => {
+  needCal();
+  const updates = eventIds.slice(1, 3).map((eventId) => ({ eventId, summary: `[${TAG}] renamed` }));
+  const dry = callTool('bulk_update_events', { calendarId, updates, dryRun: true });
+  assert(dry.wouldUpdate === 2 && !dry.missing, 'bad dry run');
+  assert(!taggedEvents().some((e) => e.summary.endsWith('renamed')), 'dry run renamed events');
+  const res = callTool('bulk_update_events', { calendarId, updates });
+  assert(res.updated === 2, `updated ${res.updated}`);
+  assert(taggedEvents().filter((e) => e.summary.endsWith('renamed')).length === 2, 'rename not visible');
+});
+
+await test('delete_event: dryRun keeps it, real delete removes it', () => {
+  needCal();
+  const dry = callTool('delete_event', { calendarId, eventId: eventIds[0], dryRun: true });
+  assert(dry.changes[0].summary.includes(TAG), 'dry run named the wrong event');
+  callTool('get_event', { calendarId, eventId: eventIds[0] });
+  callTool('delete_event', { calendarId, eventId: eventIds[0] });
+  let gone = false;
+  try { callTool('get_event', { calendarId, eventId: eventIds[0] }); } catch { gone = true; }
+  assert(gone, 'event still readable');
+  eventIds.shift();
+});
+
+await test('bulk_delete_events: dryRun keeps 4, real delete removes all', () => {
+  needCal();
+  const dry = callTool('bulk_delete_events', { calendarId, eventIds, dryRun: true });
+  assert(dry.wouldDelete === 4 && dry.changes.every((c) => c.summary.includes(TAG)), 'bad dry run');
+  assert(taggedEvents().length === 4, 'dry run deleted events');
+  const res = callTool('bulk_delete_events', { calendarId, eventIds });
+  assert(res.deleted === 4 && res.failed === 0, `deleted ${res.deleted}, failed ${res.failed}`);
+  assert(taggedEvents().length === 0, 'dummies still on the calendar');
+  eventIds = [];
+});
+
+if (calendarId && eventIds.length) {
+  try { callTool('bulk_delete_events', { calendarId, eventIds }); console.log('  (cleanup) removed dummy events'); } catch {}
+}
+if (movesReady) console.log(`  (cleanup) ${SRC}/${DST} left behind; the next run's pre-flight removes them`);
+rmSync(DATA_DIR, { recursive: true, force: true });
 
 // ─── Summary ──────────────────────────────────────────────────────────────────
 
