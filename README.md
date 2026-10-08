@@ -195,6 +195,8 @@ Set `ICLOUD_MCP_DATA_DIR` to store those files somewhere else. Do not point it a
 
 `bulk_move`, `bulk_delete`, `bulk_flag`, `search_emails`, `count_emails`, and rules accept any combination of: `sender`, `domain`, `subject`, `before`, `since`, `unread`, `flagged`, `larger`, `smaller`, `hasAttachment`, and `account`.
 
+A `domain` filter searches both the bare domain and `@domain`. iCloud's FROM search misses some senders when given only the bare domain. Subdomains are not matched: a filter of `example.com` does not find mail from `someone@mail.example.com`. When a keyword and a domain are both set, `search_emails` keeps both conditions.
+
 ## Safe move
 
 `bulk_move`, `bulk_move_by_sender`, `bulk_move_by_domain`, and `archive_older_than` copy, verify fingerprints in the destination, then remove the source. `get_move_status` and `abandon_move` inspect or clear the manifest.
