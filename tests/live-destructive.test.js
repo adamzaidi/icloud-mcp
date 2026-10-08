@@ -661,15 +661,15 @@ await test('bulk_move_by_sender (15)', async () => {
 
 await test('bulk_move_by_domain (12)', async () => {
   needMoves();
-  // Fails (as a skip, via the dry-run guard) until the domain filter searches
-  // "@domain" as well as the bare domain: iCloud's FROM search misses this sender
-  // with the bare form alone.
+  // iCloud's FROM search misses this sender with the bare domain alone; the
+  // server's domain filter also searches "@domain" (#9), and the check below
+  // has to do the same.
   const domain = `mcpdom${RUN}.invalid`;
   const uids = await seed(12, { label: 'domain-move', mailbox: SRC, from: `someone@${domain}` });
   guardDryRun(callTool('bulk_move_by_domain', { domain, sourceMailbox: SRC, targetMailbox: DST, dryRun: true }), uids, 'bulk_move_by_domain');
   const res = callTool('bulk_move_by_domain', { domain, sourceMailbox: SRC, targetMailbox: DST });
   assert(res.moved === 12, `moved ${res.moved}`);
-  assert((await uidsIn(DST, { from: domain })).length === 12, 'not all in DST');
+  assert((await uidsIn(DST, { from: `@${domain}` })).length === 12, 'not all in DST');
   await srcKeepersIntact();
 });
 
