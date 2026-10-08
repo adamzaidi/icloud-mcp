@@ -19,30 +19,28 @@ Maintained Model Context Protocol (MCP) server for iCloud Mail, Contacts, Calend
 
 ## Install
 
-This package is `"private": true`. Install it from this repository:
+Install from npm:
 
 ```bash
-git clone https://github.com/adamzaidi/icloud-mcp.git
-cd icloud-mcp
-npm install
+npm install -g icloud-mcp
 ```
+
+Or skip the install and let `npx` fetch it on demand (the configs below use this).
 
 Confirm the server can reach iCloud:
 
 ```bash
-IMAP_USER="you@icloud.com" IMAP_PASSWORD="your-app-specific-password" node index.js --doctor
+IMAP_USER="you@icloud.com" IMAP_PASSWORD="your-app-specific-password" npx -y icloud-mcp --doctor
 ```
 
 ### Claude Desktop
-
-Point `args` at `index.js` in your clone:
 
 ```json
 {
   "mcpServers": {
     "icloud-mail": {
-      "command": "node",
-      "args": ["/absolute/path/to/icloud-mcp/index.js"],
+      "command": "npx",
+      "args": ["-y", "icloud-mcp"],
       "env": {
         "IMAP_USER": "you@icloud.com",
         "IMAP_PASSWORD": "your-app-specific-password"
@@ -52,7 +50,7 @@ Point `args` at `index.js` in your clone:
 }
 ```
 
-Quit Claude Desktop completely and reopen it.
+If Claude Desktop cannot find `npx`, use its full path (`which npx`). With a global install, `"command": "icloud-mcp"` and no `args` also works. Quit Claude Desktop completely and reopen it.
 
 ### Claude Code
 
@@ -61,10 +59,18 @@ claude mcp add icloud-mail \
   --scope user \
   -e IMAP_USER=you@icloud.com \
   -e IMAP_PASSWORD=your-app-specific-password \
-  -- node /absolute/path/to/icloud-mcp/index.js
+  -- npx -y icloud-mcp
 ```
 
-To run from a checkout, copy `.mcp.json.example` to `.mcp.json` (that file is gitignored) and export `ICLOUD_EMAIL` and `ICLOUD_APP_PASSWORD` in your shell.
+### From source
+
+```bash
+git clone https://github.com/adamzaidi/icloud-mcp.git
+cd icloud-mcp
+npm install
+```
+
+Point the configs above at `node /absolute/path/to/icloud-mcp/index.js` instead of `npx -y icloud-mcp`. To run from a checkout, copy `.mcp.json.example` to `.mcp.json` (that file is gitignored) and export `ICLOUD_EMAIL` and `ICLOUD_APP_PASSWORD` in your shell.
 
 Additional IMAP accounts use `IMAP_ACCOUNT_N_USER`, `IMAP_ACCOUNT_N_PASSWORD`, `IMAP_ACCOUNT_N_HOST`, `IMAP_ACCOUNT_N_SMTP_HOST`, and `IMAP_ACCOUNT_N_NAME`.
 
