@@ -38,8 +38,9 @@ function mockClient(state) {
       state.calls.push(['status', name]);
       return { messages: 2, unseen: 1, recent: 0 };
     },
-    async search() {
+    async search(query) {
       state.calls.push('search');
+      state.lastSearch = query;
       return [...FIXTURE_UIDS];
     },
     async messageDelete(uids) { state.calls.push(['messageDelete', uids]); },
@@ -312,6 +313,8 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     }, ctx);
     assert.equal(result.wouldMove, 2);
     assert.equal(result.domain, 'example.com');
+    // iCloud misses some senders with the bare domain alone, so both forms are searched.
+    assert.deepEqual(state.lastSearch, { or: [{ from: 'example.com' }, { from: '@example.com' }] });
     assertUidChanges(result, 'move', { sourceMailbox: 'INBOX', targetMailbox: 'Newsletters' });
   });
 
