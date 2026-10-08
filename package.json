@@ -4,7 +4,7 @@
   "description": "Maintained Model Context Protocol (MCP) server for iCloud Mail, Contacts, Calendar, and Reminders",
   "main": "index.js",
   "bin": {
-    "icloud-mcp": "./index.js"
+    "icloud-mcp": "index.js"
   },
   "type": "module",
   "scripts": {
