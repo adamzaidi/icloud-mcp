@@ -19,3 +19,5 @@ jobs:
         env:
           IMAP_USER: ''
           IMAP_PASSWORD: ''
+          ICLOUD_MCP_SEND: ''
+          ICLOUD_MCP_LIVE: ''
