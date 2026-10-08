@@ -22,7 +22,23 @@
   ],
   "author": "Adam Zaidi",
   "license": "MIT",
-  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adamzaidi/icloud-mcp.git"
+  },
+  "homepage": "https://github.com/adamzaidi/icloud-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/adamzaidi/icloud-mcp/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
     "fast-xml-parser": "^5.8.0",

@@ -73,3 +73,11 @@ test('CI runs npm test with credentials blanked', () => {
   assert.match(ci, /IMAP_USER: ''/);
   assert.match(ci, /IMAP_PASSWORD: ''/);
 });
+
+test('the npm package ships only the server, its library, and docs', () => {
+  const [pack] = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: projectDir, encoding: 'utf8' }));
+  const allowed = (path) => ['index.js', 'package.json', 'README.md', 'LICENSE'].includes(path)
+    || /^lib\/[\w/-]+\.js$/.test(path);
+  assert.deepEqual(pack.files.map((f) => f.path).filter((path) => !allowed(path)), []);
+  assert.ok(pack.files.some((f) => f.path === 'lib/tools/mail.js'));
+});
