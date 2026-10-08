@@ -20,10 +20,9 @@ if (args.includes('--reset')) {
   });
   // Force full reset by re-reading and overwriting
   const { writeFileSync } = await import('fs');
-  const { homedir } = await import('os');
-  const { join } = await import('path');
+  const { dataFile } = await import('./lib/data-paths.js');
   writeFileSync(
-    join(homedir(), '.icloud-mcp-digest.json'),
+    dataFile('.icloud-mcp-digest.json'),
     JSON.stringify({ lastRun: null, processedUids: [], pendingActions: [], skipCounts: {} }, null, 2)
   );
   console.log('✓ Digest state reset.');

@@ -1,7 +1,7 @@
 {
   "name": "icloud-mcp",
   "version": "2.7.0",
-  "description": "A Model Context Protocol (MCP) server for iCloud Mail",
+  "description": "Maintained Model Context Protocol (MCP) server for iCloud Mail, Contacts, Calendar, and Reminders",
   "main": "index.js",
   "bin": {
     "icloud-mcp": "./index.js"
@@ -9,7 +9,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "test": "node tests/test.js"
+    "test": "node --test tests/dry-run.test.js && node tests/test.js",
+    "test:live": "ICLOUD_MCP_LIVE=1 node tests/live-destructive.test.js"
   },
   "keywords": [
     "mcp",
