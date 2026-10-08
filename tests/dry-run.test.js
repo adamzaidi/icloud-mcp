@@ -11,7 +11,7 @@ const dataRoot = mkdtempSync(join(tmpdir(), 'icloud-mcp-test-'));
 process.env.ICLOUD_MCP_DATA_DIR = dataRoot;
 
 const { dataDir, dataFile } = await import('../lib/data-paths.js');
-const { setImapClientFactory } = await import('../lib/imap.js');
+const { setImapClientFactory, createRateLimitedClient } = await import('../lib/imap.js');
 const { handleMailTool, mailTools } = await import('../lib/tools/mail.js');
 const { handleContactTool, contactTools } = await import('../lib/tools/contacts.js');
 const { handleCalendarTool, calendarTools, suggestEventTools } = await import('../lib/tools/calendar.js');
@@ -195,6 +195,15 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
       }
     }
     assert.equal(mailTools.length + contactTools.length + calendarTools.length + reminderTools.length + suggestEventTools.length, 83);
+  });
+
+  await t.test('IMAP client errors are handled, not thrown', () => {
+    // A socket timeout emits 'error' on the client; with no listener Node throws
+    // it and the server process exits mid-operation.
+    setImapClientFactory(null);
+    const client = createRateLimitedClient({ user: 'nobody@example.invalid', pass: 'x' });
+    assert.ok(client.listenerCount('error') > 0);
+    assert.doesNotThrow(() => client.emit('error', new Error('Socket timeout')));
   });
 
   await t.test('delete_email dryRun reports the message and does not delete', async () => {
