@@ -185,6 +185,8 @@ Set `ICLOUD_MCP_DATA_DIR` to store those files somewhere else. Do not point it a
 | `complete_reminder` | Mark a reminder as completed in iCloud Reminders. |  |
 | `delete_reminder` | Delete a reminder from iCloud Reminders permanently. | yes |
 
+Listing reminders reads each property for the whole list in one batch. A list of zero or one reminder is coerced to an array before it is indexed. If Reminders.app stalls, the tool says the script timed out after 90 seconds instead of reporting an iCloud network timeout. A timed-out create, update, or delete may still have been applied.
+
 ### Email to calendar
 
 | Tool | Description | dryRun |
