@@ -91,7 +91,7 @@ Set `ICLOUD_MCP_DATA_DIR` to store those files somewhere else. Do not point it a
 
 ### Tool profiles
 
-`ICLOUD_MCP_TOOL_PROFILE` defaults to `full`, which is the list below. `remote-safe` removes sending, delete, bulk mailbox and move tools, rules, empty trash, mailbox rename, and contact, calendar, and reminder deletion from the tool list. Read, search, drafts, and calendar or reminder create and edit stay, including `flag_email` and `mark_as_read`. `bulk_create_events` and `bulk_update_events` stay, and in `remote-safe` they run as a dry run unless that tool name is listed in `ICLOUD_MCP_ALLOW_BULK` (comma-separated). A hidden tool still throws if something calls it.
+`ICLOUD_MCP_TOOL_PROFILE` defaults to `full`, which is the list below. `remote-safe` is an allowlist: only the read, search, draft, and calendar or reminder create and edit tools named in that list are exposed, including `flag_email` and `mark_as_read`. A tool that is not on the list is hidden, including tools added later. `bulk_create_events` and `bulk_update_events` are on the list, and in `remote-safe` they run as a dry run unless that tool name is listed in `ICLOUD_MCP_ALLOW_BULK` (comma-separated). A hidden tool still throws if something calls it.
 
 ### Mail
 

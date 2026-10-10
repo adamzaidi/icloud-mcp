@@ -16,7 +16,7 @@ const { contactTools } = await import('../../lib/tools/contacts.js');
 const { calendarTools, suggestEventTools, handleCalendarTool } = await import('../../lib/tools/calendar.js');
 const { reminderTools } = await import('../../lib/tools/reminders.js');
 const { selectTools, prepareToolCall, hiddenRemoteSafeTools, resolveToolProfile } = await import('../../lib/tool-profile.js');
-const { setCalDavRequestForTests, setCalDavDiscoveryForTests } = await import('../../lib/caldav.js');
+const { createEvent, setCalDavRequestForTests, setCalDavDiscoveryForTests } = await import('../../lib/caldav.js');
 
 const allTools = [...mailTools, ...contactTools, ...calendarTools, ...reminderTools, ...suggestEventTools];
 
@@ -120,7 +120,14 @@ test('full is the default and remote-safe exposes an exact list', () => {
   assert.deepEqual(names(selectTools(allTools, { ICLOUD_MCP_TOOL_PROFILE: ' Remote-Safe ' })), REMOTE_SAFE);
 
   const hidden = FULL.filter((name) => !REMOTE_SAFE.includes(name)).sort();
-  assert.deepEqual([...hiddenRemoteSafeTools()].sort(), hidden);
+  assert.deepEqual([...hiddenRemoteSafeTools(allTools)].sort(), hidden);
+  const withNew = [...allTools, { name: 'export_everything', inputSchema: { type: 'object', properties: {} } }];
+  assert.equal(names(selectTools(withNew, {})).includes('export_everything'), true);
+  assert.equal(names(selectTools(withNew, { ICLOUD_MCP_TOOL_PROFILE: 'remote-safe' })).includes('export_everything'), false);
+  assert.throws(
+    () => prepareToolCall('export_everything', {}, { ICLOUD_MCP_TOOL_PROFILE: 'remote-safe' }),
+    /not available in the remote-safe tool profile/
+  );
   for (const name of ['compose_email', 'delete_email', 'bulk_delete', 'empty_trash', 'run_rule', 'delete_calendar', 'delete_reminder_list', 'log_clear']) {
     assert.equal(REMOTE_SAFE.includes(name), false, name);
   }
@@ -184,6 +191,40 @@ test('remote-safe forces dryRun on remaining bulk tools unless allowed', async (
     setCalDavRequestForTests(null);
     setCalDavDiscoveryForTests(null);
   }
+});
+
+test('calendar text cannot inject ATTENDEE or ORGANIZER lines', async () => {
+  const bodies = [];
+  setCalDavRequestForTests(async (_method, _url, opts) => {
+    bodies.push(opts.body);
+    return { status: 201, etag: null, body: '' };
+  });
+  setCalDavDiscoveryForTests({ dataHost: 'https://caldav.example.test', calendarsPath: '/cal/' });
+  try {
+    await createEvent('cal', {
+      summary: 'Meet\r\nATTENDEE:mailto:evil@example.com',
+      description: 'Notes\nORGANIZER:mailto:evil@example.com',
+      location: 'Room\r\nATTENDEE:mailto:evil@example.com',
+      recurrence: 'FREQ=DAILY\r\nATTENDEE:mailto:evil@example.com',
+      status: 'CONFIRMED\nORGANIZER:mailto:evil@example.com',
+      timezone: 'UTC\r\nATTENDEE:mailto:evil@example.com',
+      start: '2030-01-02T15:00:00Z',
+      end: '2030-01-02T16:00:00Z',
+    });
+  } finally {
+    setCalDavRequestForTests(null);
+    setCalDavDiscoveryForTests(null);
+  }
+  assert.equal(bodies.length, 1);
+  const lines = bodies[0].split(/\r\n/);
+  assert.equal(lines.some((line) => line.startsWith('ATTENDEE')), false);
+  assert.equal(lines.some((line) => line.startsWith('ORGANIZER')), false);
+  assert.match(lines.find((line) => line.startsWith('SUMMARY:')), /\\nATTENDEE/);
+  assert.match(lines.find((line) => line.startsWith('RRULE:')), /\\nATTENDEE/);
+  const unfolded = bodies[0].replace(/\r\n/g, '\n');
+  assert.equal(unfolded.includes('\nATTENDEE'), false);
+  assert.equal(unfolded.includes('\nORGANIZER'), false);
+  assert.equal(unfolded.includes('\r'), false);
 });
 
 test('stdio exposes the exact list for each profile and rejects hidden tools', async () => {
