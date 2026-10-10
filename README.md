@@ -262,6 +262,8 @@ Stdio stays the default and is the right transport for a local client. A phone, 
 5. The tunnel forwards `Cf-Access-Jwt-Assertion`. The server checks that JWT against the team JWKS at `https://<team-domain>/cdn-cgi/access/certs`, then requires the token email to be on the allow list.
 6. Put the public hostname in `ICLOUD_MCP_ALLOWED_HOSTS`. Loopback names are already allowed. This is the DNS-rebinding check.
 
+A non-interactive client such as Grok Bot cannot sign in with an identity provider. Create an Access service token for it, add a policy with the Service Auth action that includes the token, and put the token's Client ID in `ICLOUD_MCP_ALLOWED_SERVICE_TOKENS` (comma-separated). A service token JWT has no `email` claim; its `common_name` claim is the Client ID. A JWT with no email is accepted only when `common_name` exactly matches an entry on that list. When the list is unset or empty, a JWT with no email is rejected, which is the previous behavior. Every other check still applies: signature, `RS256`, issuer, audience, `exp`, `nbf`, key rotation, Host and Origin, the `remote-safe` profile, and the send-mode gate. Service-token requests are rate limited by `common_name`. The Client Secret stays with the client; the server never sees or stores it. `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`, and `ICLOUD_MCP_ALLOWED_EMAILS` are still required to start.
+
 `ICLOUD_MCP_BEARER_TOKEN` is a static bearer token for a local test client. It is not the remote credential. When Access and the bearer token are both set, either one is accepted.
 
 HTTP mode refuses to start unless authentication is configured, `ICLOUD_MCP_SEND_MODE` is `off`, `drafts`, or `self-only`, and `ICLOUD_MCP_TOOL_PROFILE` is `remote-safe`. The default send mode `on` and the `full` profile are refused. A missing Origin header is allowed. The Origin value `null`, and any other Origin that is not on the allow list, are rejected. Authenticated requests are limited per identity. Requests that have no credentials use a separate limit of 10 per address, so an unauthenticated flood does not consume the caller's budget.
@@ -331,6 +333,7 @@ Message bodies, subjects, and addresses are untrusted data. A sender can put ins
 | `CF_ACCESS_TEAM_DOMAIN` | unset | Cloudflare Access team domain. Required for JWT auth. |
 | `CF_ACCESS_AUD` | unset | Access application AUD tag. |
 | `ICLOUD_MCP_ALLOWED_EMAILS` | unset | Comma-separated emails allowed to present an Access JWT. |
+| `ICLOUD_MCP_ALLOWED_SERVICE_TOKENS` | unset | Comma-separated Access service token Client IDs. An Access JWT with no email is accepted only when its `common_name` matches one exactly. Unset rejects such tokens. |
 | `ICLOUD_MCP_BEARER_TOKEN` | unset | Static bearer token for local HTTP tests. |
 | `ICLOUD_MCP_ALLOWED_HOSTS` | loopback | Extra Host values, such as the tunnel hostname. |
 | `ICLOUD_MCP_ALLOWED_ORIGINS` | loopback | Extra browser Origin values. A missing Origin is allowed. The value `null` is rejected. |
