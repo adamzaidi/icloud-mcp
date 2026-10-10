@@ -8,6 +8,7 @@ import { mailTools, handleMailTool } from './lib/tools/mail.js';
 import { contactTools, handleContactTool } from './lib/tools/contacts.js';
 import { calendarTools, suggestEventTools, handleCalendarTool } from './lib/tools/calendar.js';
 import { reminderTools, handleReminderTool } from './lib/tools/reminders.js';
+import { assertValidToolProfile, selectTools, prepareToolCall } from './lib/tool-profile.js';
 
 
 const { version: SERVER_VERSION } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
@@ -75,6 +76,7 @@ function resolveMailbox(name, creds) {
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
 async function main() {
+  assertValidToolProfile();
   const server = new Server(
     { name: 'icloud-mail', version: SERVER_VERSION },
     { capabilities: { tools: {} } }
@@ -89,12 +91,13 @@ async function main() {
   ];
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: orderedTools,
+    tools: selectTools(orderedTools),
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
+    const { name } = request.params;
     try {
+      const args = prepareToolCall(name, request.params.arguments ?? {});
       const ctx = { resolveCreds, resolveMailbox, accounts: ACCOUNTS };
       const handlers = [handleMailTool, handleContactTool, handleCalendarTool, handleReminderTool];
       let result;
