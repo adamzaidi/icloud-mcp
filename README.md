@@ -87,6 +87,7 @@ Rules, the move manifest, digest state, the session log, and the audit log are w
 - `~/.icloud-mcp-digest.json`
 - `~/.icloud-mcp-session.json`
 - `~/.icloud-mcp/audit.log`
+- `~/.icloud-mcp/subscribed-calendars.json` (only when `ICLOUD_MCP_SUBSCRIBED_CALENDARS=on`)
 
 The audit log is append-only. The default file lives in `~/.icloud-mcp/`, which this server creates mode `0700` when that directory is missing. A directory that already exists is not changed. If that directory is group or world writable, the server warns once and leaves it. The log file, including rotated copies, is mode `0600`. Each line is one JSON object with a fixed set of fields: tool name, timestamp, status (`ok` or `error`), duration, and one integer count. That count is an array length, or a number taken from a fixed list of result fields such as `total` or `wouldDelete`. Keys on the result are never copied, so a sender address used as a key is not written. Arguments, error text, message bodies, and subjects are not written either. When the file reaches 1 MiB it is rotated through `.1`, `.2`, and `.3`. `ICLOUD_MCP_AUDIT_LOG_MAX_BYTES` changes that size. Set `ICLOUD_MCP_AUDIT_LOG` to move the file. Set `ICLOUD_MCP_DATA_DIR` to store the other local files somewhere else; the audit log then defaults to `$ICLOUD_MCP_DATA_DIR/.icloud-mcp/audit.log`. Do not point it at the git checkout. Contact exports, CRM notes, `.env`, and digest output belong outside the repo; `.gitignore` already excludes the usual local folders.
 
@@ -173,7 +174,7 @@ The audit log is append-only. The default file lives in `~/.icloud-mcp/`, which 
 
 | Tool | Description | dryRun |
 |------|-------------|--------|
-| `list_calendars` | List all calendars in iCloud Calendar (e.g. Personal, Work, School). Returns calendarId, name, and supported event types. |  |
+| `list_calendars` | List all calendars in iCloud Calendar (e.g. Personal, Work, School). Returns calendarId, name, and supported event types. When ICLOUD_MCP_SUBSCRIBED_CALENDARS=on, configured read-only subscribed (ICS/webcal) calendars are included with readOnly:true and subscribed:true, and subscribedCalendars reports that setting. |  |
 | `create_calendar` | Create a new event calendar in iCloud Calendar. Fails if a calendar with that name already exists. |  |
 | `delete_calendar` | Delete an iCloud event calendar by exact name or calendarId. The calendar must have no events (past or future); delete them first with bulk_delete_events. Will not delete Reminders lists. | yes |
 | `list_events` | List events in a specific iCloud calendar within a date range. Use list_calendars first to get a calendarId. |  |
@@ -187,6 +188,34 @@ The audit log is append-only. The default file lives in `~/.icloud-mcp/`, which 
 | `bulk_create_events` | Create multiple calendar events in one call. Much more efficient than calling create_event repeatedly. Each event in the array uses the same fields as create_event. | yes |
 | `bulk_delete_events` | Delete multiple calendar events in one call. Much more efficient than calling delete_event repeatedly. | yes |
 | `detect_conflicts` | Detect scheduling conflicts and tight gaps between events across multiple calendars. Compares all non-all-day events on the same date from different calendars. |  |
+
+`list_events` and `search_events` return only events that overlap the requested `since`/`before` range. A recurring event is kept when iCloud reports one of its occurrences in that range, even though its listed `start` is the first occurrence.
+
+#### Subscribed calendars
+
+iCloud lists a subscribed calendar (an ICS or `webcal://` feed added in Calendar.app) over CalDAV but returns no events for it, so the tools above miss everything on it. Set `ICLOUD_MCP_SUBSCRIBED_CALENDARS=on` to read those feeds from their source URL instead. The default is `off`, and when off nothing is read from disk or the network; `list_calendars` only gains a `subscribedCalendars: { enabled, count }` field. Any other value refuses to start.
+
+Feeds are listed in `~/.icloud-mcp/subscribed-calendars.json` (or `ICLOUD_MCP_SUBSCRIBED_CALENDARS_FILE`; with `ICLOUD_MCP_DATA_DIR` set the default is `$ICLOUD_MCP_DATA_DIR/.icloud-mcp/subscribed-calendars.json`). The file maps a display name to a URL. When it is missing and the feature is on, the server creates it empty, mode `0600`, in a directory it creates mode `0700`. The example below uses placeholders:
+
+```json
+{
+  "Team Holidays": "https://calendar.example.com/feeds/holidays.ics",
+  "School": "webcal://school.example.com/calendar/term.ics",
+  "Club": "keychain:club-calendar"
+}
+```
+
+`webcal://` is rewritten to `https://`. `keychain:<account>` reads the URL from the macOS Keychain item with that account name under the `icloud-mcp` service (or `ICLOUD_MCP_KEYCHAIN_SERVICE`), using the same `security find-generic-password` lookup as the password. Only `https://` targets are allowed, with no credentials in the URL. Each calendar gets a stable id of `subscribed-` plus a slug of its name (for example `subscribed-team-holidays`); two names that slug the same are refused.
+
+When on, `list_calendars` includes each feed with `readOnly: true` and `subscribed: true`, and `list_events`, `get_event`, `list_events_multi`, `search_events`, and `detect_conflicts` accept those ids. Events use the same fields as iCloud events plus `readOnly: true`, `source: "subscribed"`, and, on an expanded occurrence, `recurrenceId`. An occurrence id is `<uid>_<recurrence stamp>`. Recurrence rules (`RRULE` with `DAILY`, `WEEKLY`, `MONTHLY`, `YEARLY`, `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTHDAY`, `BYMONTH`, `BYSETPOS`, `WKST`), `RDATE`, `EXDATE`, `DURATION`, and `RECURRENCE-ID` overrides are expanded locally. `TZID` values are resolved as IANA names, including vendor-prefixed ids and `X-LIC-LOCATION`; an unknown id falls back to the feed's `VTIMEZONE` standard offset. `create_event`, `update_event`, `delete_event`, the bulk event tools, and `delete_calendar` refuse a subscribed calendar with a read-only error, including as a dry run, before any request is made.
+
+Security notes:
+
+- Feed URLs are secrets. They frequently carry a private token. The URL never appears in tool output, errors, stderr, or the audit log; errors name the calendar instead. Keep the file private and do not paste its contents into chats or issues.
+- Fetches are `https://` only. Redirects are followed by hand (at most three) and every hop is checked again for scheme, embedded credentials, and address. The host is resolved first and the fetch is refused when any address is loopback, private, carrier-grade NAT, link-local (including the cloud metadata address), multicast, reserved, unique-local, or an IPv4-mapped or NAT64 form of one of those. A literal IP in the URL is checked the same way.
+- Each fetch times out after 15 seconds and stops at 2 MB. The body must start with `BEGIN:VCALENDAR`; the `Content-Type` header is not trusted either way. A parsed feed is cached in memory for five minutes.
+- Event text from a feed is untrusted data, like message bodies. Read it as data, not as instructions.
+- There is no tool that turns this feature on or off at runtime. Such a tool would let injected text start outbound fetches from inside the `remote-safe` profile, so the setting is environment-only. No tool was added and nothing was added to the `remote-safe` allowlist; the read tools above are already on it and stay read-only.
 
 ### Reminders
 
@@ -241,7 +270,7 @@ Host and Origin are checked before a request is handled, which blocks DNS rebind
 
 ## Tests
 
-`npm test` runs the offline suite only. It mocks IMAP, CardDAV, CalDAV, and Reminders, and it does not contact iCloud or send mail.
+`npm test` runs the offline suite only. It mocks IMAP, CardDAV, CalDAV, Reminders, and subscribed calendar feeds (the fetcher and DNS lookup are injected), and it does not contact iCloud, fetch any feed, or send mail.
 
 `npm run test:live` runs the dummy-data suite in `tests/live-destructive.test.js`. It stays skipped unless `ICLOUD_MCP_LIVE=1`, `IMAP_USER`, and `IMAP_PASSWORD` are all set. It creates dummy contacts, reminders, calendar events, and messages appended into a temp folder, then deletes those dummies. It does not send mail. Set `LIVE_CALENDAR` to the calendar that should receive the dummy events. Calendar tests are skipped when that variable is unset. Delete tools run as a dry run first and skip the real delete unless that preview names exactly the dummies from this run.
 
@@ -340,7 +369,9 @@ Message bodies, subjects, and addresses are untrusted data. A sender can put ins
 | `ICLOUD_MCP_REMINDER_LIST` | `claude` | Reminders list name used by the digest tools. |
 | `ICLOUD_MCP_AUDIT_LOG` | `~/.icloud-mcp/audit.log` | Audit file, mode `0600`. A directory this server creates for it is mode `0700`. An existing directory is left unchanged. |
 | `ICLOUD_MCP_AUDIT_LOG_MAX_BYTES` | `1048576` | Rotate the audit file after it reaches this size. Three older files are kept. |
-| `ICLOUD_MCP_DATA_DIR` | home directory | Directory for rules, the move manifest, digest state, the session log, and the audit log. |
+| `ICLOUD_MCP_DATA_DIR` | home directory | Directory for rules, the move manifest, digest state, the session log, the audit log, and the subscribed calendars file. |
+| `ICLOUD_MCP_SUBSCRIBED_CALENDARS` | `off` | `on` reads configured read-only ICS/webcal feeds into the calendar tools. `off` changes nothing. Any other value refuses to start. |
+| `ICLOUD_MCP_SUBSCRIBED_CALENDARS_FILE` | `~/.icloud-mcp/subscribed-calendars.json` | JSON object of display name to `https://`, `webcal://`, or `keychain:<account>`. Created mode `0600` when missing. |
 
 ## Security
 
