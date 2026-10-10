@@ -11,6 +11,7 @@ import { reminderTools, handleReminderTool } from './lib/tools/reminders.js';
 import { assertValidToolProfile, selectTools, prepareToolCall } from './lib/tool-profile.js';
 import { applyKeychainCredentials } from './lib/keychain.js';
 import { recordAudit } from './lib/audit.js';
+import { assertValidSubscribedCalendarsSetting } from './lib/subscribed-calendars.js';
 
 
 const { version: SERVER_VERSION } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
@@ -81,6 +82,7 @@ function resolveMailbox(name, creds) {
 
 export function createMcpServer() {
   assertValidToolProfile();
+  assertValidSubscribedCalendarsSetting();
   const server = new Server(
     { name: 'icloud-mail', version: SERVER_VERSION },
     { capabilities: { tools: {} } }
