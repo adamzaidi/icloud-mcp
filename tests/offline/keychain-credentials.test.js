@@ -11,6 +11,7 @@ import {
   applyKeychainCredentials,
   passwordLookupArgs,
   readKeychainCredentials,
+  runKeychainCommand,
 } from '../../lib/keychain.js';
 import { loadEnvFile } from '../../mcp-call.mjs';
 import { configuredReminderListName } from '../../lib/digest.js';
@@ -66,6 +67,21 @@ test('a missing user and password both come from Keychain', () => {
   assert.equal(found.user, 'you@icloud.com');
   assert.equal(found.pass, FIXTURE_PASSWORD);
   assert.equal(found.source, 'keychain');
+});
+
+test('a failed security lookup does not keep the password on the error', () => {
+  assert.throws(
+    () => runKeychainCommand(['find-generic-password', '-w'], () => {
+      const error = new Error(`security: ${FIXTURE_PASSWORD}`);
+      error.stderr = FIXTURE_PASSWORD;
+      throw error;
+    }),
+    (error) => {
+      assert.equal(error.message, 'security lookup failed');
+      assert.equal(JSON.stringify(error).includes(FIXTURE_PASSWORD), false);
+      return true;
+    }
+  );
 });
 
 test('IMAP_PASS fills IMAP_PASSWORD when that variable is unset', () => {
