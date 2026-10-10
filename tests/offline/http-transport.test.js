@@ -32,6 +32,8 @@ const AUD = 'access-aud-tag';
 const EMAIL = 'you@example.com';
 const OTHER = 'other@example.com';
 const BEARER = 'local-test-bearer-token';
+const SERVICE_CLIENT_ID = 'test-service-token-client-id.access';
+const OTHER_CLIENT_ID = 'other-service-token-client-id.access';
 
 const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const otherPair = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -59,6 +61,13 @@ function claims(overrides = {}) {
     iss: `https://${TEAM}`,
     ...overrides,
   };
+}
+
+// An Access service token JWT carries no email. Its common_name is the Client ID.
+function serviceClaims(overrides = {}) {
+  const payload = claims({ type: 'app', common_name: SERVICE_CLIENT_ID, ...overrides });
+  delete payload.email;
+  return payload;
 }
 
 function accessEnv(extra = {}) {
@@ -256,6 +265,134 @@ test('Cloudflare Access JWT: valid, expired, wrong aud, wrong email, missing', a
     await server.close();
     resetHttpForTests();
   }
+});
+
+test('Access service token: accepted by common_name, rejected when absent from the list', async () => {
+  const logs = [];
+  const env = accessEnv({
+    ICLOUD_MCP_ALLOWED_SERVICE_TOKENS: ` ${SERVICE_CLIENT_ID} , second-client-id.access `,
+    ICLOUD_MCP_RATE_LIMIT_PER_MINUTE: '2',
+  });
+  const server = await listen(env, logs);
+  const valid = signJwt(serviceClaims());
+  try {
+    const direct = await authenticate({ headers: { 'cf-access-jwt-assertion': valid } }, env);
+    assert.equal(direct.ok, true);
+    assert.equal(direct.identity, SERVICE_CLIENT_ID);
+
+    const ok = await post(server.port, { headers: { 'cf-access-jwt-assertion': valid } });
+    assert.equal(ok.status, 200, ok.body);
+    assert.match(ok.body, /icloud-mail/);
+
+    const wrongName = await post(server.port, {
+      headers: { 'cf-access-jwt-assertion': signJwt(serviceClaims({ common_name: OTHER_CLIENT_ID })) },
+    });
+    assert.equal(wrongName.status, 401);
+    assert.equal(JSON.parse(wrongName.body).error, 'service_token_not_allowed');
+
+    const caseChanged = await post(server.port, {
+      headers: { 'cf-access-jwt-assertion': signJwt(serviceClaims({ common_name: SERVICE_CLIENT_ID.toUpperCase() })) },
+    });
+    assert.equal(caseChanged.status, 401);
+    assert.equal(JSON.parse(caseChanged.body).error, 'service_token_not_allowed');
+
+    const noName = await post(server.port, {
+      headers: { 'cf-access-jwt-assertion': signJwt(serviceClaims({ common_name: undefined })) },
+    });
+    assert.equal(noName.status, 401);
+    assert.equal(JSON.parse(noName.body).error, 'service_token_not_allowed');
+
+    // Rejections above did not spend the service token's own budget. The second
+    // request below is the second authenticated call for this common_name, so
+    // the third is over the limit of 2, while an email identity keeps its own bucket.
+    const second = await post(server.port, { headers: { 'cf-access-jwt-assertion': valid } });
+    assert.equal(second.status, 200, second.body);
+    const limited = await post(server.port, { headers: { 'cf-access-jwt-assertion': valid } });
+    assert.equal(limited.status, 429);
+    assert.equal(JSON.parse(limited.body).error, 'rate_limited');
+    const user = await post(server.port, { headers: { 'cf-access-jwt-assertion': signJwt(claims()) } });
+    assert.equal(user.status, 200, user.body);
+
+    const text = logs.join('');
+    assert.equal(text.includes(valid), false);
+    assert.equal(text.includes(SERVICE_CLIENT_ID), false);
+    assert.equal(text.includes(OTHER_CLIENT_ID), false);
+    assert.equal(wrongName.body.includes(OTHER_CLIENT_ID), false);
+  } finally {
+    await server.close();
+    resetHttpForTests();
+  }
+});
+
+test('Access service token: signature, audience, expiry, and issuer checks still apply', async () => {
+  resetHttpForTests();
+  setJwksFetcherForTests(async () => ({ keys: [jwk] }));
+  const env = accessEnv({ ICLOUD_MCP_ALLOWED_SERVICE_TOKENS: SERVICE_CLIENT_ID });
+
+  const badSig = await verifyAccessJwt(signJwt(serviceClaims(), { key: otherPair.privateKey }), env);
+  assert.equal(badSig.ok, false);
+  assert.equal(badSig.reason, 'invalid_token');
+
+  // Swap the common_name after signing. The signature no longer matches.
+  const signed = signJwt(serviceClaims({ common_name: OTHER_CLIENT_ID })).split('.');
+  const forgedBody = Buffer.from(JSON.stringify(serviceClaims())).toString('base64url');
+  const tampered = await verifyAccessJwt(`${signed[0]}.${forgedBody}.${signed[2]}`, env);
+  assert.equal(tampered.ok, false);
+  assert.equal(tampered.reason, 'invalid_token');
+
+  const wrongAud = await verifyAccessJwt(signJwt(serviceClaims({ aud: ['someone-else'] })), env);
+  assert.equal(wrongAud.ok, false);
+  assert.equal(wrongAud.reason, 'wrong_audience');
+
+  const expired = await verifyAccessJwt(
+    signJwt(serviceClaims({ exp: Math.floor(Date.now() / 1000) - 120 })),
+    env
+  );
+  assert.equal(expired.ok, false);
+  assert.equal(expired.reason, 'expired');
+
+  const issuer = await verifyAccessJwt(signJwt(serviceClaims({ iss: 'https://evil.example' })), env);
+  assert.equal(issuer.ok, false);
+  assert.equal(issuer.reason, 'invalid_issuer');
+
+  const early = await verifyAccessJwt(
+    signJwt(serviceClaims({ nbf: Math.floor(Date.now() / 1000) + 3600 })),
+    env
+  );
+  assert.equal(early.ok, false);
+  assert.equal(early.reason, 'not_yet_valid');
+
+  const valid = await verifyAccessJwt(signJwt(serviceClaims()), env);
+  assert.equal(valid.ok, true);
+  assert.equal(valid.identity, SERVICE_CLIENT_ID);
+  assert.equal(valid.serviceToken, SERVICE_CLIENT_ID);
+  assert.equal(valid.email, undefined);
+});
+
+test('a JWT with no email is rejected when no service tokens are allowed, and the email path is unchanged', async () => {
+  resetHttpForTests();
+  setJwksFetcherForTests(async () => ({ keys: [jwk] }));
+
+  for (const env of [accessEnv(), accessEnv({ ICLOUD_MCP_ALLOWED_SERVICE_TOKENS: ' , ' })]) {
+    const noList = await verifyAccessJwt(signJwt(serviceClaims()), env);
+    assert.equal(noList.ok, false);
+    assert.equal(noList.reason, 'email_not_allowed');
+    const noIdentity = await verifyAccessJwt(signJwt(claims({ email: undefined })), env);
+    assert.equal(noIdentity.ok, false);
+    assert.equal(noIdentity.reason, 'email_not_allowed');
+  }
+
+  const env = accessEnv({ ICLOUD_MCP_ALLOWED_SERVICE_TOKENS: SERVICE_CLIENT_ID });
+  const user = await verifyAccessJwt(signJwt(claims()), env);
+  assert.equal(user.ok, true);
+  assert.equal(user.identity, EMAIL);
+  assert.equal(user.email, EMAIL);
+  assert.equal(user.serviceToken, undefined);
+
+  // An email that is not allowed stays rejected, even next to an allowed common_name.
+  const otherUser = await verifyAccessJwt(signJwt(claims({ email: OTHER, common_name: SERVICE_CLIENT_ID })), env);
+  assert.equal(otherUser.ok, false);
+  assert.equal(otherUser.reason, 'email_not_allowed');
 });
 
 test('bearer token is a second auth option and a mismatch is rejected', async () => {

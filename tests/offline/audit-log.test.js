@@ -292,6 +292,7 @@ test('the README documents remote access and every new environment variable', ()
     'CF_ACCESS_TEAM_DOMAIN',
     'CF_ACCESS_AUD',
     'ICLOUD_MCP_ALLOWED_EMAILS',
+    'ICLOUD_MCP_ALLOWED_SERVICE_TOKENS',
     'ICLOUD_MCP_BEARER_TOKEN',
     'ICLOUD_MCP_ALLOWED_HOSTS',
     'ICLOUD_MCP_ALLOWED_ORIGINS',
