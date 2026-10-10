@@ -232,6 +232,22 @@ test('drafts saves instead of sending for every sending tool', async () => {
   });
 });
 
+test('drafts keeps the Reply-To header on the saved draft', async () => {
+  await withMode('drafts', async ({ sent, drafts }) => {
+    const result = await composeEmail(FOREIGN, 'Hello', 'body', { replyTo: 'other@example.com' }, CREDS);
+    assert.equal(result.drafted, true);
+    assert.equal(sent.length, 0);
+    assert.equal(drafts.length, 1);
+    assert.match(drafts[0].raw, /^Reply-To: other@example\.com\r?$/m);
+
+    await assert.rejects(
+      () => composeEmail(FOREIGN, 'Hello', 'body', { replyTo: 'other@example.com\r\nBcc: evil@example.com' }, CREDS),
+      /header/i,
+    );
+    assert.equal(drafts.length, 1);
+  });
+});
+
 test('drafts does not send when the draft append fails', async () => {
   await withMode('drafts', async ({ sent }) => {
     setDraftImapClientFactoryForTests(() => ({
