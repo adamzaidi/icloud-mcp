@@ -241,7 +241,7 @@ Credentials stay in your local MCP client config. The server runs on your machin
 | `drafts` | Do not send. `compose_email`, `reply_to_email`, and `forward_email` append a draft instead and return `sent: false`, `drafted: true`. |
 | `self-only` | Send only when every To, Cc, and Bcc mailbox is the authenticated account. Addresses are parsed with the same parser nodemailer uses, then those objects are what gets sent. Case is ignored. |
 
-Any other value is an error and nothing is sent. Recipient groups, addresses that do not parse to a single mailbox, and a CR, LF, or other control character in a header field are refused in every mode. The refusal does not include the address.
+Any other value is an error and nothing is sent. Recipient groups, addresses that do not parse to a single mailbox, and a CR, LF, or other control character in a header field are refused in every mode. The refusal does not include the address. A subject copied from the original message has CR, LF, and tab runs collapsed to a space, and other controls removed, before that check. A subject the caller supplies is still refused when it contains a control character.
 
 ## License
 

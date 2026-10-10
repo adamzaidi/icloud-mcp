@@ -441,9 +441,12 @@ test('parsed recipients match what sendMail receives, including the quoted-addre
       /line break/
     );
     await assert.rejects(
-      () => replyToEmail(selfMessage({ subject: 'Hi\r\nBcc: evil@example.com' }), 'x', {}, CREDS),
+      () => composeEmail(ACCOUNT, 'Hello\tworld', 'body', {}, CREDS),
       /line break/
     );
+    const foldedReply = await replyToEmail(selfMessage({ subject: 'Hi\r\nBcc: evil@example.com' }), 'x', {}, CREDS);
+    assert.equal(foldedReply.sent, true);
+    assert.equal(sent.at(-1).subject, 'Re: Hi Bcc: evil@example.com');
     await assert.rejects(
       () => replyToEmail(selfMessage({
         headers: {
@@ -456,14 +459,55 @@ test('parsed recipients match what sendMail receives, including the quoted-addre
       }), 'x', {}, CREDS),
       /line break/
     );
-    await assert.rejects(
-      () => forwardEmail(selfMessage({ subject: 'Hi\nBcc: evil@example.com' }), ACCOUNT, '', {}, CREDS),
-      /line break/
-    );
+    const foldedForward = await forwardEmail(selfMessage({ subject: 'Hi\nBcc: evil@example.com' }), ACCOUNT, '', {}, CREDS);
+    assert.equal(foldedForward.sent, true);
+    assert.equal(sent.at(-1).subject, 'Fwd: Hi Bcc: evil@example.com');
     await assert.rejects(() => saveDraft(group, 'Hello', 'body', {}, CREDS), /recipient groups are not allowed/);
-    assert.equal(sent.length, 1);
+    assert.equal(sent.length, 3);
     assert.equal(JSON.stringify(sent).includes('\r'), false);
     assert.equal(JSON.stringify(sent).includes('\nBcc'), false);
+    assert.equal(JSON.stringify(sent).includes('\t'), false);
+  });
+});
+
+test('reply and forward in on mode send a folded or encoded original subject', async () => {
+  const libmime = (await import('libmime')).default;
+  const folded = libmime.decodeWords('Hello\r\n\tworld');
+  const encodedFold = libmime.decodeWords('=?utf-8?q?Hello=0D=0A=09world?=');
+  const encodedControl = libmime.decodeWords('=?utf-8?q?Hello=01world?=');
+  assert.equal(folded, 'Hello\r\n\tworld');
+  assert.equal(encodedFold, 'Hello\r\n\tworld');
+  assert.equal(encodedControl, 'Hello\u0001world');
+
+  await withMode('on', async ({ sent }) => {
+    const replied = await replyToEmail(selfMessage({ subject: folded }), 'thanks', {}, CREDS);
+    assert.equal(replied.sent, true);
+    assert.equal(sent.at(-1).subject, 'Re: Hello world');
+
+    const already = await replyToEmail(selfMessage({ subject: 'Re:\r\n\tHello world' }), 'thanks', {}, CREDS);
+    assert.equal(already.sent, true);
+    assert.equal(sent.at(-1).subject, 'Re: Hello world');
+
+    const forwarded = await forwardEmail(selfMessage({ subject: encodedFold }), ACCOUNT, 'note', {}, CREDS);
+    assert.equal(forwarded.sent, true);
+    assert.equal(sent.at(-1).subject, 'Fwd: Hello world');
+    assert.match(sent.at(-1).text, /Subject: Hello world/);
+    assert.equal(sent.at(-1).text.includes('\r'), false);
+    assert.equal(sent.at(-1).text.includes('\n\t'), false);
+
+    const stripped = await forwardEmail(selfMessage({ subject: encodedControl }), ACCOUNT, '', {}, CREDS);
+    assert.equal(stripped.sent, true);
+    assert.equal(sent.at(-1).subject, 'Fwd: Helloworld');
+
+    await assert.rejects(
+      () => composeEmail(ACCOUNT, 'Hello\r\n\tworld', 'body', {}, CREDS),
+      /line break/
+    );
+    await assert.rejects(
+      () => composeEmail(ACCOUNT, encodedControl, 'body', {}, CREDS),
+      /line break/
+    );
+    assert.equal(JSON.stringify(sent).includes('\u0001'), false);
   });
 });
 
