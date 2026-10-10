@@ -15,8 +15,11 @@ const projectDir = fileURLToPath(new URL('../..', import.meta.url));
 const {
   assertHttpStartup,
   authenticate,
+  clientIp,
+  consumeRateLimit,
   hostAllowed,
   originAllowed,
+  rateBucketCount,
   resetHttpForTests,
   setJwksFetcherForTests,
   setJwksTimeoutForTests,
@@ -429,6 +432,173 @@ test('verifyAccessJwt accepts a matching allow-list entry regardless of case', a
   }, { ...env, ICLOUD_MCP_BEARER_TOKEN: BEARER });
   assert.equal(direct.ok, true);
   assert.equal(direct.identity, 'bearer');
+});
+
+function listToolsBody() {
+  return JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+}
+
+test('an unknown session id is 404 and a missing id on a non-initialize call is 400', async () => {
+  const server = await listen({
+    ICLOUD_MCP_SEND_MODE: 'off',
+    ICLOUD_MCP_TOOL_PROFILE: 'remote-safe',
+    ICLOUD_MCP_BEARER_TOKEN: BEARER,
+  });
+  try {
+    const auth = { authorization: `Bearer ${BEARER}` };
+    const missing = await post(server.port, { headers: auth, body: listToolsBody() });
+    assert.equal(missing.status, 400);
+    assert.equal(JSON.parse(missing.body).error, 'invalid_session');
+
+    const unknown = await post(server.port, {
+      headers: { ...auth, 'mcp-session-id': 'missing-session' },
+      body: listToolsBody(),
+    });
+    assert.equal(unknown.status, 404);
+    assert.equal(JSON.parse(unknown.body).error, 'session_not_found');
+
+    const staleInitialize = await post(server.port, {
+      headers: { ...auth, 'mcp-session-id': 'ended-session' },
+    });
+    assert.equal(staleInitialize.status, 404);
+
+    const opened = await post(server.port, { headers: auth });
+    assert.equal(opened.status, 200);
+    const sessionId = opened.headers['mcp-session-id'];
+    assert.equal(typeof sessionId, 'string');
+    const listed = await post(server.port, {
+      headers: { ...auth, 'mcp-session-id': sessionId },
+      body: listToolsBody(),
+    });
+    assert.equal(listed.status, 200);
+  } finally {
+    await server.close();
+    resetHttpForTests();
+  }
+});
+
+test('sessions expire when idle, stop at the cap, and stay bound to one identity', async () => {
+  let extra = 0;
+  resetHttpForTests();
+  setJwksFetcherForTests(async () => ({ keys: [jwk] }));
+  const server = await startHttpServer(createServer, {
+    env: accessEnv({ ICLOUD_MCP_BEARER_TOKEN: BEARER }),
+    port: 0,
+    sessionIdleMs: 1000,
+    sessionSweepMs: 60_000,
+    maxSessions: 1,
+    now: () => Date.now() + extra,
+    log: () => {},
+  });
+  try {
+    assert.equal(server.sweepTimer.hasRef(), false);
+    const firstToken = signJwt(claims({ email: EMAIL }));
+    const secondToken = signJwt(claims({ email: 'second@example.com' }));
+    const opened = await post(server.port, {
+      headers: { 'cf-access-jwt-assertion': firstToken },
+    });
+    assert.equal(opened.status, 200, opened.body);
+    const sessionId = opened.headers['mcp-session-id'];
+    const again = await post(server.port, { headers: { authorization: `Bearer ${BEARER}` } });
+    assert.equal(again.status, 503);
+    assert.equal(JSON.parse(again.body).error, 'session_limit');
+
+    const other = await post(server.port, {
+      headers: { 'cf-access-jwt-assertion': secondToken, 'mcp-session-id': sessionId },
+      body: listToolsBody(),
+    });
+    assert.equal(other.status, 403);
+    assert.equal(JSON.parse(other.body).error, 'session_identity');
+    assert.equal(other.body.includes(EMAIL), false);
+    assert.equal(other.body.includes('second@example.com'), false);
+
+    const same = await post(server.port, {
+      headers: { 'cf-access-jwt-assertion': firstToken, 'mcp-session-id': sessionId },
+      body: listToolsBody(),
+    });
+    assert.equal(same.status, 200);
+
+    extra += 1000;
+    const expired = await post(server.port, {
+      headers: { 'cf-access-jwt-assertion': firstToken, 'mcp-session-id': sessionId },
+      body: listToolsBody(),
+    });
+    assert.equal(expired.status, 404);
+    const reopened = await post(server.port, {
+      headers: { 'cf-access-jwt-assertion': firstToken },
+    });
+    assert.equal(reopened.status, 200);
+  } finally {
+    await server.close();
+    resetHttpForTests();
+  }
+});
+
+test('pre-auth limits use Cf-Connecting-Ip only for loopback peers when Access is configured', async () => {
+  const access = await listen(accessEnv());
+  try {
+    for (let i = 0; i < 10; i += 1) {
+      const flood = await post(access.port, { headers: { 'cf-connecting-ip': '203.0.113.10' } });
+      assert.equal(flood.status, 401);
+    }
+    const blocked = await post(access.port, { headers: { 'cf-connecting-ip': '203.0.113.10' } });
+    assert.equal(blocked.status, 429);
+    const other = await post(access.port, { headers: { 'cf-connecting-ip': '203.0.113.11' } });
+    assert.equal(other.status, 401);
+    const garbage = await post(access.port, { headers: { 'cf-connecting-ip': 'not-an-ip' } });
+    assert.equal(garbage.status, 401);
+    const direct = await post(access.port, {});
+    assert.equal(direct.status, 401);
+  } finally {
+    await access.close();
+    resetHttpForTests();
+  }
+
+  const bearerOnly = await listen({
+    ICLOUD_MCP_SEND_MODE: 'off',
+    ICLOUD_MCP_TOOL_PROFILE: 'remote-safe',
+    ICLOUD_MCP_BEARER_TOKEN: BEARER,
+  });
+  try {
+    for (let i = 0; i < 10; i += 1) {
+      const flood = await post(bearerOnly.port, { headers: { 'cf-connecting-ip': `203.0.113.${i}` } });
+      assert.equal(flood.status, 401);
+    }
+    const blocked = await post(bearerOnly.port, { headers: { 'cf-connecting-ip': '198.51.100.20' } });
+    assert.equal(blocked.status, 429);
+  } finally {
+    await bearerOnly.close();
+    resetHttpForTests();
+  }
+
+  const env = accessEnv();
+  assert.equal(clientIp({
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { 'cf-connecting-ip': '203.0.113.8' },
+  }, env), '203.0.113.8');
+  assert.equal(clientIp({
+    socket: { remoteAddress: '::ffff:127.0.0.1' },
+    headers: { 'cf-connecting-ip': '::ffff:203.0.113.9' },
+  }, env), '203.0.113.9');
+  assert.equal(clientIp({
+    socket: { remoteAddress: '203.0.113.1' },
+    headers: { 'cf-connecting-ip': '203.0.113.8' },
+  }, env), '203.0.113.1');
+  assert.equal(clientIp({
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { 'cf-connecting-ip': 'not-an-ip' },
+  }, env), '127.0.0.1');
+  assert.equal(clientIp({
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { 'cf-connecting-ip': '203.0.113.8' },
+  }, { ICLOUD_MCP_BEARER_TOKEN: BEARER }), '127.0.0.1');
+
+  resetHttpForTests();
+  consumeRateLimit('preauth:203.0.113.1', 10, 0);
+  consumeRateLimit('preauth:203.0.113.2', 10, 1);
+  assert.equal(rateBucketCount(), 2);
+  consumeRateLimit('preauth:203.0.113.3', 10, 60_001);
+  assert.equal(rateBucketCount(), 1);
 });
 
 test('icloud-mcp --http refuses to start while send mode is on, and serves when it is off', async () => {
