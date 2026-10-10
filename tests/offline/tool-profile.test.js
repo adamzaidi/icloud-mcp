@@ -14,9 +14,12 @@ process.env.ICLOUD_MCP_DATA_DIR = dataRoot;
 const { mailTools } = await import('../../lib/tools/mail.js');
 const { contactTools } = await import('../../lib/tools/contacts.js');
 const { calendarTools, suggestEventTools, handleCalendarTool } = await import('../../lib/tools/calendar.js');
-const { reminderTools } = await import('../../lib/tools/reminders.js');
+const { reminderTools, pickReminderFields } = await import('../../lib/tools/reminders.js');
 const { selectTools, prepareToolCall, hiddenRemoteSafeTools, resolveToolProfile } = await import('../../lib/tool-profile.js');
-const { createEvent, setCalDavRequestForTests, setCalDavDiscoveryForTests } = await import('../../lib/caldav.js');
+const {
+  createEvent, createReminder: createCalDavReminder, updateReminder: updateCalDavReminder,
+  setCalDavRequestForTests, setCalDavDiscoveryForTests,
+} = await import('../../lib/caldav.js');
 
 const allTools = [...mailTools, ...contactTools, ...calendarTools, ...reminderTools, ...suggestEventTools];
 
@@ -225,6 +228,65 @@ test('calendar text cannot inject ATTENDEE or ORGANIZER lines', async () => {
   assert.equal(unfolded.includes('\nATTENDEE'), false);
   assert.equal(unfolded.includes('\nORGANIZER'), false);
   assert.equal(unfolded.includes('\r'), false);
+});
+
+test('reminder text and timezone cannot inject ATTENDEE or ORGANIZER lines', async () => {
+  const bodies = [];
+  setCalDavRequestForTests(async (method, _url, opts) => {
+    if (method === 'GET') {
+      return {
+        status: 200, etag: '"e1"',
+        body: 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:ABC\r\nSUMMARY:Old\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n',
+      };
+    }
+    bodies.push(opts.body);
+    return { status: 204, etag: null, body: '' };
+  });
+  setCalDavDiscoveryForTests({ dataHost: 'https://caldav.example.test', calendarsPath: '/cal/' });
+  const hostile = {
+    title: 'Buy milk\r\nATTENDEE:mailto:evil@example.com',
+    notes: 'Notes\nORGANIZER:mailto:evil@example.com',
+    status: 'NEEDS-ACTION\nORGANIZER:mailto:evil@example.com',
+    timezone: 'America/New_York\r\nATTENDEE:mailto:evil@example.com',
+    due: '2030-01-02T15:00:00Z',
+  };
+  try {
+    await createCalDavReminder('cal', hostile);
+    await createCalDavReminder('cal', { ...hostile, allDay: true, due: '2030-01-02\r\nATTENDEE:mailto:evil@example.com' });
+    await updateCalDavReminder('cal', 'ABC', hostile);
+  } finally {
+    setCalDavRequestForTests(null);
+    setCalDavDiscoveryForTests(null);
+  }
+  assert.equal(bodies.length, 3);
+  for (const body of bodies) {
+    const lines = body.split(/\r\n/);
+    assert.equal(lines.some((line) => line.startsWith('ATTENDEE')), false);
+    assert.equal(lines.some((line) => line.startsWith('ORGANIZER')), false);
+    assert.match(lines.find((line) => line.startsWith('SUMMARY:')), /\\nATTENDEE/);
+    const unfolded = body.replace(/\r\n/g, '\n');
+    assert.equal(unfolded.includes('\nATTENDEE'), false);
+    assert.equal(unfolded.includes('\nORGANIZER'), false);
+    assert.equal(unfolded.includes('\r'), false);
+  }
+  assert.match(bodies[0].split(/\r\n/).find((line) => line.startsWith('DUE;TZID=')), /^DUE;TZID=America\/New_York\\nATTENDEE:mailto:evil@example\.com:\d{8}T\d{6}$/);
+  assert.match(bodies[1], /\r\nDUE;VALUE=DATE:20300102\r\n/);
+  assert.match(bodies[2], /\r\nUID:ABC\r\n/);
+});
+
+test('reminder tools forward only the documented fields', () => {
+  assert.deepEqual(pickReminderFields({
+    listName: 'Home', reminderId: 'ABC',
+    title: 'Buy milk', notes: 'Whole', due: '2030-01-02T15:00:00Z', priority: 'high',
+    timezone: 'UTC\r\nATTENDEE:mailto:evil@example.com', status: 'COMPLETED', completed: true, allDay: true,
+  }), { title: 'Buy milk', notes: 'Whole', due: '2030-01-02T15:00:00Z', priority: 'high' });
+  assert.deepEqual(pickReminderFields({ listName: 'Home', notes: '' }), { notes: '' });
+  assert.deepEqual(pickReminderFields({}), {});
+  for (const name of ['create_reminder', 'update_reminder']) {
+    const tool = reminderTools.find((candidate) => candidate.name === name);
+    const extra = Object.keys(tool.inputSchema.properties).filter((key) => !['listName', 'reminderId'].includes(key));
+    assert.deepEqual(extra.sort(), ['due', 'notes', 'priority', 'title']);
+  }
 });
 
 test('stdio exposes the exact list for each profile and rejects hidden tools', async () => {
