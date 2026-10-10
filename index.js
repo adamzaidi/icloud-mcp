@@ -10,6 +10,7 @@ import { calendarTools, suggestEventTools, handleCalendarTool } from './lib/tool
 import { reminderTools, handleReminderTool } from './lib/tools/reminders.js';
 import { assertValidToolProfile, selectTools, prepareToolCall } from './lib/tool-profile.js';
 import { applyKeychainCredentials } from './lib/keychain.js';
+import { recordAudit } from './lib/audit.js';
 
 
 const { version: SERVER_VERSION } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
@@ -99,6 +100,7 @@ export function createMcpServer() {
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name } = request.params;
+    const started = Date.now();
     try {
       const args = prepareToolCall(name, request.params.arguments ?? {});
       const ctx = { resolveCreds, resolveMailbox, accounts: ACCOUNTS };
@@ -114,8 +116,11 @@ export function createMcpServer() {
         }
       }
       if (!handled) throw new Error(`Unknown tool: ${name}`);
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      const payload = { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      recordAudit({ tool: name, status: 'ok', durationMs: Date.now() - started, result });
+      return payload;
     } catch (error) {
+      recordAudit({ tool: name, status: 'error', durationMs: Date.now() - started });
       process.stderr.write(`[tool-error] ${name}: ${error.responseText ?? error.message}\n`);
       return { content: [{ type: 'text', text: `Error: ${friendlyError(error)}` }], isError: true };
     }
