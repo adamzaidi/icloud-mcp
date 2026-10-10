@@ -88,7 +88,7 @@ Rules, the move manifest, digest state, the session log, and the audit log are w
 - `~/.icloud-mcp-session.json`
 - `~/.icloud-mcp-audit.log`
 
-The audit log is append-only. Each line is one JSON object with the tool name, timestamp, status (`ok` or `error`), duration, and result counts (numbers and array lengths). It does not include arguments, error text, message bodies, subjects, or addresses. Set `ICLOUD_MCP_AUDIT_LOG` to move that file. Set `ICLOUD_MCP_DATA_DIR` to store the whole set somewhere else. Do not point it at the git checkout. Contact exports, CRM notes, `.env`, and digest output belong outside the repo; `.gitignore` already excludes the usual local folders.
+The audit log is append-only. The file is created mode `0600`, and the directory that contains it is set to `0700`, including when either already exists. Each line is one JSON object with a fixed set of fields: tool name, timestamp, status (`ok` or `error`), duration, and one integer count. That count is an array length, or a number taken from a fixed list of result fields such as `total` or `wouldDelete`. Keys on the result are never copied, so a sender address used as a key is not written. Arguments, error text, message bodies, and subjects are not written either. When the file reaches 1 MiB it is rotated through `.1`, `.2`, and `.3`. `ICLOUD_MCP_AUDIT_LOG_MAX_BYTES` changes that size. Set `ICLOUD_MCP_AUDIT_LOG` to move the file. Set `ICLOUD_MCP_DATA_DIR` to store the whole set somewhere else. Do not point it at the git checkout. Contact exports, CRM notes, `.env`, and digest output belong outside the repo; `.gitignore` already excludes the usual local folders.
 
 ## Available tools (86)
 
@@ -264,7 +264,7 @@ Stdio stays the default and is the right transport for a local client. A phone, 
 
 `ICLOUD_MCP_BEARER_TOKEN` is a static bearer token for a local test client. It is not the remote credential. When Access and the bearer token are both set, either one is accepted.
 
-HTTP mode refuses to start unless authentication is configured and `ICLOUD_MCP_SEND_MODE` is not `on`. `ICLOUD_MCP_ALLOW_REMOTE_SEND=1` overrides the send-mode refusal. Leave it unset.
+HTTP mode refuses to start unless authentication is configured, `ICLOUD_MCP_SEND_MODE` is `off`, `drafts`, or `self-only`, and `ICLOUD_MCP_TOOL_PROFILE` is `remote-safe`. The default send mode `on` and the `full` profile are refused. A missing Origin header is allowed. The Origin value `null`, and any other Origin that is not on the allow list, are rejected. Authenticated requests are limited per identity. Requests that have no credentials use a separate limit of 10 per address, so an unauthenticated flood does not consume the caller's budget.
 
 ### macOS LaunchAgent
 
@@ -314,7 +314,7 @@ Store the app-specific password in the macOS Keychain (service `icloud-mcp`, or 
 
 Use `ICLOUD_MCP_SEND_MODE=off` or `drafts` for a remote connector. `off` blocks `compose_email`, `reply_to_email`, and `forward_email`. `drafts` saves a draft instead of sending. `self-only` sends only when every To, Cc, and Bcc is the authenticated account. Unset means `on`, which is the local stdio default and is refused in HTTP mode.
 
-Use `ICLOUD_MCP_TOOL_PROFILE=remote-safe`. That profile hides sending, mailbox delete and bulk tools, move-by-rule tools, rules management, empty trash, and calendar or list deletion. Read, search, drafts, and calendar or reminder create and edit stay. Leave `ICLOUD_MCP_ALLOW_BULK` unset so any bulk tool that is still listed runs as a dry run.
+Use `ICLOUD_MCP_TOOL_PROFILE=remote-safe`. That profile is an allowlist of read, search, draft, and calendar or reminder create and edit tools. A tool that is not on the list is hidden, including tools added later. Leave `ICLOUD_MCP_ALLOW_BULK` unset so any bulk tool that is on the list runs as a dry run.
 
 ### Prompt injection
 
@@ -325,21 +325,21 @@ Message bodies, subjects, and addresses are untrusted data. A sender can put ins
 | Variable | Default | Role |
 |----------|---------|------|
 | `ICLOUD_MCP_SEND_MODE` | `on` | `off`, `drafts`, `self-only`, or `on`. Enforced in the SMTP send path. |
-| `ICLOUD_MCP_TOOL_PROFILE` | `full` | `full` or `remote-safe`. `remote-safe` omits destructive tools from the tool list. |
+| `ICLOUD_MCP_TOOL_PROFILE` | `full` | `full` or `remote-safe`. `remote-safe` is an allowlist. Tools that are not on it stay hidden. |
 | `ICLOUD_MCP_ALLOW_BULK` | unset | Comma-separated tool names that may mutate in `remote-safe`. Hidden tools stay hidden. |
 | `ICLOUD_MCP_HTTP_PORT` | `8787` | Loopback port for `--http`. |
 | `CF_ACCESS_TEAM_DOMAIN` | unset | Cloudflare Access team domain. Required for JWT auth. |
 | `CF_ACCESS_AUD` | unset | Access application AUD tag. |
 | `ICLOUD_MCP_ALLOWED_EMAILS` | unset | Comma-separated emails allowed to present an Access JWT. |
 | `ICLOUD_MCP_BEARER_TOKEN` | unset | Static bearer token for local HTTP tests. |
-| `ICLOUD_MCP_ALLOW_REMOTE_SEND` | unset | Set to `1` only to let HTTP start while send mode is `on`. |
 | `ICLOUD_MCP_ALLOWED_HOSTS` | loopback | Extra Host values, such as the tunnel hostname. |
-| `ICLOUD_MCP_ALLOWED_ORIGINS` | loopback | Extra browser Origin values. A missing Origin is allowed. |
-| `ICLOUD_MCP_RATE_LIMIT_PER_MINUTE` | `60` | Process-wide request limit in HTTP mode. |
+| `ICLOUD_MCP_ALLOWED_ORIGINS` | loopback | Extra browser Origin values. A missing Origin is allowed. The value `null` is rejected. |
+| `ICLOUD_MCP_RATE_LIMIT_PER_MINUTE` | `60` | Per-identity limit after authentication. Unauthenticated requests use a separate limit of 10 per address. |
 | `ICLOUD_MCP_KEYCHAIN_SERVICE` | `icloud-mcp` | `security` service name used when `IMAP_USER` or `IMAP_PASSWORD` is missing. |
 | `IMAP_PASS` | unset | Copied to `IMAP_PASSWORD` only when `IMAP_PASSWORD` is unset. |
 | `ICLOUD_MCP_REMINDER_LIST` | `claude` | Reminders list name used by the digest tools. |
-| `ICLOUD_MCP_AUDIT_LOG` | `~/.icloud-mcp-audit.log` | Append-only audit file. Also honors `ICLOUD_MCP_DATA_DIR`. |
+| `ICLOUD_MCP_AUDIT_LOG` | `~/.icloud-mcp-audit.log` | Audit file, mode `0600`. The directory that contains it is mode `0700`. |
+| `ICLOUD_MCP_AUDIT_LOG_MAX_BYTES` | `1048576` | Rotate the audit file after it reaches this size. Three older files are kept. |
 | `ICLOUD_MCP_DATA_DIR` | home directory | Directory for rules, the move manifest, digest state, the session log, and the audit log. |
 
 ## Security

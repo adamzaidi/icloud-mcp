@@ -1,44 +1,45 @@
-// Audit log: counts only, append-only, and no message content.
+// Audit log: fixed fields, private modes, size rotation, and no message content.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'child_process';
-import { mkdtempSync, readFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
-import { isSensitiveKey, recordAudit, summarizeCounts } from '../../lib/audit.js';
+import { AUDIT_DIR_MODE, AUDIT_FILE_MODE, integerCount, recordAudit } from '../../lib/audit.js';
 
 const projectDir = fileURLToPath(new URL('../..', import.meta.url));
 const SECRET_SUBJECT = 'Secret subject line';
 const SECRET_BODY = 'Secret body text';
 const SECRET_ADDRESS = 'person@example.com';
+const OTHER_ADDRESS = 'other@example.com';
 
-test('counts keep numbers and array lengths and drop message content', () => {
-  assert.equal(isSensitiveKey('total'), false);
-  assert.equal(isSensitiveKey('to'), true);
-  assert.equal(isSensitiveKey('subject'), true);
-  assert.equal(isSensitiveKey('notes'), true);
+function modeOf(path) {
+  return statSync(path).mode & 0o777;
+}
 
-  const counts = summarizeCounts({
+test('the integer count ignores keys taken from the result', () => {
+  assert.equal(integerCount({
     total: 4,
     unread: 1,
     messages: [{ subject: SECRET_SUBJECT, body: SECRET_BODY, from: SECRET_ADDRESS }],
-    to: [SECRET_ADDRESS],
+    [SECRET_ADDRESS]: 3,
+    [OTHER_ADDRESS]: 1,
     subject: SECRET_SUBJECT,
     note: SECRET_BODY,
     password: 'fixture-app-password',
     skipped: Number.NaN,
     infinite: Number.POSITIVE_INFINITY,
     nested: { subject: SECRET_SUBJECT, count: 9 },
-  });
-  assert.deepEqual(counts, { total: 4, unread: 1, messages: 1 });
-
-  assert.deepEqual(summarizeCounts([{ subject: SECRET_SUBJECT }]), { length: 1 });
-  assert.deepEqual(summarizeCounts('not-an-object'), {});
-  assert.deepEqual(summarizeCounts(null), {});
+  }), 4);
+  assert.equal(integerCount({ [SECRET_ADDRESS]: 3, subject: SECRET_SUBJECT }), 0);
+  assert.equal(integerCount({ total: Number.NaN, count: 5.9 }), 5);
+  assert.equal(integerCount([{ subject: SECRET_SUBJECT }]), 1);
+  assert.equal(integerCount('not-an-object'), 0);
+  assert.equal(integerCount(null), 0);
 });
 
-test('the audit file is append-only and omits bodies, subjects, and addresses', () => {
+test('an address-keyed result is not written, and only fixed fields are', () => {
   const root = mkdtempSync(join(tmpdir(), 'icloud-mcp-audit-'));
   const file = join(root, 'audit.log');
   const env = { ICLOUD_MCP_AUDIT_LOG: file };
@@ -48,9 +49,12 @@ test('the audit file is append-only and omits bodies, subjects, and addresses', 
     durationMs: 12.4,
     result: {
       total: 2,
+      [SECRET_ADDRESS]: 3,
+      [`Me <${OTHER_ADDRESS}>`]: 1,
       messages: [{ subject: SECRET_SUBJECT, body: SECRET_BODY, from: SECRET_ADDRESS }],
       to: [SECRET_ADDRESS],
-      cc: ['other@example.com'],
+      cc: [OTHER_ADDRESS],
+      subject: SECRET_SUBJECT,
     },
   }, env);
   recordAudit({ tool: 'get_email', status: 'error', durationMs: -5 }, env);
@@ -59,27 +63,92 @@ test('the audit file is append-only and omits bodies, subjects, and addresses', 
   assert.equal(lines.length, 2);
   const first = JSON.parse(lines[0]);
   const second = JSON.parse(lines[1]);
+  assert.deepEqual(Object.keys(first).sort(), ['count', 'durationMs', 'status', 'tool', 'ts']);
+  assert.deepEqual(Object.keys(second).sort(), ['count', 'durationMs', 'status', 'tool', 'ts']);
   assert.equal(first.tool, 'search_emails');
   assert.equal(first.status, 'ok');
   assert.equal(first.durationMs, 12);
-  assert.deepEqual(first.counts, { total: 2, messages: 1 });
+  assert.equal(first.count, 2);
   assert.equal(typeof first.ts, 'string');
   assert.equal(second.tool, 'get_email');
   assert.equal(second.status, 'error');
   assert.equal(second.durationMs, 0);
-  assert.deepEqual(second.counts, {});
+  assert.equal(second.count, 0);
 
   const text = readFileSync(file, 'utf8');
   assert.equal(text.includes(SECRET_SUBJECT), false);
   assert.equal(text.includes(SECRET_BODY), false);
   assert.equal(text.includes(SECRET_ADDRESS), false);
-  assert.equal(text.includes('other@example.com'), false);
+  assert.equal(text.includes(OTHER_ADDRESS), false);
   assert.equal(text.includes('fixture-app-password'), false);
+  assert.equal(modeOf(file), AUDIT_FILE_MODE);
+  assert.equal(modeOf(root), AUDIT_DIR_MODE);
+});
+
+test('an existing audit file and directory are forced to 0600 and 0700', () => {
+  const root = mkdtempSync(join(tmpdir(), 'icloud-mcp-audit-mode-'));
+  const dir = join(root, 'data');
+  mkdirSync(dir, { mode: 0o755 });
+  chmodSync(dir, 0o755);
+  const file = join(dir, 'audit.log');
+  writeFileSync(file, '', { mode: 0o644 });
+  chmodSync(file, 0o644);
+  assert.equal(modeOf(dir), 0o755);
+  assert.equal(modeOf(file), 0o644);
+
+  recordAudit({
+    tool: 'list_accounts',
+    status: 'ok',
+    durationMs: 1,
+    result: { [SECRET_ADDRESS]: 4 },
+  }, { ICLOUD_MCP_AUDIT_LOG: file });
+
+  assert.equal(modeOf(file), AUDIT_FILE_MODE);
+  assert.equal(modeOf(dir), AUDIT_DIR_MODE);
+  const text = readFileSync(file, 'utf8');
+  assert.equal(text.includes(SECRET_ADDRESS), false);
+  assert.equal(JSON.parse(text).count, 0);
+});
+
+test('a new parent directory is created mode 0700', () => {
+  const root = mkdtempSync(join(tmpdir(), 'icloud-mcp-audit-dir-'));
+  const dir = join(root, 'private');
+  const file = join(dir, 'audit.log');
+  recordAudit({ tool: 'list_accounts', status: 'ok', durationMs: 1, result: [] }, {
+    ICLOUD_MCP_AUDIT_LOG: file,
+  });
+  assert.equal(existsSync(file), true);
+  assert.equal(modeOf(file), AUDIT_FILE_MODE);
+  assert.equal(modeOf(dir), AUDIT_DIR_MODE);
+});
+
+test('the audit log rotates by size and keeps private modes', () => {
+  const root = mkdtempSync(join(tmpdir(), 'icloud-mcp-audit-rotate-'));
+  const file = join(root, 'audit.log');
+  const env = { ICLOUD_MCP_AUDIT_LOG: file, ICLOUD_MCP_AUDIT_LOG_MAX_BYTES: '80' };
+  for (let i = 0; i < 8; i += 1) {
+    recordAudit({ tool: 'list_accounts', status: 'ok', durationMs: i, result: { total: i } }, env);
+  }
+  assert.equal(existsSync(`${file}.1`), true);
+  assert.equal(existsSync(`${file}.2`), true);
+  assert.equal(existsSync(`${file}.3`), true);
+  assert.equal(existsSync(`${file}.4`), false);
+  for (const path of [file, `${file}.1`, `${file}.2`, `${file}.3`]) {
+    assert.equal(modeOf(path), AUDIT_FILE_MODE);
+    const text = readFileSync(path, 'utf8');
+    assert.equal(text.includes(SECRET_ADDRESS), false);
+    for (const line of text.trim().split('\n')) {
+      const parsed = JSON.parse(line);
+      assert.deepEqual(Object.keys(parsed).sort(), ['count', 'durationMs', 'status', 'tool', 'ts']);
+    }
+  }
+  assert.ok(statSync(file).size < 80 * 8);
 });
 
 test('a failed audit write does not throw', () => {
   const root = mkdtempSync(join(tmpdir(), 'icloud-mcp-audit-fail-'));
   const blocked = join(root, 'not-a-directory');
+  writeFileSync(blocked, '');
   recordAudit({ tool: 'list_accounts', status: 'ok', durationMs: 1, result: { total: 1 } }, {
     ICLOUD_MCP_AUDIT_LOG: join(blocked, 'audit.log'),
   });
@@ -126,9 +195,10 @@ test('stdio tool calls append an audit line without arguments or credentials', a
   assert.equal(lines[0].tool, 'list_accounts');
   assert.equal(lines[0].status, 'ok');
   assert.equal(typeof lines[0].durationMs, 'number');
-  assert.deepEqual(lines[0].counts, { length: 1 });
+  assert.equal(lines[0].count, 1);
   assert.equal(lines[1].tool, 'not_a_tool');
   assert.equal(lines[1].status, 'error');
+  assert.equal(lines[1].count, 0);
   const text = readFileSync(file, 'utf8');
   assert.equal(text.includes(SECRET_SUBJECT), false);
   assert.equal(text.includes(SECRET_BODY), false);
@@ -136,6 +206,7 @@ test('stdio tool calls append an audit line without arguments or credentials', a
   assert.equal(text.includes('you@icloud.com'), false);
   assert.equal(text.includes('fixture-app-password'), false);
   assert.equal(text.includes('Unknown tool'), false);
+  assert.equal(modeOf(file), AUDIT_FILE_MODE);
 });
 
 test('the README documents remote access and every new environment variable', () => {
@@ -154,7 +225,6 @@ test('the README documents remote access and every new environment variable', ()
     'CF_ACCESS_AUD',
     'ICLOUD_MCP_ALLOWED_EMAILS',
     'ICLOUD_MCP_BEARER_TOKEN',
-    'ICLOUD_MCP_ALLOW_REMOTE_SEND',
     'ICLOUD_MCP_ALLOWED_HOSTS',
     'ICLOUD_MCP_ALLOWED_ORIGINS',
     'ICLOUD_MCP_RATE_LIMIT_PER_MINUTE',
@@ -162,9 +232,12 @@ test('the README documents remote access and every new environment variable', ()
     'IMAP_PASS',
     'ICLOUD_MCP_REMINDER_LIST',
     'ICLOUD_MCP_AUDIT_LOG',
+    'ICLOUD_MCP_AUDIT_LOG_MAX_BYTES',
     'ICLOUD_MCP_DATA_DIR',
   ]) {
     assert.match(readme, new RegExp(name));
   }
+  assert.equal(readme.includes('ICLOUD_MCP_ALLOW_REMOTE_SEND'), false);
+  assert.equal(readme.includes('ICLOUD_MCP_ALLOW_FULL_REMOTE'), false);
   assert.equal(readme.includes('fixture-app-password'), false);
 });
