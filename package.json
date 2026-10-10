@@ -1,6 +1,6 @@
 {
   "name": "icloud-mcp",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "description": "MCP server for iCloud Mail, Calendar, Contacts, and Reminders. Works with Claude, Grok Bot, and any MCP client",
   "main": "index.js",
   "bin": {
