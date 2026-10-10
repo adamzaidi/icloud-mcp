@@ -1,7 +1,7 @@
 {
   "name": "icloud-mcp",
   "version": "2.7.0",
-  "description": "Maintained Model Context Protocol (MCP) server for iCloud Mail, Contacts, Calendar, and Reminders",
+  "description": "MCP server for iCloud Mail, Calendar, Contacts, and Reminders. Works with Claude, Grok Bot, and any MCP client",
   "main": "index.js",
   "bin": {
     "icloud-mcp": "index.js"
@@ -15,10 +15,14 @@
   },
   "keywords": [
     "mcp",
+    "model-context-protocol",
+    "mcp-server",
     "icloud",
     "email",
     "imap",
-    "claude"
+    "calendar",
+    "claude",
+    "grok"
   ],
   "author": "Adam Zaidi",
   "license": "MIT",

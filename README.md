@@ -1,6 +1,24 @@
 # icloud-mcp
 
-Maintained Model Context Protocol (MCP) server for iCloud Mail, Contacts, Calendar, and Reminders. Version **2.7.0** (86 tools).
+An MCP server for iCloud Mail, Calendar, Contacts and Reminders. Works with Claude, Grok Bot, and any MCP client.
+
+Version **2.7.0** (86 tools).
+
+**Works with:** Claude Desktop, Claude Code, Claude custom connectors (including phone), Grok Bot, and other MCP clients over stdio or Streamable HTTP. "Works with" describes compatibility only; this is an independent project and is not endorsed by or affiliated with Anthropic or xAI.
+
+## Pick your client
+
+| Client | How it connects | Start here |
+| --- | --- | --- |
+| Claude Desktop | Local, stdio | [Install](#install), then [Claude Desktop](#claude-desktop) |
+| Claude Code | Local, stdio | [Claude Code](#claude-code) |
+| Claude custom connector / phone | Remote, Cloudflare Access sign-in (Managed OAuth) | [Remote access](#remote-access), then [step 3](#3-interactive-clients-claude) of the Grok Bot guide |
+| Grok Bot | Remote, Cloudflare Access service token headers | [Using icloud-mcp with Grok Bot](#using-icloud-mcp-with-grok-bot-mac-host-and-phone) |
+| Other MCP clients | stdio, or Streamable HTTP | [Install](#install), [HTTP transport](#http-transport) |
+
+Local stdio setups run on your own machine. Remote setups run the server on a Mac you control, behind a tunnel and an access policy, so that machine must be awake and online.
+
+> **Remote mode is drafts-only.** Run remote setups with `ICLOUD_MCP_SEND_MODE=drafts` and `ICLOUD_MCP_TOOL_PROFILE=remote-safe` so connected clients can read and draft but cannot send mail. See [Send mode](#send-mode) and [Tool profiles](#tool-profiles).
 
 ## Features
 
@@ -14,7 +32,7 @@ Maintained Model Context Protocol (MCP) server for iCloud Mail, Contacts, Calend
 ## Prerequisites
 
 - Node.js 20 or newer
-- Claude Desktop or Claude Code
+- An MCP client, such as Claude Desktop, Claude Code, Grok Bot, or any client that supports stdio or Streamable HTTP
 - An iCloud account with an app-specific password
 
 ## Install
