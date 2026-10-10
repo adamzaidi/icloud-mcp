@@ -9,9 +9,12 @@ import { contactTools, handleContactTool } from './lib/tools/contacts.js';
 import { calendarTools, suggestEventTools, handleCalendarTool } from './lib/tools/calendar.js';
 import { reminderTools, handleReminderTool } from './lib/tools/reminders.js';
 import { assertValidToolProfile, selectTools, prepareToolCall } from './lib/tool-profile.js';
+import { applyKeychainCredentials } from './lib/keychain.js';
 
 
 const { version: SERVER_VERSION } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+
+applyKeychainCredentials();
 
 const IMAP_USER = process.env.IMAP_USER;
 const IMAP_PASSWORD = process.env.IMAP_PASSWORD;

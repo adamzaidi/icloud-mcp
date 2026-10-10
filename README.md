@@ -74,6 +74,10 @@ Point the configs above at `node /absolute/path/to/icloud-mcp/index.js` instead 
 
 Additional IMAP accounts use `IMAP_ACCOUNT_N_USER`, `IMAP_ACCOUNT_N_PASSWORD`, `IMAP_ACCOUNT_N_HOST`, `IMAP_ACCOUNT_N_SMTP_HOST`, and `IMAP_ACCOUNT_N_NAME`.
 
+If `IMAP_USER` or `IMAP_PASSWORD` is unset, the server fills the missing value from the macOS Keychain via `security find-generic-password`. The service name defaults to `icloud-mcp` and can be changed with `ICLOUD_MCP_KEYCHAIN_SERVICE`. When both variables are already set, Keychain is not read. `IMAP_PASS` is used only when `IMAP_PASSWORD` is unset. The password is not written to the log. `node mcp-call.mjs` loads a `.env` file in the checkout when one exists, and keeps working from the process environment when it does not.
+
+`ICLOUD_MCP_REMINDER_LIST` is the Reminders list name mentioned by the digest tools. The default is `claude`.
+
 ## Local data
 
 Rules, the move manifest, digest state, and the session log are written outside the repository, in your home directory:
