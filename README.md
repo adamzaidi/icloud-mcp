@@ -344,6 +344,158 @@ Store the app-specific password in the macOS Keychain (service `icloud-mcp`, or 
 </plist>
 ```
 
+### Using icloud-mcp with Grok Bot (Mac host and phone)
+
+This walks through hosting the server on an always-on Mac and connecting Grok Bot (and Claude) to it. Everything below uses placeholders: `example.com`, `<TEAM_DOMAIN>`, `<AUD_TAG>`, `<CLIENT_ID>`, `<APPLE_ID>`. Substitute your own values locally and never commit them.
+
+#### Prerequisites
+
+- A Mac that stays on and logged in to a GUI session (see the LaunchAgent note above).
+- Node (see Prerequisites) and this repo checked out, with `npm install` done.
+- `cloudflared`: `brew install cloudflared`.
+- A Cloudflare account with a domain and Zero Trust enabled.
+
+#### 1. Tunnel
+
+Create a remotely managed tunnel in Zero Trust (Networks, Tunnels). Add a public hostname such as `icloud-mcp.example.com` routed to `http://127.0.0.1:8787`, and keep the catch-all rule as `http_status:404`. Create a proxied CNAME for the hostname pointing at `<tunnel-id>.cfargotunnel.com`. Copy the tunnel token and treat it as a password.
+
+#### 2. Access application
+
+Create a self-hosted Access application on that hostname. Add an Allow policy that includes only your email address, use one-time PIN login, and set the session duration to 24 hours. Copy the application's AUD tag; it is `CF_ACCESS_AUD` (`<AUD_TAG>`). Your team domain (`<TEAM_DOMAIN>.cloudflareaccess.com`) is `CF_ACCESS_TEAM_DOMAIN`.
+
+#### 3. Interactive clients (Claude)
+
+Enable Managed OAuth on the Access application and add the client's callback URL to the allowed redirect URIs. For Claude that is `https://claude.ai/api/mcp/auth_callback`. In Claude, add a custom connector with the URL `https://icloud-mcp.example.com/mcp` and sign in with the one-time PIN.
+
+#### 4. Non-interactive clients (Grok Bot)
+
+Grok Bot's own OAuth callback is not known, so it cannot be added to the allowed redirect URIs. Use an Access service token instead:
+
+1. In Zero Trust, create a service token (Access, Service Auth). The Client Secret is shown once. Store it like a password.
+2. Add a policy to the Access application with the action Service Auth that includes that token. An Allow policy for your email does not cover service tokens.
+3. Set `ICLOUD_MCP_ALLOWED_SERVICE_TOKENS=<CLIENT_ID>` on the server (see Cloudflare Tunnel and Access above).
+4. In Grok Bot, add a custom MCP server with the URL `https://icloud-mcp.example.com/mcp` and two headers: `CF-Access-Client-Id: <CLIENT_ID>` and `CF-Access-Client-Secret: <the secret>`.
+
+To revoke, delete the token in Zero Trust (or remove it from the Service Auth policy); requests with it fail at Cloudflare immediately. To rotate, create a new token, add it to the policy, update `ICLOUD_MCP_ALLOWED_SERVICE_TOKENS` and the Grok Bot headers, restart the server, then delete the old token.
+
+#### 5. Mac setup
+
+Store the app-specific password in the Keychain. The command prompts for it, so it never lands in shell history or a file:
+
+```sh
+security add-generic-password -s icloud-mcp -a <APPLE_ID> -w
+```
+
+Save the tunnel token to a file only you can read, then run two LaunchAgents in `~/Library/LaunchAgents`. Never put the app-specific password in a plist.
+
+```sh
+mkdir -p ~/.icloud-mcp && chmod 700 ~/.icloud-mcp
+# paste the tunnel token into this file, then:
+chmod 600 ~/.icloud-mcp/tunnel-token
+```
+
+`com.example.cloudflared.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.cloudflared</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/cloudflared</string>
+    <string>tunnel</string>
+    <string>run</string>
+    <string>--token-file</string>
+    <string>/Users/you/.icloud-mcp/tunnel-token</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>
+```
+
+`com.example.icloud-mcp.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.icloud-mcp</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>index.js</string>
+    <string>--http</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/you/icloud-mcp</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>IMAP_USER</key>
+    <string><APPLE_ID></string>
+    <key>ICLOUD_MCP_SEND_MODE</key>
+    <string>drafts</string>
+    <key>ICLOUD_MCP_TOOL_PROFILE</key>
+    <string>remote-safe</string>
+    <key>CF_ACCESS_TEAM_DOMAIN</key>
+    <string><TEAM_DOMAIN>.cloudflareaccess.com</string>
+    <key>CF_ACCESS_AUD</key>
+    <string><AUD_TAG></string>
+    <key>ICLOUD_MCP_ALLOWED_EMAILS</key>
+    <string>you@example.com</string>
+    <key>ICLOUD_MCP_ALLOWED_HOSTS</key>
+    <string>icloud-mcp.example.com</string>
+    <key>ICLOUD_MCP_ALLOWED_SERVICE_TOKENS</key>
+    <string><CLIENT_ID></string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>
+```
+
+Load each agent with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<file>.plist`. To restart after a change, run `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/<file>.plist`, wait a few seconds, then bootstrap again.
+
+#### 6. Optional: subscribed calendars
+
+To make subscribed (ICS) calendars readable through the same server, see Subscribed calendars under Calendar and add `ICLOUD_MCP_SUBSCRIBED_CALENDARS=on` to the server's environment.
+
+#### 7. Verify
+
+- An unauthenticated request returns 401: `curl -s -o /dev/null -w '%{http_code}\n' -X POST https://icloud-mcp.example.com/mcp`
+- An `initialize` request with the two service-token headers returns 200:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://icloud-mcp.example.com/mcp \
+  -H 'CF-Access-Client-Id: <CLIENT_ID>' \
+  -H 'CF-Access-Client-Secret: <CLIENT_SECRET>' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"check","version":"0"}}}'
+```
+
+- Then ask Grok Bot to run `list_calendars`.
+
+#### Phone
+
+The Grok Bot connector is saved on your Grok Bot account, not in one conversation, so it also works from the phone. The server runs on the Mac, so the Mac must be awake, online, and logged in. When it sleeps, tool calls fail until it wakes.
+
+#### Security notes
+
+- Keep `ICLOUD_MCP_SEND_MODE=drafts` and `ICLOUD_MCP_TOOL_PROFILE=remote-safe`. Do not enable send mode remotely.
+- Never expose port 8787 on the LAN or the public internet; only the tunnel should reach it.
+- Keep the tunnel token, service token secret, app-specific password, and subscription URLs out of the repo, issues, and chats.
+- This repo is public. Never commit plists, `.env` files, or other config with real values.
+
 ### Recommended environment
 
 Use `ICLOUD_MCP_SEND_MODE=off` or `drafts` for a remote connector. `off` blocks `compose_email`, `reply_to_email`, and `forward_email`. `drafts` saves a draft instead of sending. `self-only` sends only when every To, Cc, and Bcc is the authenticated account. Unset means `on`, which is the local stdio default and is refused in HTTP mode.
