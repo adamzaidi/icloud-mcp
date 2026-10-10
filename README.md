@@ -86,9 +86,9 @@ Rules, the move manifest, digest state, the session log, and the audit log are w
 - `~/.icloud-mcp-move-manifest.json`
 - `~/.icloud-mcp-digest.json`
 - `~/.icloud-mcp-session.json`
-- `~/.icloud-mcp-audit.log`
+- `~/.icloud-mcp/audit.log`
 
-The audit log is append-only. The file is created mode `0600`, and the directory that contains it is set to `0700`, including when either already exists. Each line is one JSON object with a fixed set of fields: tool name, timestamp, status (`ok` or `error`), duration, and one integer count. That count is an array length, or a number taken from a fixed list of result fields such as `total` or `wouldDelete`. Keys on the result are never copied, so a sender address used as a key is not written. Arguments, error text, message bodies, and subjects are not written either. When the file reaches 1 MiB it is rotated through `.1`, `.2`, and `.3`. `ICLOUD_MCP_AUDIT_LOG_MAX_BYTES` changes that size. Set `ICLOUD_MCP_AUDIT_LOG` to move the file. Set `ICLOUD_MCP_DATA_DIR` to store the whole set somewhere else. Do not point it at the git checkout. Contact exports, CRM notes, `.env`, and digest output belong outside the repo; `.gitignore` already excludes the usual local folders.
+The audit log is append-only. The default file lives in `~/.icloud-mcp/`, which this server creates mode `0700` when that directory is missing. A directory that already exists is not changed. If that directory is group or world writable, the server warns once and leaves it. The log file, including rotated copies, is mode `0600`. Each line is one JSON object with a fixed set of fields: tool name, timestamp, status (`ok` or `error`), duration, and one integer count. That count is an array length, or a number taken from a fixed list of result fields such as `total` or `wouldDelete`. Keys on the result are never copied, so a sender address used as a key is not written. Arguments, error text, message bodies, and subjects are not written either. When the file reaches 1 MiB it is rotated through `.1`, `.2`, and `.3`. `ICLOUD_MCP_AUDIT_LOG_MAX_BYTES` changes that size. Set `ICLOUD_MCP_AUDIT_LOG` to move the file. Set `ICLOUD_MCP_DATA_DIR` to store the other local files somewhere else; the audit log then defaults to `$ICLOUD_MCP_DATA_DIR/.icloud-mcp/audit.log`. Do not point it at the git checkout. Contact exports, CRM notes, `.env`, and digest output belong outside the repo; `.gitignore` already excludes the usual local folders.
 
 ## Available tools (86)
 
@@ -334,11 +334,11 @@ Message bodies, subjects, and addresses are untrusted data. A sender can put ins
 | `ICLOUD_MCP_BEARER_TOKEN` | unset | Static bearer token for local HTTP tests. |
 | `ICLOUD_MCP_ALLOWED_HOSTS` | loopback | Extra Host values, such as the tunnel hostname. |
 | `ICLOUD_MCP_ALLOWED_ORIGINS` | loopback | Extra browser Origin values. A missing Origin is allowed. The value `null` is rejected. |
-| `ICLOUD_MCP_RATE_LIMIT_PER_MINUTE` | `60` | Per-identity limit after authentication. Unauthenticated requests use a separate limit of 10 per address. |
+| `ICLOUD_MCP_RATE_LIMIT_PER_MINUTE` | `60` | Per-identity limit after authentication. Unauthenticated requests use a separate limit of 10, keyed by the socket address, or by `Cf-Connecting-Ip` when the peer is loopback and Cloudflare Access is configured. |
 | `ICLOUD_MCP_KEYCHAIN_SERVICE` | `icloud-mcp` | `security` service name used when `IMAP_USER` or `IMAP_PASSWORD` is missing. |
 | `IMAP_PASS` | unset | Copied to `IMAP_PASSWORD` only when `IMAP_PASSWORD` is unset. |
 | `ICLOUD_MCP_REMINDER_LIST` | `claude` | Reminders list name used by the digest tools. |
-| `ICLOUD_MCP_AUDIT_LOG` | `~/.icloud-mcp-audit.log` | Audit file, mode `0600`. The directory that contains it is mode `0700`. |
+| `ICLOUD_MCP_AUDIT_LOG` | `~/.icloud-mcp/audit.log` | Audit file, mode `0600`. A directory this server creates for it is mode `0700`. An existing directory is left unchanged. |
 | `ICLOUD_MCP_AUDIT_LOG_MAX_BYTES` | `1048576` | Rotate the audit file after it reaches this size. Three older files are kept. |
 | `ICLOUD_MCP_DATA_DIR` | home directory | Directory for rules, the move manifest, digest state, the session log, and the audit log. |
 

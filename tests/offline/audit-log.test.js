@@ -6,7 +6,13 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
-import { AUDIT_DIR_MODE, AUDIT_FILE_MODE, integerCount, recordAudit } from '../../lib/audit.js';
+import {
+  AUDIT_DIR_MODE,
+  AUDIT_FILE_MODE,
+  integerCount,
+  recordAudit,
+  resetAuditWarningsForTests,
+} from '../../lib/audit.js';
 
 const projectDir = fileURLToPath(new URL('../..', import.meta.url));
 const SECRET_SUBJECT = 'Secret subject line';
@@ -81,11 +87,13 @@ test('an address-keyed result is not written, and only fixed fields are', () => 
   assert.equal(text.includes(SECRET_ADDRESS), false);
   assert.equal(text.includes(OTHER_ADDRESS), false);
   assert.equal(text.includes('fixture-app-password'), false);
+  chmodSync(root, 0o755);
+  recordAudit({ tool: 'get_email', status: 'error', durationMs: 1 }, env);
   assert.equal(modeOf(file), AUDIT_FILE_MODE);
-  assert.equal(modeOf(root), AUDIT_DIR_MODE);
+  assert.equal(modeOf(root), 0o755);
 });
 
-test('an existing audit file and directory are forced to 0600 and 0700', () => {
+test('an existing audit file is forced to 0600 and its directory is left alone', () => {
   const root = mkdtempSync(join(tmpdir(), 'icloud-mcp-audit-mode-'));
   const dir = join(root, 'data');
   mkdirSync(dir, { mode: 0o755 });
@@ -104,26 +112,85 @@ test('an existing audit file and directory are forced to 0600 and 0700', () => {
   }, { ICLOUD_MCP_AUDIT_LOG: file });
 
   assert.equal(modeOf(file), AUDIT_FILE_MODE);
-  assert.equal(modeOf(dir), AUDIT_DIR_MODE);
+  assert.equal(modeOf(dir), 0o755);
   const text = readFileSync(file, 'utf8');
   assert.equal(text.includes(SECRET_ADDRESS), false);
   assert.equal(JSON.parse(text).count, 0);
 });
 
-test('a new parent directory is created mode 0700', () => {
+test('the default audit path is a private subfolder and does not change the home directory', () => {
+  const home = mkdtempSync(join(tmpdir(), 'icloud-mcp-audit-home-'));
+  chmodSync(home, 0o755);
+  const warnings = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk, ...rest) => {
+    warnings.push(String(chunk));
+    return write.call(process.stderr, chunk, ...rest);
+  };
+  try {
+    recordAudit({ tool: 'list_accounts', status: 'ok', durationMs: 1, result: { total: 1 } }, { HOME: home });
+  } finally {
+    process.stderr.write = write;
+  }
+  const dir = join(home, '.icloud-mcp');
+  const file = join(dir, 'audit.log');
+  assert.equal(existsSync(file), true);
+  assert.equal(modeOf(home), 0o755);
+  assert.equal(modeOf(dir), AUDIT_DIR_MODE);
+  assert.equal(modeOf(file), AUDIT_FILE_MODE);
+  assert.equal(warnings.some((line) => line.includes('[audit]')), false);
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).count, 1);
+});
+
+test('a pre-existing group or world writable directory is not chmodded, and the warning is once', () => {
+  resetAuditWarningsForTests();
+  const root = mkdtempSync(join(tmpdir(), 'icloud-mcp-audit-shared-'));
+  const dir = join(root, 'shared');
+  mkdirSync(dir);
+  chmodSync(dir, 0o777);
+  const file = join(dir, 'audit.log');
+  const warnings = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk, ...rest) => {
+    const text = String(chunk);
+    if (text.includes('[audit]')) warnings.push(text);
+    return write.call(process.stderr, chunk, ...rest);
+  };
+  try {
+    recordAudit({ tool: 'list_accounts', status: 'ok', durationMs: 1, result: { total: 2 } }, {
+      ICLOUD_MCP_AUDIT_LOG: file,
+    });
+    recordAudit({ tool: 'list_accounts', status: 'ok', durationMs: 1, result: { total: 3 } }, {
+      ICLOUD_MCP_AUDIT_LOG: file,
+    });
+  } finally {
+    process.stderr.write = write;
+  }
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /group or world writable/);
+  assert.equal(modeOf(dir), 0o777);
+  assert.equal(modeOf(file), AUDIT_FILE_MODE);
+  assert.equal(modeOf(`${file}`), AUDIT_FILE_MODE);
+});
+
+test('a new parent directory is created mode 0700 and its parent is unchanged', () => {
   const root = mkdtempSync(join(tmpdir(), 'icloud-mcp-audit-dir-'));
-  const dir = join(root, 'private');
+  chmodSync(root, 0o755);
+  const dir = join(root, 'private', 'nested');
   const file = join(dir, 'audit.log');
   recordAudit({ tool: 'list_accounts', status: 'ok', durationMs: 1, result: [] }, {
     ICLOUD_MCP_AUDIT_LOG: file,
   });
   assert.equal(existsSync(file), true);
-  assert.equal(modeOf(file), AUDIT_FILE_MODE);
+  assert.equal(modeOf(root), 0o755);
+  assert.equal(modeOf(join(root, 'private')), AUDIT_DIR_MODE);
   assert.equal(modeOf(dir), AUDIT_DIR_MODE);
+  assert.equal(modeOf(file), AUDIT_FILE_MODE);
 });
 
 test('the audit log rotates by size and keeps private modes', () => {
   const root = mkdtempSync(join(tmpdir(), 'icloud-mcp-audit-rotate-'));
+  chmodSync(root, 0o755);
   const file = join(root, 'audit.log');
   const env = { ICLOUD_MCP_AUDIT_LOG: file, ICLOUD_MCP_AUDIT_LOG_MAX_BYTES: '80' };
   for (let i = 0; i < 8; i += 1) {
@@ -143,6 +210,7 @@ test('the audit log rotates by size and keeps private modes', () => {
     }
   }
   assert.ok(statSync(file).size < 80 * 8);
+  assert.equal(modeOf(root), 0o755);
 });
 
 test('a failed audit write does not throw', () => {
