@@ -75,7 +75,7 @@ function resolveMailbox(name, creds) {
 
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
-async function main() {
+export function createMcpServer() {
   assertValidToolProfile();
   const server = new Server(
     { name: 'icloud-mail', version: SERVER_VERSION },
@@ -118,6 +118,16 @@ async function main() {
     }
   });
 
+  return server;
+}
+
+async function main() {
+  if (process.argv.includes('--http')) {
+    const { startHttpServer } = await import('./lib/http.js');
+    await startHttpServer(createMcpServer);
+    return;
+  }
+  const server = createMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write('iCloud Mail MCP Server running\n');

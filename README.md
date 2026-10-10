@@ -220,6 +220,20 @@ A `domain` filter searches both the bare domain and `@domain`. iCloud's FROM sea
 
 An idle iCloud IMAP connection times out after 60 seconds of silence. The server logs the error and that tool call fails. The process stays up. Saving a draft uses its own IMAP connection and attaches the same handler.
 
+## HTTP transport
+
+Stdio is still the default. `icloud-mcp --http` (or `node index.js --http`) also serves the same tools over MCP Streamable HTTP. The process listens on `127.0.0.1` only. `ICLOUD_MCP_HTTP_PORT` chooses the port (default `8787`).
+
+HTTP mode refuses to start unless both of these are true:
+
+- Authentication is configured. Either set `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`, and `ICLOUD_MCP_ALLOWED_EMAILS` for a Cloudflare Access JWT (`Cf-Access-Jwt-Assertion`, checked against the team JWKS), or set `ICLOUD_MCP_BEARER_TOKEN` for a static bearer token used in local tests. When both are set, either one is accepted.
+- `ICLOUD_MCP_SEND_MODE` is `off`, `drafts`, or `self-only`. The default `on` is refused.
+- `ICLOUD_MCP_TOOL_PROFILE` is `remote-safe`. `full` is refused.
+
+Host and Origin are checked before a request is handled, which blocks DNS rebinding. Loopback names (`localhost`, `127.0.0.1`, `::1`) are always allowed. A tunnel hostname belongs in `ICLOUD_MCP_ALLOWED_HOSTS` (comma-separated). A browser `Origin` must be a loopback origin for this port, or a value in `ICLOUD_MCP_ALLOWED_ORIGINS`, or `http`/`https` on an allowed host. A missing Origin header is allowed so non-browser clients can connect. The Origin value `null` is rejected. Authenticated requests are limited per identity (`ICLOUD_MCP_RATE_LIMIT_PER_MINUTE`, default 60). Requests with no credentials, and requests that fail authentication, have a separate limit of 10. That limit is per socket address. When the socket is loopback and Cloudflare Access is configured, the key is `Cf-Connecting-Ip` if the header is an IP address, so callers behind the tunnel do not share one bucket. Otherwise the header is ignored. An unknown or expired `mcp-session-id` is rejected with 404. A request with no session id that is not `initialize` is rejected with 400. Each session is tied to the identity that created it, dropped after 30 minutes idle, and new sessions stop once 100 are open. Logs record a reason code, not tokens or message contents.
+
+`IMAP_USER` and `IMAP_PASSWORD` are still required to start. The send-mode values themselves are enforced by the SMTP layer when that gate is installed; this transport only refuses to listen while the mode is `on`.
+
 ## Tests
 
 `npm test` runs the offline suite only. It mocks IMAP, CardDAV, CalDAV, and Reminders, and it does not contact iCloud or send mail.
