@@ -220,6 +220,19 @@ A `domain` filter searches both the bare domain and `@domain`. iCloud's FROM sea
 
 An idle iCloud IMAP connection times out after 60 seconds of silence. The server logs the error and that tool call fails. The process stays up. Saving a draft uses its own IMAP connection and attaches the same handler.
 
+## HTTP transport
+
+Stdio is still the default. `icloud-mcp --http` (or `node index.js --http`) also serves the same tools over MCP Streamable HTTP. The process listens on `127.0.0.1` only. `ICLOUD_MCP_HTTP_PORT` chooses the port (default `8787`).
+
+HTTP mode refuses to start unless both of these are true:
+
+- Authentication is configured. Either set `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`, and `ICLOUD_MCP_ALLOWED_EMAILS` for a Cloudflare Access JWT (`Cf-Access-Jwt-Assertion`, checked against the team JWKS), or set `ICLOUD_MCP_BEARER_TOKEN` for a static bearer token used in local tests. When both are set, either one is accepted.
+- `ICLOUD_MCP_SEND_MODE` is `off`, `drafts`, or `self-only`. The default `on` is refused. `ICLOUD_MCP_ALLOW_REMOTE_SEND=1` overrides that refusal. Leave the override unset for a remote connector.
+
+Host and Origin are checked before a request is handled, which blocks DNS rebinding. Loopback names (`localhost`, `127.0.0.1`, `::1`) are always allowed. A tunnel hostname belongs in `ICLOUD_MCP_ALLOWED_HOSTS` (comma-separated). Browser origins that are not loopback belong in `ICLOUD_MCP_ALLOWED_ORIGINS`. Requests with no Origin are allowed so non-browser clients can connect. `ICLOUD_MCP_RATE_LIMIT_PER_MINUTE` defaults to 60. Logs record a reason code, not tokens or message contents.
+
+`IMAP_USER` and `IMAP_PASSWORD` are still required to start. The send-mode values themselves are enforced by the SMTP layer when that gate is installed; this transport only refuses to listen while the mode is `on`.
+
 ## Tests
 
 `npm test` runs the offline suite only. It mocks IMAP, CardDAV, CalDAV, and Reminders, and it does not contact iCloud or send mail.
