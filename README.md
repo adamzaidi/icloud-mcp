@@ -227,9 +227,10 @@ Stdio is still the default. `icloud-mcp --http` (or `node index.js --http`) also
 HTTP mode refuses to start unless both of these are true:
 
 - Authentication is configured. Either set `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`, and `ICLOUD_MCP_ALLOWED_EMAILS` for a Cloudflare Access JWT (`Cf-Access-Jwt-Assertion`, checked against the team JWKS), or set `ICLOUD_MCP_BEARER_TOKEN` for a static bearer token used in local tests. When both are set, either one is accepted.
-- `ICLOUD_MCP_SEND_MODE` is `off`, `drafts`, or `self-only`. The default `on` is refused. `ICLOUD_MCP_ALLOW_REMOTE_SEND=1` overrides that refusal. Leave the override unset for a remote connector.
+- `ICLOUD_MCP_SEND_MODE` is `off`, `drafts`, or `self-only`. The default `on` is refused.
+- `ICLOUD_MCP_TOOL_PROFILE` is `remote-safe`. `full` is refused.
 
-Host and Origin are checked before a request is handled, which blocks DNS rebinding. Loopback names (`localhost`, `127.0.0.1`, `::1`) are always allowed. A tunnel hostname belongs in `ICLOUD_MCP_ALLOWED_HOSTS` (comma-separated). Browser origins that are not loopback belong in `ICLOUD_MCP_ALLOWED_ORIGINS`. Requests with no Origin are allowed so non-browser clients can connect. `ICLOUD_MCP_RATE_LIMIT_PER_MINUTE` defaults to 60. Logs record a reason code, not tokens or message contents.
+Host and Origin are checked before a request is handled, which blocks DNS rebinding. Loopback names (`localhost`, `127.0.0.1`, `::1`) are always allowed. A tunnel hostname belongs in `ICLOUD_MCP_ALLOWED_HOSTS` (comma-separated). A browser `Origin` must be a loopback origin for this port, or a value in `ICLOUD_MCP_ALLOWED_ORIGINS`, or `http`/`https` on an allowed host. A missing Origin header is allowed so non-browser clients can connect. The Origin value `null` is rejected. Authenticated requests are limited per identity (`ICLOUD_MCP_RATE_LIMIT_PER_MINUTE`, default 60). Requests with no credentials have a separate smaller per-address limit, so a flood of missing tokens does not use up the caller's budget. Logs record a reason code, not tokens or message contents.
 
 `IMAP_USER` and `IMAP_PASSWORD` are still required to start. The send-mode values themselves are enforced by the SMTP layer when that gate is installed; this transport only refuses to listen while the mode is `on`.
 

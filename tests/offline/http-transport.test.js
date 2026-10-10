@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'child_process';
-import { createSign, generateKeyPairSync } from 'node:crypto';
+import { createHmac, createSign, generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -19,6 +19,7 @@ const {
   originAllowed,
   resetHttpForTests,
   setJwksFetcherForTests,
+  setJwksTimeoutForTests,
   startHttpServer,
   verifyAccessJwt,
 } = await import('../../lib/http.js');
@@ -60,6 +61,7 @@ function claims(overrides = {}) {
 function accessEnv(extra = {}) {
   return {
     ICLOUD_MCP_SEND_MODE: 'off',
+    ICLOUD_MCP_TOOL_PROFILE: 'remote-safe',
     CF_ACCESS_TEAM_DOMAIN: `https://${TEAM}`,
     CF_ACCESS_AUD: AUD,
     ICLOUD_MCP_ALLOWED_EMAILS: ` ${EMAIL} , second@example.com `,
@@ -130,7 +132,7 @@ async function listen(env, logs = []) {
   });
 }
 
-test('HTTP startup refuses an open send mode and missing auth', () => {
+test('HTTP startup refuses an open send mode and missing auth', async () => {
   assert.throws(() => assertHttpStartup({ ICLOUD_MCP_BEARER_TOKEN: BEARER }), /SEND_MODE is on/);
   assert.throws(
     () => assertHttpStartup({ ICLOUD_MCP_SEND_MODE: 'on', ICLOUD_MCP_BEARER_TOKEN: BEARER }),
@@ -140,22 +142,45 @@ test('HTTP startup refuses an open send mode and missing auth', () => {
     () => assertHttpStartup({
       ICLOUD_MCP_SEND_MODE: 'on',
       ICLOUD_MCP_ALLOW_REMOTE_SEND: '1',
+      ICLOUD_MCP_TOOL_PROFILE: 'remote-safe',
+      ICLOUD_MCP_BEARER_TOKEN: BEARER,
     }),
-    /configure Cloudflare Access/
+    /SEND_MODE is on/
   );
   assert.throws(
-    () => assertHttpStartup({ ICLOUD_MCP_SEND_MODE: 'drafts', CF_ACCESS_TEAM_DOMAIN: TEAM, CF_ACCESS_AUD: AUD }),
+    () => assertHttpStartup({
+      ICLOUD_MCP_SEND_MODE: 'off',
+      ICLOUD_MCP_BEARER_TOKEN: BEARER,
+    }),
+    /must be remote-safe/
+  );
+  assert.throws(
+    () => assertHttpStartup({
+      ICLOUD_MCP_SEND_MODE: 'drafts',
+      ICLOUD_MCP_TOOL_PROFILE: 'remote-safe',
+      CF_ACCESS_TEAM_DOMAIN: TEAM,
+      CF_ACCESS_AUD: AUD,
+    }),
     /configure Cloudflare Access/
   );
   assert.throws(
     () => assertHttpStartup({ ICLOUD_MCP_SEND_MODE: 'sideways', ICLOUD_MCP_BEARER_TOKEN: BEARER }),
     /must be off, drafts, self-only, or on/
   );
-  assert.doesNotThrow(() => assertHttpStartup({
-    ICLOUD_MCP_SEND_MODE: 'on',
-    ICLOUD_MCP_ALLOW_REMOTE_SEND: '1',
-    ICLOUD_MCP_BEARER_TOKEN: BEARER,
-  }));
+  const logs = [];
+  const opened = await startHttpServer(createServer, {
+    env: {
+      ICLOUD_MCP_SEND_MODE: 'off',
+      ICLOUD_MCP_TOOL_PROFILE: 'full',
+      ICLOUD_MCP_ALLOW_FULL_REMOTE: '1',
+      ICLOUD_MCP_BEARER_TOKEN: BEARER,
+    },
+    port: 0,
+    log: (line) => logs.push(line),
+  });
+  await opened.close();
+  assert.match(logs.join(''), /ICLOUD_MCP_ALLOW_FULL_REMOTE/);
+  assert.equal(logs.join('').includes(BEARER), false);
   assert.doesNotThrow(() => assertHttpStartup(accessEnv({ ICLOUD_MCP_SEND_MODE: 'self-only' })));
   assert.doesNotThrow(() => assertHttpStartup(accessEnv({ ICLOUD_MCP_SEND_MODE: 'drafts' })));
 });
@@ -233,6 +258,7 @@ test('Cloudflare Access JWT: valid, expired, wrong aud, wrong email, missing', a
 test('bearer token is a second auth option and a mismatch is rejected', async () => {
   const env = {
     ICLOUD_MCP_SEND_MODE: 'drafts',
+    ICLOUD_MCP_TOOL_PROFILE: 'remote-safe',
     ICLOUD_MCP_BEARER_TOKEN: BEARER,
     ICLOUD_MCP_RATE_LIMIT_PER_MINUTE: '20',
   };
@@ -258,6 +284,8 @@ test('Host and Origin headers block DNS rebinding', async () => {
   assert.equal(hostAllowed('mail.example.com', { ICLOUD_MCP_ALLOWED_HOSTS: 'mail.example.com' }), true);
   assert.equal(originAllowed('https://evil.example', 8787, {}), false);
   assert.equal(originAllowed(undefined, 8787, {}), true);
+  assert.equal(originAllowed('null', 8787, {}), false);
+  assert.equal(originAllowed('', 8787, {}), false);
   assert.equal(originAllowed('http://127.0.0.1:8787', 8787, {}), true);
   assert.equal(originAllowed('https://mail.example.com', 8787, { ICLOUD_MCP_ALLOWED_HOSTS: 'mail.example.com' }), true);
 
@@ -279,6 +307,12 @@ test('Host and Origin headers block DNS rebinding', async () => {
 
     const noOrigin = await post(server.port, { headers: { authorization: `Bearer ${BEARER}` } });
     assert.equal(noOrigin.status, 200);
+    const nullOrigin = await post(server.port, {
+      origin: 'null',
+      headers: { authorization: `Bearer ${BEARER}` },
+    });
+    assert.equal(nullOrigin.status, 403);
+    assert.equal(JSON.parse(nullOrigin.body).error, 'invalid_origin');
   } finally {
     await server.close();
   }
@@ -287,6 +321,7 @@ test('Host and Origin headers block DNS rebinding', async () => {
 test('per-minute rate limit rejects the next request', async () => {
   const server = await listen({
     ICLOUD_MCP_SEND_MODE: 'off',
+    ICLOUD_MCP_TOOL_PROFILE: 'remote-safe',
     ICLOUD_MCP_BEARER_TOKEN: BEARER,
     ICLOUD_MCP_RATE_LIMIT_PER_MINUTE: '2',
   });
@@ -302,6 +337,84 @@ test('per-minute rate limit rejects the next request', async () => {
     await server.close();
     resetHttpForTests();
   }
+});
+
+test('unauthenticated floods do not spend the authenticated rate limit', async () => {
+  const server = await listen({
+    ICLOUD_MCP_SEND_MODE: 'off',
+    ICLOUD_MCP_TOOL_PROFILE: 'remote-safe',
+    ICLOUD_MCP_BEARER_TOKEN: BEARER,
+    ICLOUD_MCP_RATE_LIMIT_PER_MINUTE: '2',
+  });
+  try {
+    for (let i = 0; i < 10; i += 1) {
+      const flood = await post(server.port, {});
+      assert.equal(flood.status, 401);
+    }
+    const blocked = await post(server.port, {});
+    assert.equal(blocked.status, 429);
+    const first = await post(server.port, { headers: { authorization: `Bearer ${BEARER}` } });
+    const second = await post(server.port, { headers: { authorization: `Bearer ${BEARER}` } });
+    const third = await post(server.port, { headers: { authorization: `Bearer ${BEARER}` } });
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.equal(third.status, 429);
+  } finally {
+    await server.close();
+    resetHttpForTests();
+  }
+});
+
+test('JWT rejects alg none, HMAC confusion, bad issuer, nbf, and throttles unknown kids', async () => {
+  resetHttpForTests();
+  setJwksFetcherForTests(async () => ({ keys: [jwk] }));
+  const env = accessEnv();
+
+  const noneHeader = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT', kid: 'test-key' })).toString('base64url');
+  const noneBody = Buffer.from(JSON.stringify(claims())).toString('base64url');
+  const none = await verifyAccessJwt(`${noneHeader}.${noneBody}.e30`, env);
+  assert.equal(none.ok, false);
+  assert.equal(none.reason, 'invalid_token');
+
+  const hsHeader = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT', kid: 'test-key' })).toString('base64url');
+  const hsBody = Buffer.from(JSON.stringify(claims())).toString('base64url');
+  const hsSig = createHmac('sha256', Buffer.from(JSON.stringify(jwk))).update(`${hsHeader}.${hsBody}`).digest('base64url');
+  const hmac = await verifyAccessJwt(`${hsHeader}.${hsBody}.${hsSig}`, env);
+  assert.equal(hmac.ok, false);
+  assert.equal(hmac.reason, 'invalid_token');
+
+  const issuer = await verifyAccessJwt(signJwt(claims({ iss: 'https://evil.example' })), env);
+  assert.equal(issuer.reason, 'invalid_issuer');
+  const early = await verifyAccessJwt(signJwt(claims({ nbf: Math.floor(Date.now() / 1000) + 3600 })), env);
+  assert.equal(early.reason, 'not_yet_valid');
+
+  resetHttpForTests();
+  let fetches = 0;
+  setJwksFetcherForTests(async () => {
+    fetches += 1;
+    if (fetches === 1) return { keys: [jwk] };
+    const rotated = otherPair.publicKey.export({ format: 'jwk' });
+    rotated.kid = 'rotated-key';
+    rotated.alg = 'RS256';
+    rotated.use = 'sig';
+    return { keys: [jwk, rotated] };
+  });
+  const rotated = await verifyAccessJwt(signJwt(claims(), { kid: 'rotated-key', key: otherPair.privateKey }), env);
+  assert.equal(rotated.ok, true);
+  assert.equal(fetches, 2);
+  const unknown = await verifyAccessJwt(signJwt(claims(), { kid: 'missing-key' }), env);
+  assert.equal(unknown.ok, false);
+  assert.equal(unknown.reason, 'invalid_token');
+  assert.equal(fetches, 2);
+
+  resetHttpForTests();
+  setJwksTimeoutForTests(40);
+  setJwksFetcherForTests(() => new Promise(() => {}));
+  const started = Date.now();
+  const timedOut = await verifyAccessJwt(signJwt(claims()), env);
+  assert.equal(timedOut.ok, false);
+  assert.equal(timedOut.reason, 'invalid_token');
+  assert.ok(Date.now() - started < 1000);
 });
 
 test('verifyAccessJwt accepts a matching allow-list entry regardless of case', async () => {
@@ -347,6 +460,7 @@ test('icloud-mcp --http refuses to start while send mode is on, and serves when 
     cwd: projectDir,
     env: childEnv({
       ICLOUD_MCP_SEND_MODE: 'off',
+      ICLOUD_MCP_TOOL_PROFILE: 'remote-safe',
       ICLOUD_MCP_BEARER_TOKEN: BEARER,
       ICLOUD_MCP_HTTP_PORT: '0',
     }),
