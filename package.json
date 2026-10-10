@@ -9,7 +9,7 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test tests/dry-run.test.js tests/send-guard.test.js tests/pr-claims.test.js",
+    "test": "node --test tests/dry-run.test.js tests/send-guard.test.js tests/pr-claims.test.js tests/offline/*.test.js",
     "test:live": "ICLOUD_MCP_LIVE=1 node tests/live-destructive.test.js",
     "test:send": "node tests/test.js"
   },
