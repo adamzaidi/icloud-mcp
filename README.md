@@ -80,14 +80,15 @@ If `IMAP_USER` or `IMAP_PASSWORD` is unset, the server fills the missing value f
 
 ## Local data
 
-Rules, the move manifest, digest state, and the session log are written outside the repository, in your home directory:
+Rules, the move manifest, digest state, the session log, and the audit log are written outside the repository, in your home directory:
 
 - `~/.icloud-mcp-rules.json`
 - `~/.icloud-mcp-move-manifest.json`
 - `~/.icloud-mcp-digest.json`
 - `~/.icloud-mcp-session.json`
+- `~/.icloud-mcp/audit.log`
 
-Set `ICLOUD_MCP_DATA_DIR` to store those files somewhere else. Do not point it at the git checkout. Contact exports, CRM notes, `.env`, and digest output belong outside the repo; `.gitignore` already excludes the usual local folders.
+The audit log is append-only. The default file lives in `~/.icloud-mcp/`, which this server creates mode `0700` when that directory is missing. A directory that already exists is not changed. If that directory is group or world writable, the server warns once and leaves it. The log file, including rotated copies, is mode `0600`. Each line is one JSON object with a fixed set of fields: tool name, timestamp, status (`ok` or `error`), duration, and one integer count. That count is an array length, or a number taken from a fixed list of result fields such as `total` or `wouldDelete`. Keys on the result are never copied, so a sender address used as a key is not written. Arguments, error text, message bodies, and subjects are not written either. When the file reaches 1 MiB it is rotated through `.1`, `.2`, and `.3`. `ICLOUD_MCP_AUDIT_LOG_MAX_BYTES` changes that size. Set `ICLOUD_MCP_AUDIT_LOG` to move the file. Set `ICLOUD_MCP_DATA_DIR` to store the other local files somewhere else; the audit log then defaults to `$ICLOUD_MCP_DATA_DIR/.icloud-mcp/audit.log`. Do not point it at the git checkout. Contact exports, CRM notes, `.env`, and digest output belong outside the repo; `.gitignore` already excludes the usual local folders.
 
 ## Available tools (86)
 
@@ -247,6 +248,99 @@ Host and Origin are checked before a request is handled, which blocks DNS rebind
 `npm run test:send` runs `tests/test.js`. It stays skipped unless `ICLOUD_MCP_SEND=1`, `IMAP_USER`, and `IMAP_PASSWORD` are all set. Every message it sends goes only to the account in `IMAP_USER`. Reply, reply-all, and forward act on a seed that account just sent to itself, never on other inbox mail. Before each send, a guard checks every To, Cc, and Bcc recipient (case and surrounding whitespace ignored) and aborts the run if any address is anyone else.
 
 `dryRun: true` on a delete, a move that removes the original, or a bulk change returns `{ dryRun: true, changes: [...] }` and does not write. Omit it, or pass false, to perform the change.
+
+## Remote access
+
+Stdio stays the default and is the right transport for a local client. A phone, Grok Bot, or a Claude custom connector should use the loopback HTTP listener behind Cloudflare Tunnel and Cloudflare Access. Do not expose port 8787 on the LAN or the public internet.
+
+### Cloudflare Tunnel and Access
+
+1. Start `icloud-mcp --http` (or `node index.js --http`). The process binds to `127.0.0.1` only. `ICLOUD_MCP_HTTP_PORT` defaults to `8787`.
+2. Create a Cloudflare Tunnel that routes one hostname to `http://127.0.0.1:8787`.
+3. Put a Cloudflare Access application on that hostname and use Managed OAuth, so the connector signs in with an identity provider instead of a shared Mac password.
+4. Set `CF_ACCESS_TEAM_DOMAIN` to the team domain (no scheme), `CF_ACCESS_AUD` to the application's AUD tag, and `ICLOUD_MCP_ALLOWED_EMAILS` to the comma-separated addresses that may call the server.
+5. The tunnel forwards `Cf-Access-Jwt-Assertion`. The server checks that JWT against the team JWKS at `https://<team-domain>/cdn-cgi/access/certs`, then requires the token email to be on the allow list.
+6. Put the public hostname in `ICLOUD_MCP_ALLOWED_HOSTS`. Loopback names are already allowed. This is the DNS-rebinding check.
+
+`ICLOUD_MCP_BEARER_TOKEN` is a static bearer token for a local test client. It is not the remote credential. When Access and the bearer token are both set, either one is accepted.
+
+HTTP mode refuses to start unless authentication is configured, `ICLOUD_MCP_SEND_MODE` is `off`, `drafts`, or `self-only`, and `ICLOUD_MCP_TOOL_PROFILE` is `remote-safe`. The default send mode `on` and the `full` profile are refused. A missing Origin header is allowed. The Origin value `null`, and any other Origin that is not on the allow list, are rejected. Authenticated requests are limited per identity. Requests that have no credentials use a separate limit of 10 per address, so an unauthenticated flood does not consume the caller's budget.
+
+### macOS LaunchAgent
+
+Reminders uses JavaScript for Automation and needs a logged-in GUI session. Run the server as a LaunchAgent in `~/Library/LaunchAgents`, not as a LaunchDaemon. A daemon starts outside that session and cannot talk to Reminders.
+
+Store the app-specific password in the macOS Keychain (service `icloud-mcp`, or `ICLOUD_MCP_KEYCHAIN_SERVICE`) instead of in the plist. `IMAP_PASS` is only a fallback when `IMAP_PASSWORD` is unset. `node mcp-call.mjs` loads a `.env` file when one exists and otherwise uses the process environment.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.icloud-mcp</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/Users/you/icloud-mcp/index.js</string>
+    <string>--http</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>IMAP_USER</key>
+    <string>you@icloud.com</string>
+    <key>ICLOUD_MCP_SEND_MODE</key>
+    <string>drafts</string>
+    <key>ICLOUD_MCP_TOOL_PROFILE</key>
+    <string>remote-safe</string>
+    <key>CF_ACCESS_TEAM_DOMAIN</key>
+    <string>team.cloudflareaccess.com</string>
+    <key>CF_ACCESS_AUD</key>
+    <string>access-aud-tag</string>
+    <key>ICLOUD_MCP_ALLOWED_EMAILS</key>
+    <string>you@example.com</string>
+    <key>ICLOUD_MCP_ALLOWED_HOSTS</key>
+    <string>mail.example.com</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>
+```
+
+### Recommended environment
+
+Use `ICLOUD_MCP_SEND_MODE=off` or `drafts` for a remote connector. `off` blocks `compose_email`, `reply_to_email`, and `forward_email`. `drafts` saves a draft instead of sending. `self-only` sends only when every To, Cc, and Bcc is the authenticated account. Unset means `on`, which is the local stdio default and is refused in HTTP mode.
+
+Use `ICLOUD_MCP_TOOL_PROFILE=remote-safe`. That profile is an allowlist of read, search, draft, and calendar or reminder create and edit tools. A tool that is not on the list is hidden, including tools added later. Leave `ICLOUD_MCP_ALLOW_BULK` unset so any bulk tool that is on the list runs as a dry run.
+
+### Prompt injection
+
+Message bodies, subjects, and addresses are untrusted data. A sender can put instructions in a message that a model may follow. Read tool output as data, not as a new task. Send mode `off` or `drafts`, plus the `remote-safe` profile, limits what those instructions can cause. They do not make the text trustworthy.
+
+### Environment variables
+
+| Variable | Default | Role |
+|----------|---------|------|
+| `ICLOUD_MCP_SEND_MODE` | `on` | `off`, `drafts`, `self-only`, or `on`. Enforced in the SMTP send path. |
+| `ICLOUD_MCP_TOOL_PROFILE` | `full` | `full` or `remote-safe`. `remote-safe` is an allowlist. Tools that are not on it stay hidden. |
+| `ICLOUD_MCP_ALLOW_BULK` | unset | Comma-separated tool names that may mutate in `remote-safe`. Hidden tools stay hidden. |
+| `ICLOUD_MCP_HTTP_PORT` | `8787` | Loopback port for `--http`. |
+| `CF_ACCESS_TEAM_DOMAIN` | unset | Cloudflare Access team domain. Required for JWT auth. |
+| `CF_ACCESS_AUD` | unset | Access application AUD tag. |
+| `ICLOUD_MCP_ALLOWED_EMAILS` | unset | Comma-separated emails allowed to present an Access JWT. |
+| `ICLOUD_MCP_BEARER_TOKEN` | unset | Static bearer token for local HTTP tests. |
+| `ICLOUD_MCP_ALLOWED_HOSTS` | loopback | Extra Host values, such as the tunnel hostname. |
+| `ICLOUD_MCP_ALLOWED_ORIGINS` | loopback | Extra browser Origin values. A missing Origin is allowed. The value `null` is rejected. |
+| `ICLOUD_MCP_RATE_LIMIT_PER_MINUTE` | `60` | Per-identity limit after authentication. Unauthenticated requests use a separate limit of 10, keyed by the socket address, or by `Cf-Connecting-Ip` when the peer is loopback and Cloudflare Access is configured. |
+| `ICLOUD_MCP_KEYCHAIN_SERVICE` | `icloud-mcp` | `security` service name used when `IMAP_USER` or `IMAP_PASSWORD` is missing. |
+| `IMAP_PASS` | unset | Copied to `IMAP_PASSWORD` only when `IMAP_PASSWORD` is unset. |
+| `ICLOUD_MCP_REMINDER_LIST` | `claude` | Reminders list name used by the digest tools. |
+| `ICLOUD_MCP_AUDIT_LOG` | `~/.icloud-mcp/audit.log` | Audit file, mode `0600`. A directory this server creates for it is mode `0700`. An existing directory is left unchanged. |
+| `ICLOUD_MCP_AUDIT_LOG_MAX_BYTES` | `1048576` | Rotate the audit file after it reaches this size. Three older files are kept. |
+| `ICLOUD_MCP_DATA_DIR` | home directory | Directory for rules, the move manifest, digest state, the session log, and the audit log. |
 
 ## Security
 
