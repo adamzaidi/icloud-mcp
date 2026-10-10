@@ -2,7 +2,7 @@
 
 An MCP server for iCloud Mail, Calendar, Contacts and Reminders. Works with Claude, Grok Bot, and any MCP client.
 
-Version **2.7.0** (86 tools).
+Version **2.8.0** (86 tools).
 
 **Works with:** Claude Desktop, Claude Code, Claude custom connectors (including phone), Grok Bot, and other MCP clients over stdio or Streamable HTTP. "Works with" describes compatibility only; this is an independent project and is not endorsed by or affiliated with Anthropic or xAI.
 
