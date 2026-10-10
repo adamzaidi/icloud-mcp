@@ -154,9 +154,9 @@ test('default mode still sends, including Cc and Bcc', async () => {
     }, CREDS);
     assert.equal(result.sent, true);
     assert.equal(sent.length, 1);
-    assert.equal(sent[0].to, 'person@example.com');
-    assert.equal(sent[0].cc, 'cc@example.com');
-    assert.equal(sent[0].bcc, 'bcc@example.com');
+    assert.deepEqual(sent[0].to, [{ name: '', address: 'person@example.com' }]);
+    assert.deepEqual(sent[0].cc, [{ name: '', address: 'cc@example.com' }]);
+    assert.deepEqual(sent[0].bcc, [{ name: '', address: 'bcc@example.com' }]);
     assert.equal(drafts.length, 0);
   });
 });
@@ -265,8 +265,8 @@ test('self-only allows only the authenticated account, case-insensitively', asyn
     }, mixed);
     assert.equal(ok.sent, true);
     assert.equal(sent.length, 1);
-    assert.equal(sent[0].cc, 'Person <you@icloud.com>');
-    assert.match(sent[0].bcc, /YOU@icloud.com/);
+    assert.deepEqual(sent[0].cc, [{ name: 'Person', address: 'you@icloud.com' }]);
+    assert.deepEqual(sent[0].bcc, [{ name: 'Last, First', address: 'YOU@icloud.com' }]);
 
     await composeEmail([ACCOUNT, 'you@icloud.com'], 'Hello', 'body', {}, CREDS);
     assert.equal(sent.length, 2);
@@ -329,8 +329,8 @@ test('self-only does not treat Reply-To as a recipient', async () => {
   await withMode('self-only', async ({ sent }) => {
     const result = await composeEmail(ACCOUNT, 'Hello', 'body', { replyTo: FOREIGN }, CREDS);
     assert.equal(result.sent, true);
-    assert.equal(sent[0].replyTo, FOREIGN);
-    assert.equal(sent[0].to, ACCOUNT);
+    assert.deepEqual(sent[0].replyTo, [{ name: '', address: FOREIGN }]);
+    assert.deepEqual(sent[0].to, [{ name: '', address: ACCOUNT }]);
   });
 });
 
@@ -379,7 +379,91 @@ test('self-only and on are enforced through every sending tool', async () => {
     const forwarded = await handleMailTool('forward_email', { uid: 5, to: FOREIGN }, ctx);
     assert.equal(forwarded.sent, true);
     assert.equal(sent.length, 3);
-    assert.equal(sent[1].to, FOREIGN);
+    assert.deepEqual(sent[1].to, [{ name: '', address: FOREIGN }]);
+  });
+});
+
+test('parsed recipients match what sendMail receives, including the quoted-address bypass', async () => {
+  const hidden = `"Me <${ACCOUNT}>" <evil@example.com>`;
+  const group = `Friends: ${ACCOUNT}, evil@example.com;`;
+
+  await withMode('self-only', async (mocks) => {
+    const rejected = [
+      () => composeEmail(hidden, 'Hello', 'body', {}, CREDS),
+      () => composeEmail(`${hidden}, ${ACCOUNT}`, 'Hello', 'body', {}, CREDS),
+      () => composeEmail(ACCOUNT, 'Hello', 'body', { cc: hidden }, CREDS),
+      () => composeEmail(ACCOUNT, 'Hello', 'body', { bcc: `"Last, First" <evil@example.com>` }, CREDS),
+      () => composeEmail(`YOU@icloud.com, evil@example.com`, 'Hello', 'body', {}, CREDS),
+      () => replyToEmail(selfMessage({ from: hidden }), 'x', {}, CREDS),
+      () => forwardEmail(selfMessage(), hidden, '', {}, CREDS),
+      () => forwardEmail(selfMessage(), [ACCOUNT, 'Evil@Example.com'], '', {}, CREDS),
+    ];
+    for (const run of rejected) {
+      const before = mocks.sent.length;
+      await assert.rejects(run, (err) => {
+        assert.match(err.message, /self-only/);
+        assert.equal(err.message.includes('evil@example.com'), false);
+        return true;
+      });
+      assert.equal(mocks.sent.length, before);
+    }
+
+    const allowed = await composeEmail(`"Last, First" <${ACCOUNT}>`, 'Hello', 'body', {
+      cc: `YOU@icloud.com, "Also" <you@icloud.com>`,
+    }, CREDS);
+    assert.equal(allowed.sent, true);
+    assert.deepEqual(mocks.sent.at(-1).to, [{ name: 'Last, First', address: ACCOUNT }]);
+    assert.deepEqual(mocks.sent.at(-1).cc, [
+      { name: '', address: 'YOU@icloud.com' },
+      { name: 'Also', address: 'you@icloud.com' },
+    ]);
+  });
+
+  await withMode('on', async ({ sent }) => {
+    const result = await composeEmail(hidden, 'Hello', 'body', {}, CREDS);
+    assert.equal(result.sent, true);
+    assert.deepEqual(sent.at(-1).to, [{ name: `Me <${ACCOUNT}>`, address: 'evil@example.com' }]);
+
+    await assert.rejects(() => composeEmail(group, 'Hello', 'body', {}, CREDS), /recipient groups are not allowed/);
+    await assert.rejects(() => composeEmail('not-an-email', 'Hello', 'body', {}, CREDS), /could not be parsed/);
+    await assert.rejects(() => composeEmail('<>', 'Hello', 'body', {}, CREDS), /could not be parsed/);
+    await assert.rejects(() => composeEmail('foo@bar@baz.com', 'Hello', 'body', {}, CREDS), /could not be parsed/);
+    await assert.rejects(
+      () => composeEmail(`${ACCOUNT}\r\nBcc: evil@example.com`, 'Hello', 'body', {}, CREDS),
+      /line break/
+    );
+    await assert.rejects(
+      () => composeEmail(ACCOUNT, 'Hello\r\nBcc: evil@example.com', 'body', {}, CREDS),
+      /line break/
+    );
+    await assert.rejects(
+      () => composeEmail(ACCOUNT, 'Hello', 'body', { cc: `${ACCOUNT}\nBcc: evil@example.com` }, CREDS),
+      /line break/
+    );
+    await assert.rejects(
+      () => replyToEmail(selfMessage({ subject: 'Hi\r\nBcc: evil@example.com' }), 'x', {}, CREDS),
+      /line break/
+    );
+    await assert.rejects(
+      () => replyToEmail(selfMessage({
+        headers: {
+          replyTo: null,
+          to: [ACCOUNT],
+          cc: [],
+          messageId: '<id@example.com>\r\nBcc: evil@example.com',
+          references: [],
+        },
+      }), 'x', {}, CREDS),
+      /line break/
+    );
+    await assert.rejects(
+      () => forwardEmail(selfMessage({ subject: 'Hi\nBcc: evil@example.com' }), ACCOUNT, '', {}, CREDS),
+      /line break/
+    );
+    await assert.rejects(() => saveDraft(group, 'Hello', 'body', {}, CREDS), /recipient groups are not allowed/);
+    assert.equal(sent.length, 1);
+    assert.equal(JSON.stringify(sent).includes('\r'), false);
+    assert.equal(JSON.stringify(sent).includes('\nBcc'), false);
   });
 });
 
