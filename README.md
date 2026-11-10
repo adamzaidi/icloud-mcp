@@ -132,18 +132,18 @@ The audit log is append-only. The default file lives in `~/.icloud-mcp/`, which 
 | `search_emails` | Search emails by keyword or targeted field queries, with optional filters for date, read status, domain, and more |  |
 | `count_emails` | Count how many emails match a set of filters without moving or deleting them. Use this before bulk_move or bulk_delete to preview how many emails will be affected. |  |
 | `bulk_move` | Move emails matching any combination of filters from one mailbox to another. Uses safe copy-verify-delete with fingerprint verification and a persistent manifest. Use dryRun: true to preview without making changes. | yes |
-| `bulk_delete` | Delete emails matching any combination of filters. Processes in chunks of 500 with per-chunk timeouts for reliability. Use dryRun: true to preview without making changes. | yes |
+| `bulk_delete` | Delete emails matching any combination of filters. Moves them to the Trash folder unless `permanent: true`. Processes in chunks of 500 with per-chunk timeouts. Use dryRun: true to preview without making changes. | yes |
 | `bulk_flag` | Flag or unflag emails matching any combination of filters in bulk | yes |
-| `bulk_delete_by_sender` | Delete all emails from a specific sender | yes |
+| `bulk_delete_by_sender` | Delete all emails from a specific sender. Moves them to the Trash folder unless `permanent: true`. | yes |
 | `bulk_move_by_sender` | Move all emails from a specific sender to a folder | yes |
-| `bulk_delete_by_subject` | Delete all emails matching a subject pattern | yes |
+| `bulk_delete_by_subject` | Delete all emails matching a subject pattern. Moves them to the Trash folder unless `permanent: true`. | yes |
 | `bulk_mark_read` | Mark all emails as read, optionally filtered by sender | yes |
 | `bulk_mark_unread` | Mark all emails as unread, optionally filtered by sender | yes |
-| `delete_older_than` | Delete all emails older than a certain number of days | yes |
+| `delete_older_than` | Delete all emails older than a certain number of days. Moves them to the Trash folder unless `permanent: true`. | yes |
 | `get_emails_by_date_range` | Get emails between two dates |  |
 | `flag_email` | Flag or unflag a single email |  |
 | `mark_as_read` | Mark a single email as read or unread |  |
-| `delete_email` | Delete a single email | yes |
+| `delete_email` | Delete a single email. Moves it to the Trash folder unless `permanent: true`. | yes |
 | `move_email` | Move a single email to a different mailbox/folder | yes |
 | `list_mailboxes` | List all mailboxes/folders in iCloud Mail |  |
 | `create_mailbox` | Create a new mailbox/folder |  |
@@ -197,8 +197,8 @@ The audit log is append-only. The default file lives in `~/.icloud-mcp/`, which 
 | `delete_calendar` | Delete an iCloud event calendar by exact name or calendarId. The calendar must have no events (past or future); delete them first with bulk_delete_events. Will not delete Reminders lists. | yes |
 | `list_events` | List events in a specific iCloud calendar within a date range. Use list_calendars first to get a calendarId. |  |
 | `get_event` | Get full details of a specific calendar event by its ID. |  |
-| `create_event` | Create a new event in an iCloud calendar. For all-day events use allDay:true and YYYY-MM-DD for start/end. |  |
-| `update_event` | Update an existing calendar event. Only provided fields are changed; others are preserved. |  |
+| `create_event` | Create a new event in an iCloud calendar. For all-day events use allDay:true and YYYY-MM-DD for start/end. See [Event times](#event-times). |  |
+| `update_event` | Update an existing calendar event in place. Only the fields passed are changed; attendees, alarms, deleted and edited occurrences, and every other property are left as they are. |  |
 | `delete_event` | Delete a calendar event permanently from iCloud Calendar. | yes |
 | `search_events` | Search for events by title/summary across all calendars within an optional date range. |  |
 | `bulk_update_events` | Update multiple calendar events in one call. Each update object must include eventId and only the fields to change. | yes |
@@ -267,9 +267,28 @@ Listing reminders reads each property for the whole list in one batch. A list of
 
 A `domain` filter searches both the bare domain and `@domain`. iCloud's FROM search misses some senders when given only the bare domain. Subdomains are not matched: a filter of `example.com` does not find mail from `someone@mail.example.com`. When a keyword and a domain are both set, `search_emails` keeps both conditions.
 
+## Deleting mail
+
+`delete_email`, `bulk_delete`, `bulk_delete_by_sender`, `bulk_delete_by_subject`, `delete_older_than`, and rules with a `delete` action move mail to the account's Trash folder, so a delete can be undone from Mail. Pass `permanent: true` (on a rule, `action.permanent: true`) to delete with no Trash copy. Mail that is already in the Trash is deleted permanently, and `empty_trash` always is. If the account has no Trash folder the call fails without deleting anything.
+
 ## Safe move
 
-`bulk_move`, `bulk_move_by_sender`, `bulk_move_by_domain`, and `archive_older_than` copy, verify fingerprints in the destination, then remove the source. `get_move_status` and `abandon_move` inspect or clear the manifest.
+`bulk_move`, `bulk_move_by_sender`, `bulk_move_by_domain`, and `archive_older_than` copy, verify, then remove the source. `get_move_status` and `abandon_move` inspect or clear the manifest.
+
+Verification uses the destination UIDs the server reports for the copy (COPYUID, which iCloud and Gmail both send): each one is fetched and compared with the message it was copied from. On a server that does not report them, only messages that arrived in the destination after the move began are counted, one per source message. A copy of the same message that was already in the destination is never taken as proof. If the reply to a copy is lost, the server checks which messages arrived before copying the rest, so a retry does not leave duplicates.
+
+## Timeouts
+
+When a tool call times out, its IMAP connections are closed, which stops the work in progress. A command the mail server had already received may still finish there, so check the result (`count_emails`, `get_move_status`) before running the call again.
+
+## Event times
+
+`create_event` and `update_event` accept `start` and `end` as ISO 8601 text.
+
+- With `timezone` (an IANA name such as `America/New_York`, or `UTC`), the event is stored in that zone. Plain text such as `2026-03-15T10:00:00` is the wall-clock time there; text with `Z` or an offset is converted into the zone.
+- Without `timezone`, text with `Z` or an offset is stored in UTC. Plain text is taken as the local time of the machine running the server and stored with that machine's zone, so a repeating event keeps its local hour across daylight-saving changes.
+- An unknown timezone or an unreadable date is refused.
+- `update_event` with a new `start` and no `end` keeps the event's length. Without `timezone` it keeps the event's existing zone. Alarms change only when `reminder` is passed.
 
 ## Connections
 

@@ -3,7 +3,7 @@ import { readFileSync } from 'fs';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { createRateLimitedClient } from './lib/imap.js';
+import { createRateLimitedClient, withImapScope } from './lib/imap.js';
 import { mailTools, handleMailTool } from './lib/tools/mail.js';
 import { contactTools, handleContactTool } from './lib/tools/contacts.js';
 import { calendarTools, suggestEventTools, handleCalendarTool } from './lib/tools/calendar.js';
@@ -110,7 +110,7 @@ export function createMcpServer() {
       let result;
       let handled = false;
       for (const handle of handlers) {
-        const out = await handle(name, args, ctx);
+        const out = await withImapScope(() => handle(name, args, ctx));
         if (out !== undefined) {
           result = out;
           handled = true;
