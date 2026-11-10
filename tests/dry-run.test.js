@@ -43,6 +43,10 @@ function mockClient(state) {
       state.lastSearch = query;
       return [...FIXTURE_UIDS];
     },
+    async list() {
+      state.calls.push('list');
+      return [{ path: 'INBOX' }, { path: 'Deleted Messages', specialUse: '\\Trash' }];
+    },
     async messageDelete(uids) { state.calls.push(['messageDelete', uids]); },
     async messageMove(uid, target) { state.calls.push(['messageMove', uid, target]); },
     async messageFlagsAdd() { state.calls.push('flagsAdd'); },
@@ -242,11 +246,49 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
     assertNoMutation();
   });
 
-  await t.test('delete_email without dryRun does delete', async () => {
+  await t.test('delete_email moves to Trash by default and expunges only when asked', async () => {
     resetImap();
     const result = await handleMailTool('delete_email', { uid: 101, mailbox: 'INBOX' }, ctx);
-    assert.equal(result, true);
+    assert.deepEqual(result, { deleted: true, uid: 101, mailbox: 'INBOX', permanent: false, movedTo: 'Deleted Messages' });
+    assert.deepEqual(state.calls.find((call) => Array.isArray(call) && call[0] === 'messageMove'), ['messageMove', 101, 'Deleted Messages']);
+    assert.ok(!state.calls.some((call) => Array.isArray(call) && call[0] === 'messageDelete'));
+
+    resetImap();
+    const permanent = await handleMailTool('delete_email', { uid: 101, mailbox: 'INBOX', permanent: true }, ctx);
+    assert.deepEqual(permanent, { deleted: true, uid: 101, mailbox: 'INBOX', permanent: true });
     assert.ok(state.calls.some((call) => Array.isArray(call) && call[0] === 'messageDelete'));
+    assert.ok(!state.calls.some((call) => Array.isArray(call) && call[0] === 'messageMove'));
+
+    // Mail already in the Trash has nowhere further to go.
+    resetImap();
+    const inTrash = await handleMailTool('delete_email', { uid: 101, mailbox: 'Deleted Messages' }, ctx);
+    assert.equal(inTrash.permanent, true);
+    assert.ok(state.calls.some((call) => Array.isArray(call) && call[0] === 'messageDelete'));
+  });
+
+  await t.test('bulk deletes move to Trash by default', async () => {
+    for (const [tool, args] of [
+      ['bulk_delete', { sender: 'sender@example.com' }],
+      ['bulk_delete_by_sender', { sender: 'sender@example.com' }],
+      ['bulk_delete_by_subject', { subject: 'Fixture' }],
+      ['delete_older_than', { days: 30 }],
+    ]) {
+      resetImap();
+      const result = await handleMailTool(tool, args, ctx);
+      assert.equal(result.deleted, 2, tool);
+      assert.equal(result.permanent, false, tool);
+      assert.equal(result.movedTo, 'Deleted Messages', tool);
+      assert.ok(!state.calls.some((call) => Array.isArray(call) && call[0] === 'messageDelete'), tool);
+
+      resetImap();
+      const dry = await handleMailTool(tool, { ...args, dryRun: true }, ctx);
+      assert.equal(dry.wouldMoveTo, 'Deleted Messages', tool);
+
+      resetImap();
+      const permanent = await handleMailTool(tool, { ...args, permanent: true }, ctx);
+      assert.equal(permanent.permanent, true, tool);
+      assert.ok(state.calls.some((call) => Array.isArray(call) && call[0] === 'messageDelete'), tool);
+    }
   });
 
   await t.test('move_email dryRun reports source and destination', async () => {
