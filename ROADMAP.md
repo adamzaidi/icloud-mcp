@@ -1,38 +1,18 @@
 # Roadmap
 
-What to work on next, in priority order within each section. Written against v2.8.0 plus the fixes in #11 and #12.
+What to work on next, in priority order within each section. Written against v2.8.0 plus the fixes in #11, #12 and #14.
 
 Sizes are rough: **S** is an afternoon, **M** is a few days, **L** is a week or more. "Breaking" means existing prompts, rules or clients would need to change, so the item belongs in a major release.
 
-## 0. Contacts: rewrite `update_contact` first
+## 0. Contacts
 
-`update_contact` has the same flaw #11 fixed in `update_event`: it parses the card into a few fields and writes a new card from them. Running a typical card created on an iPhone through an update that changes only the note produced these changes:
+Fixed in #14: `update_contact` now edits a card in place, reads no longer return photo data, and a failed request is an error. Still open:
 
-| What happens | Example |
-|---|---|
-| Middle name, prefix and suffix are deleted | `N:Smith;Jane;Marie;Dr.;Jr.` becomes `N:Smith;Jane;;;` |
-| All but one URL is deleted | Two `URL` lines become one |
-| An empty address is added | Apple's `item3.X-ABADR:us` (the address's country code) is read as a second address and written back as a blank `ADR`; the country code is lost |
-| Custom labels move to the wrong entry | `item1.X-ABLabel:Assistant` belonged to an email; phones are renumbered from `item1`, so the label now sits on a phone |
-| Every phone, email and address is marked preferred | The real preferred entry is lost |
-| Types are rewritten | An unlabeled phone becomes type `phone`; a work email with no explicit type becomes `home`; `CELL;VOICE` becomes `cell` |
-| Birthday parameters are dropped | `BDAY;value=date:` becomes `BDAY:`; a birthday with no year loses the marker that says so |
-| A new `phone` or `email` is ignored | When the contact already has one, the single-value field is dropped and the old list is written back. Only `phones[]` / `emails[]` take effect |
-
-Reading has its own problems:
-
-| What happens | Detail |
-|---|---|
-| Photo data is returned to the model | Unknown lines, including base64 `PHOTO`, come back in `_rawLines`. One photo can cost tens of thousands of tokens |
-| A failed request looks like an empty address book | `list_contacts` and `search_contacts` do not check the HTTP status. A 401 returns `{ contacts: [], count: 0 }` |
-| XML entities are not decoded | A company named `AT&T` is returned as `AT&amp;T` |
-| vCard escapes are not decoded | `1 Main St\, Apt 2` keeps its backslash |
-| Groups are listed as contacts | A contact group is a card too; it shows up as a nameless contact and an update would break it |
-| Paging re-reads everything | Each page asks for `limit + offset` cards and slices; there is no stable order |
-| Search is narrow | Name, email and phone only (not company or note), and a phone matches only in the exact format stored |
-| Only the first address book is used | Shared or secondary books are ignored |
-
-The fix is the one used for events: edit only the lines for the fields the caller passed and write every other line back unchanged, guarded by the ETag. Size **M**, and it should come before any new contact feature.
+| Item | Detail | Size |
+|---|---|---|
+| First live write | #14 was checked read-only against a real address book (every card reproduced line for line), but no update has been sent to a real server. Try it on a throwaway contact first. | S |
+| Only the first address book is used | Shared or secondary books are ignored. | M |
+| Cache the address book | iCloud returns every card on each listing or page. Cache by the collection's sync token. | M |
 
 ## 1. Known bugs
 
@@ -133,7 +113,7 @@ Tools that combine surfaces, once the pieces exist:
 
 ## Suggested order
 
-1. Section 0: the contacts rewrite.
+1. Merge #11, #12 and #14.
 1. Section 1, as one or two PRs.
 2. `get_email`, batched fetches, compact results (section 2).
 3. Recurring event expansion and `find_free_slots` (section 4).
