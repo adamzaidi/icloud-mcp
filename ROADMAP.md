@@ -4,18 +4,46 @@ What to work on next, in priority order within each section. Written against v2.
 
 Sizes are rough: **S** is an afternoon, **M** is a few days, **L** is a week or more. "Breaking" means existing prompts, rules or clients would need to change, so the item belongs in a major release.
 
+## 0. Contacts: rewrite `update_contact` first
+
+`update_contact` has the same flaw #11 fixed in `update_event`: it parses the card into a few fields and writes a new card from them. Running a typical card created on an iPhone through an update that changes only the note produced these changes:
+
+| What happens | Example |
+|---|---|
+| Middle name, prefix and suffix are deleted | `N:Smith;Jane;Marie;Dr.;Jr.` becomes `N:Smith;Jane;;;` |
+| All but one URL is deleted | Two `URL` lines become one |
+| An empty address is added | Apple's `item3.X-ABADR:us` (the address's country code) is read as a second address and written back as a blank `ADR`; the country code is lost |
+| Custom labels move to the wrong entry | `item1.X-ABLabel:Assistant` belonged to an email; phones are renumbered from `item1`, so the label now sits on a phone |
+| Every phone, email and address is marked preferred | The real preferred entry is lost |
+| Types are rewritten | An unlabeled phone becomes type `phone`; a work email with no explicit type becomes `home`; `CELL;VOICE` becomes `cell` |
+| Birthday parameters are dropped | `BDAY;value=date:` becomes `BDAY:`; a birthday with no year loses the marker that says so |
+| A new `phone` or `email` is ignored | When the contact already has one, the single-value field is dropped and the old list is written back. Only `phones[]` / `emails[]` take effect |
+
+Reading has its own problems:
+
+| What happens | Detail |
+|---|---|
+| Photo data is returned to the model | Unknown lines, including base64 `PHOTO`, come back in `_rawLines`. One photo can cost tens of thousands of tokens |
+| A failed request looks like an empty address book | `list_contacts` and `search_contacts` do not check the HTTP status. A 401 returns `{ contacts: [], count: 0 }` |
+| XML entities are not decoded | A company named `AT&T` is returned as `AT&amp;T` |
+| vCard escapes are not decoded | `1 Main St\, Apt 2` keeps its backslash |
+| Groups are listed as contacts | A contact group is a card too; it shows up as a nameless contact and an update would break it |
+| Paging re-reads everything | Each page asks for `limit + offset` cards and slices; there is no stable order |
+| Search is narrow | Name, email and phone only (not company or note), and a phone matches only in the exact format stored |
+| Only the first address book is used | Shared or secondary books are ignored |
+
+The fix is the one used for events: edit only the lines for the fields the caller passed and write every other line back unchanged, guarded by the ETag. Size **M**, and it should come before any new contact feature.
+
 ## 1. Known bugs
 
 Small, verified against the code, and worth fixing before anything new.
 
 | Item | Detail | Size |
 |---|---|---|
-| `update_contact` ignores `phone` and `email` | When the contact already has a phone or email, the single-value field is dropped and the old list is written back. Only `phones[]` / `emails[]` take effect. | S |
-| `list_contacts` and `search_contacts` return photo data | Unknown vCard lines, including base64 `PHOTO`, are returned in `_rawLines`. One contact photo can cost tens of thousands of tokens. Keep the lines for round-tripping, leave them out of tool output. | S |
 | Refused flag changes are reported as success | imapflow returns `false` when the server refuses a command. #11 handles this for copy, move and delete; `flag_email`, `mark_as_read` and the bulk flag and mark tools still ignore it. | S |
 | `update_digest_state` schema rejects its own data | `processedUids` is declared as numbers, but UIDs from non-default accounts are strings such as `umd:12345`. A strict client refuses the call. | S |
 | Calendar and contact calls cannot be cancelled | A timed-out DAV request keeps running (the same class of problem #11 fixed for IMAP). Pass an `AbortSignal` to `fetch`. | S |
-| vCard and iCal text is under-escaped | `FN` and `ORG` are written unescaped; event text does not escape `,` and `;`; long lines are not folded. Servers tolerate most of it, but a name with a semicolon is split. | S |
+| Event text is under-escaped, and entities are not decoded | Event text does not escape `,` and `;`, and long lines are not folded. Event titles from a calendar query can come back with `&amp;` in them, as contacts do. | S |
 | All-day events created without `end` have zero length | `DTEND` is written equal to `DTSTART`; it should be the next day. | S |
 | Retry treats most server errors as transient | Any message containing `BAD` or `NO ` is retried, including permanent refusals. | S |
 | Error text names iCloud for every account | A Gmail failure says "Could not reach imap.mail.me.com". | S |
@@ -105,6 +133,7 @@ Tools that combine surfaces, once the pieces exist:
 
 ## Suggested order
 
+1. Section 0: the contacts rewrite.
 1. Section 1, as one or two PRs.
 2. `get_email`, batched fetches, compact results (section 2).
 3. Recurring event expansion and `find_free_slots` (section 4).
