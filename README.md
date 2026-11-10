@@ -267,6 +267,14 @@ Listing reminders reads each property for the whole list in one batch. A list of
 
 A `domain` filter searches both the bare domain and `@domain`. iCloud's FROM search misses some senders when given only the bare domain. Subdomains are not matched: a filter of `example.com` does not find mail from `someone@mail.example.com`. When a keyword and a domain are both set, `search_emails` keeps both conditions.
 
+## Accounts
+
+Every mail tool that reaches a mail server takes an optional `account` (a name from `list_accounts`); without it the first configured account is used. A message UID belongs to one account and mailbox, so pass the same `account` that returned it. `create_rule` takes `account` too, and the rule then runs against that account every time. A rule saved without one runs against the `IMAP_USER` account.
+
+## Tool annotations
+
+Each tool reports MCP annotations so a client can tell what a call may do: read-only tools set `readOnlyHint`, tools that remove data (deletes, `empty_trash`, running a rule) set `destructiveHint`, and the three send tools set `openWorldHint`. The lists live in `lib/tool-annotations.js`; a test fails if a tool is added without being placed in one.
+
 ## Deleting mail
 
 `delete_email`, `bulk_delete`, `bulk_delete_by_sender`, `bulk_delete_by_subject`, `delete_older_than`, and rules with a `delete` action move mail to the account's Trash folder, so a delete can be undone from Mail. Pass `permanent: true` (on a rule, `action.permanent: true`) to delete with no Trash copy. Mail that is already in the Trash is deleted permanently, and `empty_trash` always is. If the account has no Trash folder the call fails without deleting anything.

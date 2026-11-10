@@ -11,6 +11,7 @@ import { reminderTools, handleReminderTool } from './lib/tools/reminders.js';
 import { assertValidToolProfile, selectTools, prepareToolCall } from './lib/tool-profile.js';
 import { applyKeychainCredentials } from './lib/keychain.js';
 import { recordAudit } from './lib/audit.js';
+import { withAnnotations } from './lib/tool-annotations.js';
 import { assertValidSubscribedCalendarsSetting } from './lib/subscribed-calendars.js';
 
 
@@ -88,13 +89,13 @@ export function createMcpServer() {
     { capabilities: { tools: {} } }
   );
 
-  const orderedTools = [
+  const orderedTools = withAnnotations([
     ...mailTools,
     ...contactTools,
     ...calendarTools,
     ...reminderTools,
     ...suggestEventTools,
-  ];
+  ]);
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: selectTools(orderedTools),
