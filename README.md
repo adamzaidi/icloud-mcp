@@ -567,6 +567,10 @@ Credentials stay in your local MCP client config. The server runs on your machin
 
 Any other value is an error and nothing is sent. Recipient groups, addresses that do not parse to a single mailbox, and a CR, LF, or other control character in a header field are refused in every mode. The refusal does not include the address. A subject copied from the original message has CR, LF, and tab runs collapsed to a space, and other controls removed, before that check. A subject the caller supplies is still refused when it contains a control character.
 
+## Roadmap
+
+Planned fixes and features are in [ROADMAP.md](ROADMAP.md).
+
 ## License
 
 MIT
