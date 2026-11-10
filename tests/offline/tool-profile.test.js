@@ -210,10 +210,15 @@ test('calendar text cannot inject ATTENDEE or ORGANIZER lines', async () => {
       location: 'Room\r\nATTENDEE:mailto:evil@example.com',
       recurrence: 'FREQ=DAILY\r\nATTENDEE:mailto:evil@example.com',
       status: 'CONFIRMED\nORGANIZER:mailto:evil@example.com',
-      timezone: 'UTC\r\nATTENDEE:mailto:evil@example.com',
       start: '2030-01-02T15:00:00Z',
       end: '2030-01-02T16:00:00Z',
     });
+    // A timezone is validated against the zone database, so a hostile one is
+    // refused before any request is built.
+    await assert.rejects(
+      createEvent('cal', { summary: 'Meet', start: '2030-01-02T15:00:00Z', timezone: 'UTC\r\nATTENDEE:mailto:evil@example.com' }),
+      /Unknown timezone/
+    );
   } finally {
     setCalDavRequestForTests(null);
     setCalDavDiscoveryForTests(null);
