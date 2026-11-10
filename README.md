@@ -181,12 +181,25 @@ The audit log is append-only. The default file lives in `~/.icloud-mcp/`, which 
 
 | Tool | Description | dryRun |
 |------|-------------|--------|
-| `list_contacts` | List contacts from iCloud Contacts. Returns names, phones, emails, and other fields. |  |
-| `search_contacts` | Search iCloud Contacts by name, email address, or phone number. |  |
-| `get_contact` | Get full details for a specific contact by ID. Use list_contacts or search_contacts to find a contactId. |  |
-| `create_contact` | Create a new contact in iCloud Contacts. |  |
-| `update_contact` | Update an existing contact in iCloud Contacts. Only provided fields are changed; others are preserved. |  |
+| `list_contacts` | List contacts, sorted by name, with `total` and `hasMore` for paging. Photos are never returned. |  |
+| `search_contacts` | Search by name, nickname, email, phone, company, or note text. A phone number matches whatever format it is stored in. |  |
+| `get_contact` | Get full details for a contact by ID, including fields the other tools do not edit (related names, social profiles) under `other`. |  |
+| `create_contact` | Create a new contact. Needs a name or an organization. |  |
+| `update_contact` | Update a contact in place. Only the fields passed are changed; the rest of the card is left exactly as it is. See [Editing contacts](#editing-contacts). |  |
 | `delete_contact` | Delete a contact from iCloud Contacts permanently. | yes |
+
+#### Editing contacts
+
+`update_contact` edits the card's own lines. Anything it is not asked to change is written back byte for byte: the photo, custom labels, middle name and suffix, extra URLs, related people, social profiles.
+
+- `phone` and `email` make that number or address the primary one. It is added if the contact does not have it, and the existing ones are kept. A number already on the contact in another format (`(555) 555-0100` and `+1 555 555 0100`) is recognised, not added again.
+- `phones`, `emails`, and `addresses` replace the whole list. An entry that matches one already on the contact keeps its label, so reading a list, adding one entry, and writing it back changes nothing else.
+- A `type` Contacts has built in (mobile, home, work, main, fax, pager) is stored that way; any other text becomes a custom label.
+- An empty string clears `nickname`, `org`, `department`, `title`, `birthday`, `note`, or `url`.
+- `birthday` is `YYYY-MM-DD`, or `--MM-DD` when the year is unknown.
+- The update is refused if the contact changed on another device in the meantime, and contact groups cannot be edited.
+
+iCloud returns the whole address book for every listing (it ignores a page size), so `list_contacts` sorts by name and pages locally. A failed or refused request is reported as an error.
 
 ### Calendar
 

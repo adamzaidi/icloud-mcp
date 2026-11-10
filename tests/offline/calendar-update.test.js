@@ -253,7 +253,7 @@ test('search text is escaped inside the request body', async () => {
     await searchEvents('R&D </C:text-match><x>');
     await searchContacts('Smith & "Sons" <x>');
   } finally { restore(); }
-  assert.equal(bodies.length, 4);
+  assert.equal(bodies.length, 2);
   assert.ok(bodies[0].includes('>R&amp;D &lt;/C:text-match&gt;&lt;x&gt;</C:text-match>'));
   for (const body of bodies.slice(1)) {
     assert.ok(body.includes('>Smith &amp; &quot;Sons&quot; &lt;x&gt;</C:text-match>'));
