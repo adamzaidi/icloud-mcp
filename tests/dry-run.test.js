@@ -503,7 +503,8 @@ test('offline dry-run, registration, and privacy paths', async (t) => {
       action: 'delete_contact',
       contactId: 'FAKE-CONTACT',
       fullName: 'Fake Person',
-      emails: [{ type: 'home', email: 'fake.person@example.com' }],
+      // The card gives this address no type, so none is invented.
+      emails: [{ type: 'other', email: 'fake.person@example.com' }],
       phones: [{ type: 'cell', number: '+1-555-0100' }],
     });
     assert.deepEqual(methods, ['GET']);
